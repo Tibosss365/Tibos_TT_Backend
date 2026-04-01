@@ -22,7 +22,7 @@ Flow (IMAP)
       d. Create Ticket + TicketTimeline row.
       e. Create EmailTicketLog row.
       f. Notify via SSE / WS.
-      g. STORE +FLAGS (\Seen) — or move to sub-folder.
+      g. STORE +FLAGS (\\Seen) — or move to sub-folder.
 6.  Update last_polled_at + processed_count.
 7.  Sleep poll_interval_minutes.
 
