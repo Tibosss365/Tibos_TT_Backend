@@ -22,6 +22,7 @@ class UserUpdate(BaseModel):
     name: str | None = None
     initials: str | None = None
     group: str | None = None
+    username: str | None = None
     role: UserRole | None = None
     is_active: bool | None = None
     password: str | None = None

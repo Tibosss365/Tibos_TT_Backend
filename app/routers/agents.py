@@ -72,6 +72,16 @@ async def update_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     update_data = body.model_dump(exclude_unset=True)
+
+    if "username" in update_data and update_data["username"] != user.username:
+        conflict = await db.execute(select(User).where(User.username == update_data["username"]))
+        if conflict.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Username already taken")
+
+    if "name" in update_data and "initials" not in update_data:
+        words = update_data["name"].split()
+        update_data["initials"] = "".join(w[0] for w in words).upper()[:4]
+
     if "password" in update_data:
         update_data["hashed_password"] = hash_password(update_data.pop("password"))
     for key, val in update_data.items():
