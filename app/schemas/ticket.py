@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from app.models.ticket import TicketCategory, TicketPriority, TicketStatus, TimelineType
 from app.schemas.user import UserPublic
@@ -46,6 +46,7 @@ class TicketUpdate(BaseModel):
     phone: str | None = None
     asset: str | None = None
     description: str | None = None
+    resolution: str | None = None
 
 
 class TicketOut(TicketBase):
@@ -55,9 +56,24 @@ class TicketOut(TicketBase):
     status: TicketStatus
     assignee_id: uuid.UUID | None
     assignee: UserPublic | None = None
+    resolution: str | None = None
+    sla_due_at: datetime | None = None
+    sla_paused_at: datetime | None = None
     timeline: list[TimelineEntryOut] = []
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def is_overdue(self) -> bool:
+        if self.status in (TicketStatus.resolved, TicketStatus.closed, TicketStatus.on_hold):
+            return False
+        if self.sla_due_at is None:
+            return False
+        due = self.sla_due_at
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > due
 
     model_config = {"from_attributes": True}
 
@@ -73,9 +89,24 @@ class TicketListOut(BaseModel):
     status: TicketStatus
     submitter_name: str
     company: str
+    resolution: str | None = None
+    sla_due_at: datetime | None = None
+    sla_paused_at: datetime | None = None
     assignee: UserPublic | None = None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def is_overdue(self) -> bool:
+        if self.status in (TicketStatus.resolved, TicketStatus.closed, TicketStatus.on_hold):
+            return False
+        if self.sla_due_at is None:
+            return False
+        due = self.sla_due_at
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > due
 
     model_config = {"from_attributes": True}
 

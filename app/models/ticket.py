@@ -92,6 +92,13 @@ class Ticket(Base):
     phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     asset: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sla_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sla_paused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

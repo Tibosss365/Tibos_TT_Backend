@@ -2,7 +2,7 @@ import uuid
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Boolean, Integer, DateTime, Enum as SAEnum, Text
+from sqlalchemy import String, Boolean, Integer, DateTime, Enum as SAEnum, Text, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,10 +32,29 @@ class SLAConfig(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    critical_hours: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    high_hours: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
-    medium_hours: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
-    low_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=False)
+    # Response time targets (hours per priority)
+    critical_hours: Mapped[int] = mapped_column(Integer, default=1,  nullable=False)
+    high_hours:     Mapped[int] = mapped_column(Integer, default=4,  nullable=False)
+    medium_hours:   Mapped[int] = mapped_column(Integer, default=8,  nullable=False)
+    low_hours:      Mapped[int] = mapped_column(Integer, default=24, nullable=False)
+
+    # Timer trigger: "on_creation" | "on_assignment"
+    timer_start: Mapped[str] = mapped_column(String(20), default="on_creation", nullable=False)
+
+    # Countdown mode: "24_7" | "business_hours"
+    countdown_mode: Mapped[str] = mapped_column(String(20), default="24_7", nullable=False)
+
+    # Business hours (only used when countdown_mode = "business_hours")
+    # work_days: JSON list of ints 0–6 (0=Mon … 6=Sun), default Mon–Fri
+    work_days: Mapped[list] = mapped_column(JSON, default=lambda: [0, 1, 2, 3, 4], nullable=False)
+    work_start: Mapped[str] = mapped_column(String(5), default="09:00", nullable=False)  # "HH:MM"
+    work_end:   Mapped[str] = mapped_column(String(5), default="20:00", nullable=False)  # "HH:MM"
+
+    # Statuses that pause the SLA timer (JSON list of status strings)
+    pause_on: Mapped[list] = mapped_column(
+        JSON, default=lambda: ["on-hold"], nullable=False
+    )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

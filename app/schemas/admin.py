@@ -12,6 +12,12 @@ class SLAConfigOut(BaseModel):
     high_hours: int
     medium_hours: int
     low_hours: int
+    timer_start: str
+    countdown_mode: str
+    work_days: list[int]
+    work_start: str
+    work_end: str
+    pause_on: list[str]
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -22,6 +28,12 @@ class SLAConfigUpdate(BaseModel):
     high_hours: int
     medium_hours: int
     low_hours: int
+    timer_start: str = "on_creation"
+    countdown_mode: str = "24_7"
+    work_days: list[int] = [0, 1, 2, 3, 4]
+    work_start: str = "09:00"
+    work_end: str = "20:00"
+    pause_on: list[str] = ["on-hold"]
 
 
 class SMTPSettings(BaseModel):

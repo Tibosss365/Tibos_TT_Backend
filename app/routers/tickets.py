@@ -2,7 +2,7 @@ import csv
 import io
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -21,6 +21,7 @@ from app.models.ticket import (
     TicketTimeline,
     TimelineType,
 )
+from app.models.admin import SLAConfig
 from app.models.user import User, UserRole
 from app.redis_client import get_redis
 from app.schemas.ticket import (
@@ -55,6 +56,74 @@ def _ticket_query(db: AsyncSession):
             selectinload(Ticket.timeline).selectinload(TicketTimeline.author),
         )
     )
+
+
+def _calc_biz_due_at(start: datetime, hours: int, work_days: list, work_start: str, work_end: str) -> datetime:
+    """
+    Advance `start` by `hours` worth of business-hours time.
+    work_days: list of ints 0=Mon … 6=Sun
+    work_start / work_end: "HH:MM" strings (local, treated as UTC for simplicity)
+    """
+    ws_h, ws_m = int(work_start.split(":")[0]), int(work_start.split(":")[1])
+    we_h, we_m = int(work_end.split(":")[0]),   int(work_end.split(":")[1])
+    biz_seconds_per_day = ((we_h * 60 + we_m) - (ws_h * 60 + ws_m)) * 60
+    remaining = timedelta(hours=hours)
+    current = start
+
+    # Snap to next business moment if currently outside business hours
+    def snap_to_biz(dt: datetime) -> datetime:
+        for _ in range(14):  # max 2 weeks scan
+            if dt.weekday() not in work_days:
+                dt = (dt + timedelta(days=1)).replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+                continue
+            day_start = dt.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+            day_end   = dt.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
+            if dt < day_start:
+                return day_start
+            if dt >= day_end:
+                dt = (dt + timedelta(days=1)).replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+                continue
+            return dt
+        return dt
+
+    current = snap_to_biz(current)
+
+    while remaining > timedelta(0):
+        if current.weekday() not in work_days:
+            current = snap_to_biz(current)
+            continue
+        day_end = current.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
+        time_left_today = day_end - current
+        if time_left_today <= timedelta(0):
+            current = snap_to_biz(current + timedelta(seconds=1))
+            continue
+        if remaining <= time_left_today:
+            current += remaining
+            remaining = timedelta(0)
+        else:
+            remaining -= time_left_today
+            current = snap_to_biz(day_end + timedelta(seconds=1))
+
+    return current
+
+
+async def _get_sla_due_at(priority: TicketPriority, db: AsyncSession, start: datetime | None = None) -> datetime:
+    """Calculate SLA deadline from priority and configured SLA settings."""
+    result = await db.execute(select(SLAConfig).limit(1))
+    cfg = result.scalar_one_or_none()
+    hours_map = {
+        TicketPriority.critical: cfg.critical_hours if cfg else 1,
+        TicketPriority.high:     cfg.high_hours     if cfg else 4,
+        TicketPriority.medium:   cfg.medium_hours   if cfg else 8,
+        TicketPriority.low:      cfg.low_hours      if cfg else 24,
+    }
+    hours = hours_map[priority]
+    from_dt = start or datetime.now(timezone.utc)
+
+    if cfg and cfg.countdown_mode == "business_hours":
+        return _calc_biz_due_at(from_dt, hours, cfg.work_days or [0,1,2,3,4], cfg.work_start or "09:00", cfg.work_end or "20:00")
+
+    return from_dt + timedelta(hours=hours)
 
 
 async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
@@ -239,10 +308,25 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Fetch SLA config to check timer_start setting
+    _sla_cfg_res = await db.execute(select(SLAConfig).limit(1))
+    _sla_cfg = _sla_cfg_res.scalar_one_or_none()
+    timer_start_mode = _sla_cfg.timer_start if _sla_cfg else "on_creation"
+
+    # SLA starts on creation unless configured to start on assignment
+    if timer_start_mode == "on_creation" or body.assignee_id:
+        sla_due_at = await _get_sla_due_at(body.priority, db)
+    else:
+        sla_due_at = None  # will be set when assignee is added
+
+    # Auto set in-progress when ticket is created with an assignee
+    initial_status = TicketStatus.in_progress if body.assignee_id else TicketStatus.open
+
     ticket = Ticket(
         subject=body.subject,
         category=body.category,
         priority=body.priority,
+        status=initial_status,
         submitter_name=body.submitter_name,
         company=body.company,
         contact_name=body.contact_name,
@@ -251,6 +335,7 @@ async def create_ticket(
         asset=body.asset,
         description=body.description,
         assignee_id=body.assignee_id,
+        sla_due_at=sla_due_at,
     )
     db.add(ticket)
     await db.flush()
@@ -272,6 +357,13 @@ async def create_ticket(
             author_id=current_user.id,
         )
         db.add(assign_entry)
+        status_entry = TicketTimeline(
+            ticket_id=ticket.id,
+            type=TimelineType.status,
+            text=f"Status changed to <strong>in-progress</strong> by <strong>{current_user.name}</strong>",
+            author_id=current_user.id,
+        )
+        db.add(status_entry)
 
     await db.flush()
     await db.refresh(ticket)
@@ -326,7 +418,52 @@ async def update_ticket(
     update_data = body.model_dump(exclude_unset=True)
     for key, val in update_data.items():
         setattr(ticket, key, val)
-    ticket.updated_at = datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    ticket.updated_at = now
+
+    # Load SLA config once for use in multiple rules below
+    _sla_res = await db.execute(select(SLAConfig).limit(1))
+    _sla_cfg = _sla_res.scalar_one_or_none()
+    pause_on_statuses = set(_sla_cfg.pause_on) if _sla_cfg and _sla_cfg.pause_on else {"on-hold"}
+    timer_start_mode  = _sla_cfg.timer_start if _sla_cfg else "on_creation"
+
+    # ── SLA: pause / resume based on configurable pause_on statuses ───────
+    if "status" in update_data:
+        new_status_val = update_data["status"]
+        new_status_str = new_status_val.value if hasattr(new_status_val, "value") else str(new_status_val)
+        old_status_str = old_status.value if hasattr(old_status, "value") else str(old_status)
+
+        entering_pause  = new_status_str in pause_on_statuses and old_status_str not in pause_on_statuses
+        leaving_pause   = old_status_str in pause_on_statuses and new_status_str not in pause_on_statuses
+
+        if entering_pause:
+            ticket.sla_paused_at = now
+        elif leaving_pause:
+            # Resume: extend deadline by the time spent paused
+            if ticket.sla_paused_at is not None and ticket.sla_due_at is not None:
+                paused_since = ticket.sla_paused_at
+                if paused_since.tzinfo is None:
+                    paused_since = paused_since.replace(tzinfo=timezone.utc)
+                ticket.sla_due_at = ticket.sla_due_at + (now - paused_since)
+            ticket.sla_paused_at = None
+
+    # ── SLA: recalculate when priority changes ─────────────────────────────
+    if "priority" in update_data:
+        ticket.sla_due_at = await _get_sla_due_at(update_data["priority"], db)
+
+    # ── Auto in-progress + start SLA timer when assignee assigned ──────────
+    if (
+        "assignee_id" in update_data
+        and update_data["assignee_id"] is not None
+        and old_status == TicketStatus.open
+        and "status" not in update_data
+    ):
+        ticket.status = TicketStatus.in_progress
+        update_data["status"] = TicketStatus.in_progress
+        # If timer_start = "on_assignment" and no SLA deadline set yet, set it now
+        if timer_start_mode == "on_assignment" and ticket.sla_due_at is None:
+            ticket.sla_due_at = await _get_sla_due_at(ticket.priority, db)
 
     # Timeline entries for meaningful changes
     if "status" in update_data:

@@ -57,7 +57,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  Category seeding failed: {e}")
 
-    # 3. Start email poller only if inbound email is enabled in DB
+    # 3. Seed default SLA config if the table is empty
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.admin import SLAConfig
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(SLAConfig))
+            if not result.scalar_one_or_none():
+                db.add(SLAConfig(critical_hours=1, high_hours=4, medium_hours=8, low_hours=24))
+                await db.commit()
+                _log("[OK] Default SLA config seeded")
+    except Exception as e:
+        _log(f"  SLA config seeding failed: {e}")
+
+    # 4. Start email poller only if inbound email is enabled in DB
     try:
         from app.database import AsyncSessionLocal
         from app.models.inbound_email import InboundEmailConfig

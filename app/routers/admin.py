@@ -11,6 +11,7 @@ from app.core.deps import get_current_user, require_admin
 from app.database import get_db
 from app.models.admin import EmailConfig, OAuthProvider, SLAConfig
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
+from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.redis_client import get_redis
 from app.schemas.admin import (
@@ -59,18 +60,43 @@ async def update_sla(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
+    from datetime import datetime, timedelta, timezone
+
     result = await db.execute(select(SLAConfig))
     sla = result.scalar_one_or_none()
     if not sla:
         sla = SLAConfig()
         db.add(sla)
 
-    sla.critical_hours = body.critical_hours
-    sla.high_hours = body.high_hours
-    sla.medium_hours = body.medium_hours
-    sla.low_hours = body.low_hours
+    sla.critical_hours  = body.critical_hours
+    sla.high_hours      = body.high_hours
+    sla.medium_hours    = body.medium_hours
+    sla.low_hours       = body.low_hours
+    sla.timer_start     = body.timer_start
+    sla.countdown_mode  = body.countdown_mode
+    sla.work_days       = body.work_days
+    sla.work_start      = body.work_start
+    sla.work_end        = body.work_end
+    sla.pause_on        = body.pause_on
 
     await db.flush()
+
+    # Recalculate sla_due_at for all active (non-closed, non-resolved, non-on-hold) tickets
+    # New deadline = created_at + new SLA hours for that priority
+    active_statuses = [TicketStatus.open, TicketStatus.in_progress]
+    hours_by_priority = {
+        TicketPriority.critical: body.critical_hours,
+        TicketPriority.high:     body.high_hours,
+        TicketPriority.medium:   body.medium_hours,
+        TicketPriority.low:      body.low_hours,
+    }
+    for priority, hours in hours_by_priority.items():
+        await db.execute(
+            sa_update(Ticket)
+            .where(Ticket.priority == priority, Ticket.status.in_(active_statuses))
+            .values(sla_due_at=Ticket.created_at + timedelta(hours=hours))
+        )
+
     await db.refresh(sla)
     return SLAConfigOut.model_validate(sla)
 
