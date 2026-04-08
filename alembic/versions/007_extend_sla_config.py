@@ -18,12 +18,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("sla_config", sa.Column("timer_start",    sa.String(20),  nullable=False, server_default="on_creation"))
-    op.add_column("sla_config", sa.Column("countdown_mode", sa.String(20),  nullable=False, server_default="24_7"))
-    op.add_column("sla_config", sa.Column("work_days",      JSONB(),        nullable=False, server_default="[0,1,2,3,4]"))
-    op.add_column("sla_config", sa.Column("work_start",     sa.String(5),   nullable=False, server_default="'09:00'"))
-    op.add_column("sla_config", sa.Column("work_end",       sa.String(5),   nullable=False, server_default="'20:00'"))
-    op.add_column("sla_config", sa.Column("pause_on",       JSONB(),        nullable=False, server_default='["on-hold"]'))
+    # Use raw SQL ADD COLUMN IF NOT EXISTS for idempotency.
+    # Safe to re-run even if these columns already exist (edge-case replays).
+    op.execute("ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS timer_start    VARCHAR(20) NOT NULL DEFAULT 'on_creation'")
+    op.execute("ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS countdown_mode VARCHAR(20) NOT NULL DEFAULT '24_7'")
+    op.execute("ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS work_days      JSONB       NOT NULL DEFAULT '[0,1,2,3,4]'")
+    op.execute("ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS work_start     VARCHAR(5)  NOT NULL DEFAULT '09:00'")
+    op.execute("ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS work_end       VARCHAR(5)  NOT NULL DEFAULT '20:00'")
+    op.execute("""ALTER TABLE sla_config ADD COLUMN IF NOT EXISTS pause_on JSONB NOT NULL DEFAULT '["on-hold"]'""")
 
 
 def downgrade() -> None:

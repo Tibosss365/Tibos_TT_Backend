@@ -35,6 +35,12 @@ async def _auto_migrate() -> None:
     here, we guarantee the DB schema is always up-to-date the moment the new
     code starts serving traffic — no manual steps, no CI secrets required.
 
+    Self-healing: If the production DB was bootstrapped with create_tables.py
+    (no alembic tracking), the first upgrade attempt fails with
+    DuplicateObjectError.  We detect that, stamp the DB to revision 006
+    (the baseline schema that already exists), then retry — so only the
+    missing revisions 007-009 are applied.
+
     Implementation detail: alembic's env.py calls asyncio.run() internally.
     That call creates a *new* event loop inside the thread-pool thread, so it
     never conflicts with FastAPI's running event loop.
@@ -42,10 +48,24 @@ async def _auto_migrate() -> None:
     def _run_sync() -> None:
         from alembic.config import Config as AlembicConfig
         from alembic import command as alembic_command
+
         cfg = AlembicConfig("alembic.ini")
         # Override the hard-coded localhost URL in alembic.ini
         cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
-        alembic_command.upgrade(cfg, "head")
+
+        try:
+            alembic_command.upgrade(cfg, "head")
+        except Exception as first_err:
+            err_lower = str(first_err).lower()
+            if "already exists" in err_lower or "duplicate" in err_lower:
+                # DB schema was created outside Alembic (e.g. create_tables.py).
+                # Stamp to revision 006 — the baseline that already exists —
+                # then upgrade so only the missing revisions (007-009) run.
+                _log("  Detected untracked schema — stamping to baseline (006)…")
+                alembic_command.stamp(cfg, "006")
+                alembic_command.upgrade(cfg, "head")
+            else:
+                raise
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _run_sync)

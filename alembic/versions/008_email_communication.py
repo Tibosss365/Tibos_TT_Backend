@@ -17,11 +17,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Add email_thread_id to tickets
-    op.add_column("tickets", sa.Column("email_thread_id", sa.String(500), nullable=True))
-    op.create_index("ix_tickets_email_thread_id", "tickets", ["email_thread_id"])
+    # 1. Add email_thread_id to tickets (idempotent)
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS email_thread_id VARCHAR(500)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_tickets_email_thread_id ON tickets (email_thread_id)")
 
-    # 2. Extend timelinetype enum with email_out and email_in
+    # 2. Extend timelinetype enum — already uses IF NOT EXISTS
     op.execute("ALTER TYPE timelinetype ADD VALUE IF NOT EXISTS 'email_out'")
     op.execute("ALTER TYPE timelinetype ADD VALUE IF NOT EXISTS 'email_in'")
 

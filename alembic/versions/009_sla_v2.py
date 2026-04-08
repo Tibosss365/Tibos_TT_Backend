@@ -30,33 +30,23 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Create slastatus enum
-    op.execute(
-        "CREATE TYPE slastatus AS ENUM "
-        "('not_started', 'active', 'paused', 'completed', 'overdue')"
-    )
+    # 1. Create slastatus enum safely (idempotent via DO block)
+    op.execute("""
+        DO $$ BEGIN
+            CREATE TYPE slastatus AS ENUM ('not_started','active','paused','completed','overdue');
+        EXCEPTION WHEN duplicate_object THEN null;
+        END $$
+    """)
 
-    # 2. Add new columns
-    op.add_column("tickets", sa.Column(
-        "sla_start_time", sa.DateTime(timezone=True), nullable=True,
-    ))
-    op.add_column("tickets", sa.Column(
-        "sla_due_time", sa.DateTime(timezone=True), nullable=True,
-    ))
-    op.add_column("tickets", sa.Column(
-        "sla_status",
-        sa.Enum("not_started", "active", "paused", "completed", "overdue",
-                name="slastatus"),
-        nullable=False,
-        server_default="not_started",
-    ))
-    op.add_column("tickets", sa.Column(
-        "sla_paused_seconds", sa.Integer(), nullable=False, server_default="0",
-    ))
+    # 2. Add new columns idempotently
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS sla_start_time     TIMESTAMPTZ")
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS sla_due_time       TIMESTAMPTZ")
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS sla_status         slastatus NOT NULL DEFAULT 'not_started'")
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS sla_paused_seconds INTEGER   NOT NULL DEFAULT 0")
 
-    # 3. Add indexes
-    op.create_index("ix_tickets_sla_status",   "tickets", ["sla_status"])
-    op.create_index("ix_tickets_sla_due_time",  "tickets", ["sla_due_time"])
+    # 3. Add indexes idempotently
+    op.execute("CREATE INDEX IF NOT EXISTS ix_tickets_sla_status   ON tickets (sla_status)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_tickets_sla_due_time ON tickets (sla_due_time)")
 
     # 4. Migrate existing data
     # Copy sla_due_at → sla_due_time for tickets that already had an SLA
