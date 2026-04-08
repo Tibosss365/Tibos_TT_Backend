@@ -242,7 +242,8 @@ async def backfill_sla(
 
     started = 0
     for ticket in tickets:
-        await SLAService.start(ticket, db)
+        # Use created_at so the deadline is relative to ticket creation, not backfill time
+        await SLAService.start(ticket, db, start_time=ticket.created_at)
         started += 1
 
     if started:

@@ -107,10 +107,19 @@ class SLAService:
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     @staticmethod
-    async def start(ticket: Ticket, db: AsyncSession) -> None:
+    async def start(
+        ticket: Ticket,
+        db: AsyncSession,
+        start_time: datetime | None = None,
+    ) -> None:
         """
-        Start the SLA timer. Should be called the moment a ticket gets its
-        first assignment. No-op if already started or running.
+        Start the SLA timer. Called at ticket creation (SLA begins immediately).
+        No-op if already started or running.
+
+        Args:
+            start_time: Override when the SLA clock starts. Defaults to now.
+                        Pass ticket.created_at when backfilling existing tickets
+                        so the deadline is relative to creation, not backfill time.
         """
         current = ticket.sla_status
         # Treat None (pre-migration rows) the same as not_started
@@ -120,18 +129,22 @@ class SLAService:
 
         cfg = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
         hours = _hours_for(ticket.priority, cfg)
-        now   = datetime.now(timezone.utc)
+        t0    = _ensure_utc(start_time) if start_time else datetime.now(timezone.utc)
 
-        ticket.sla_start_time     = now
-        ticket.sla_due_time       = now + timedelta(hours=hours)
+        ticket.sla_start_time     = t0
+        ticket.sla_due_time       = t0 + timedelta(hours=hours)
         ticket.sla_due_at         = ticket.sla_due_time      # keep legacy in sync
         ticket.sla_status         = SLAStatus.active
         ticket.sla_paused_at      = None
         ticket.sla_paused_seconds = 0
 
+        # If the calculated due time is already in the past, mark overdue immediately
+        if ticket.sla_due_time < datetime.now(timezone.utc):
+            ticket.sla_status = SLAStatus.overdue
+
         logger.info(
             f"SLA started for {ticket.ticket_id} | priority={ticket.priority.value} "
-            f"| hours={hours} | due={ticket.sla_due_time.isoformat()}"
+            f"| hours={hours} | start={t0.isoformat()} | due={ticket.sla_due_time.isoformat()}"
         )
 
     @staticmethod

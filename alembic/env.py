@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -21,6 +22,19 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+# ── Override sqlalchemy.url with the real DATABASE_URL from environment ──────
+# This allows alembic to use the production DB (from .env or CI secrets)
+# instead of the localhost URL in alembic.ini
+_db_url = os.environ.get("DATABASE_URL")
+if not _db_url:
+    try:
+        from app.config import get_settings
+        _db_url = get_settings().DATABASE_URL
+    except Exception:
+        pass
+if _db_url:
+    config.set_main_option("sqlalchemy.url", _db_url)
 
 
 def run_migrations_offline() -> None:

@@ -244,7 +244,6 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # SLA rule: start only when BOTH created AND assigned.
     # Auto set in-progress when ticket is created with an assignee.
     initial_status = TicketStatus.in_progress if body.assignee_id else TicketStatus.open
 
@@ -287,8 +286,9 @@ async def create_ticket(
             text=f"Status changed to <strong>in-progress</strong> by <strong>{current_user.name}</strong>",
             author_id=current_user.id,
         ))
-        # SLA starts now — ticket is created AND assigned
-        await SLAService.start(ticket, db)
+
+    # SLA starts immediately when ticket is created (clock runs from creation)
+    await SLAService.start(ticket, db)
 
     await db.flush()
     await db.refresh(ticket)
