@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -26,9 +27,44 @@ def _log(msg: str) -> None:
         print(msg.encode("ascii", errors="replace").decode("ascii"))
 
 
+async def _auto_migrate() -> None:
+    """
+    Run 'alembic upgrade head' on every app startup.
+
+    Why: Azure App Service restarts after each deployment. By running migrations
+    here, we guarantee the DB schema is always up-to-date the moment the new
+    code starts serving traffic — no manual steps, no CI secrets required.
+
+    Implementation detail: alembic's env.py calls asyncio.run() internally.
+    That call creates a *new* event loop inside the thread-pool thread, so it
+    never conflicts with FastAPI's running event loop.
+    """
+    def _run_sync() -> None:
+        from alembic.config import Config as AlembicConfig
+        from alembic import command as alembic_command
+        cfg = AlembicConfig("alembic.ini")
+        # Override the hard-coded localhost URL in alembic.ini
+        cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+        alembic_command.upgrade(cfg, "head")
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_sync)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ────────────────────────────────────────────────────────
+    # 0. Auto-migrate: run 'alembic upgrade head' before anything else.
+    #    This is idempotent — alembic skips revisions already applied.
+    try:
+        _log("  Running database migrations…")
+        await _auto_migrate()
+        _log("[OK] Database migrations up to date")
+    except Exception as e:
+        # Log but don't crash — a failed migration is better diagnosed
+        # from the alembic output than a silent server crash.
+        _log(f"  [WARN] Migration failed (will attempt to continue): {e}")
+
     # 1. Redis
     redis = await get_redis()
     await redis.ping()
