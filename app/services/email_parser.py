@@ -27,6 +27,8 @@ class ParsedEmail(TypedDict):
     subject: str
     body: str          # plain-text body, HTML stripped
     received_at: datetime | None
+    in_reply_to: str   # value of In-Reply-To header (for thread matching)
+    references: str    # value of References header (for thread matching)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -137,6 +139,10 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
         except Exception:
             received_at = None
 
+    # Threading headers (for inbound reply matching)
+    in_reply_to = (msg.get("In-Reply-To") or "").strip()
+    references  = (msg.get("References")  or "").strip()
+
     # Body
     body = _get_body(msg)
 
@@ -147,4 +153,6 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
         subject=subject,
         body=body,
         received_at=received_at,
+        in_reply_to=in_reply_to,
+        references=references,
     )

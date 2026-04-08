@@ -2,7 +2,7 @@ import csv
 import io
 import math
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -21,9 +21,9 @@ from app.models.ticket import (
     TicketTimeline,
     TimelineType,
 )
-from app.models.admin import SLAConfig
 from app.models.user import User, UserRole
 from app.redis_client import get_redis
+from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
     BulkTicketAction,
@@ -40,6 +40,7 @@ from app.services.notification_service import (
     notify_ticket_created,
     notify_ticket_resolved,
 )
+from app.services.email_sender import send_ticket_email
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -58,72 +59,6 @@ def _ticket_query(db: AsyncSession):
     )
 
 
-def _calc_biz_due_at(start: datetime, hours: int, work_days: list, work_start: str, work_end: str) -> datetime:
-    """
-    Advance `start` by `hours` worth of business-hours time.
-    work_days: list of ints 0=Mon … 6=Sun
-    work_start / work_end: "HH:MM" strings (local, treated as UTC for simplicity)
-    """
-    ws_h, ws_m = int(work_start.split(":")[0]), int(work_start.split(":")[1])
-    we_h, we_m = int(work_end.split(":")[0]),   int(work_end.split(":")[1])
-    biz_seconds_per_day = ((we_h * 60 + we_m) - (ws_h * 60 + ws_m)) * 60
-    remaining = timedelta(hours=hours)
-    current = start
-
-    # Snap to next business moment if currently outside business hours
-    def snap_to_biz(dt: datetime) -> datetime:
-        for _ in range(14):  # max 2 weeks scan
-            if dt.weekday() not in work_days:
-                dt = (dt + timedelta(days=1)).replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
-                continue
-            day_start = dt.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
-            day_end   = dt.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
-            if dt < day_start:
-                return day_start
-            if dt >= day_end:
-                dt = (dt + timedelta(days=1)).replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
-                continue
-            return dt
-        return dt
-
-    current = snap_to_biz(current)
-
-    while remaining > timedelta(0):
-        if current.weekday() not in work_days:
-            current = snap_to_biz(current)
-            continue
-        day_end = current.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
-        time_left_today = day_end - current
-        if time_left_today <= timedelta(0):
-            current = snap_to_biz(current + timedelta(seconds=1))
-            continue
-        if remaining <= time_left_today:
-            current += remaining
-            remaining = timedelta(0)
-        else:
-            remaining -= time_left_today
-            current = snap_to_biz(day_end + timedelta(seconds=1))
-
-    return current
-
-
-async def _get_sla_due_at(priority: TicketPriority, db: AsyncSession, start: datetime | None = None) -> datetime:
-    """Calculate SLA deadline from priority and configured SLA settings."""
-    result = await db.execute(select(SLAConfig).limit(1))
-    cfg = result.scalar_one_or_none()
-    hours_map = {
-        TicketPriority.critical: cfg.critical_hours if cfg else 1,
-        TicketPriority.high:     cfg.high_hours     if cfg else 4,
-        TicketPriority.medium:   cfg.medium_hours   if cfg else 8,
-        TicketPriority.low:      cfg.low_hours      if cfg else 24,
-    }
-    hours = hours_map[priority]
-    from_dt = start or datetime.now(timezone.utc)
-
-    if cfg and cfg.countdown_mode == "business_hours":
-        return _calc_biz_due_at(from_dt, hours, cfg.work_days or [0,1,2,3,4], cfg.work_start or "09:00", cfg.work_end or "20:00")
-
-    return from_dt + timedelta(hours=hours)
 
 
 async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
@@ -308,18 +243,8 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Fetch SLA config to check timer_start setting
-    _sla_cfg_res = await db.execute(select(SLAConfig).limit(1))
-    _sla_cfg = _sla_cfg_res.scalar_one_or_none()
-    timer_start_mode = _sla_cfg.timer_start if _sla_cfg else "on_creation"
-
-    # SLA starts on creation unless configured to start on assignment
-    if timer_start_mode == "on_creation" or body.assignee_id:
-        sla_due_at = await _get_sla_due_at(body.priority, db)
-    else:
-        sla_due_at = None  # will be set when assignee is added
-
-    # Auto set in-progress when ticket is created with an assignee
+    # SLA rule: start only when BOTH created AND assigned.
+    # Auto set in-progress when ticket is created with an assignee.
     initial_status = TicketStatus.in_progress if body.assignee_id else TicketStatus.open
 
     ticket = Ticket(
@@ -335,7 +260,6 @@ async def create_ticket(
         asset=body.asset,
         description=body.description,
         assignee_id=body.assignee_id,
-        sla_due_at=sla_due_at,
     )
     db.add(ticket)
     await db.flush()
@@ -350,20 +274,20 @@ async def create_ticket(
     db.add(entry)
 
     if body.assignee_id:
-        assign_entry = TicketTimeline(
+        db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.assign,
             text=f"Assigned by <strong>{current_user.name}</strong>",
             author_id=current_user.id,
-        )
-        db.add(assign_entry)
-        status_entry = TicketTimeline(
+        ))
+        db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.status,
             text=f"Status changed to <strong>in-progress</strong> by <strong>{current_user.name}</strong>",
             author_id=current_user.id,
-        )
-        db.add(status_entry)
+        ))
+        # SLA starts now — ticket is created AND assigned
+        await SLAService.start(ticket, db)
 
     await db.flush()
     await db.refresh(ticket)
@@ -380,6 +304,35 @@ async def create_ticket(
         assignee = assignee_res.scalar_one_or_none()
         if assignee:
             await notify_ticket_assigned(db, full, assignee, current_user.name)
+
+    # ── Email: ticket created confirmation to submitter ────────────────
+    if full.email:
+        email_body = (
+            f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
+            f"<p>Your support request has been received. Here are the details:</p>"
+            f"<p><strong>Subject:</strong> {full.subject}<br/>"
+            f"<strong>Priority:</strong> {full.priority.value if hasattr(full.priority,'value') else full.priority}<br/>"
+            f"<strong>Category:</strong> {full.category}</p>"
+            f"<p>We will get back to you as soon as possible. You can reply to this email to add more information.</p>"
+        )
+        msg_id = await send_ticket_email(
+            db, full,
+            to_email=full.email,
+            subject=f"[{full.ticket_id}] {full.subject}",
+            body_html=email_body,
+            action_label="New Ticket Created",
+            action_color="#6366f1",
+        )
+        if msg_id:
+            # Store thread ID for reply matching and log in timeline
+            ticket.email_thread_id = msg_id
+            db.add(TicketTimeline(
+                ticket_id=ticket.id,
+                type=TimelineType.email_out,
+                text=f"Ticket confirmation email sent to <strong>{full.email}</strong>",
+                author_id=current_user.id,
+            ))
+            await db.flush()
 
     # Invalidate cache
     redis = await get_redis()
@@ -413,57 +366,35 @@ async def update_ticket(
 ):
     ticket = await _get_ticket_or_404(ticket_id, db)
     old_assignee_id = ticket.assignee_id
-    old_status = ticket.status
+    old_status      = ticket.status
 
     update_data = body.model_dump(exclude_unset=True)
     for key, val in update_data.items():
         setattr(ticket, key, val)
 
-    now = datetime.now(timezone.utc)
-    ticket.updated_at = now
+    ticket.updated_at = datetime.now(timezone.utc)
 
-    # Load SLA config once for use in multiple rules below
-    _sla_res = await db.execute(select(SLAConfig).limit(1))
-    _sla_cfg = _sla_res.scalar_one_or_none()
-    pause_on_statuses = set(_sla_cfg.pause_on) if _sla_cfg and _sla_cfg.pause_on else {"on-hold"}
-    timer_start_mode  = _sla_cfg.timer_start if _sla_cfg else "on_creation"
-
-    # ── SLA: pause / resume based on configurable pause_on statuses ───────
+    # ── SLA: handle status transitions ────────────────────────────────────
     if "status" in update_data:
-        new_status_val = update_data["status"]
-        new_status_str = new_status_val.value if hasattr(new_status_val, "value") else str(new_status_val)
-        old_status_str = old_status.value if hasattr(old_status, "value") else str(old_status)
+        await SLAService.handle_status_change(
+            ticket, update_data["status"], old_status, db
+        )
 
-        entering_pause  = new_status_str in pause_on_statuses and old_status_str not in pause_on_statuses
-        leaving_pause   = old_status_str in pause_on_statuses and new_status_str not in pause_on_statuses
-
-        if entering_pause:
-            ticket.sla_paused_at = now
-        elif leaving_pause:
-            # Resume: extend deadline by the time spent paused
-            if ticket.sla_paused_at is not None and ticket.sla_due_at is not None:
-                paused_since = ticket.sla_paused_at
-                if paused_since.tzinfo is None:
-                    paused_since = paused_since.replace(tzinfo=timezone.utc)
-                ticket.sla_due_at = ticket.sla_due_at + (now - paused_since)
-            ticket.sla_paused_at = None
-
-    # ── SLA: recalculate when priority changes ─────────────────────────────
+    # ── SLA: recalculate when priority changes ────────────────────────────
     if "priority" in update_data:
-        ticket.sla_due_at = await _get_sla_due_at(update_data["priority"], db)
+        await SLAService.recalculate(ticket, db, new_priority=update_data["priority"])
 
-    # ── Auto in-progress + start SLA timer when assignee assigned ──────────
+    # ── Auto in-progress + start SLA when first assignee is set ──────────
     if (
         "assignee_id" in update_data
         and update_data["assignee_id"] is not None
-        and old_status == TicketStatus.open
+        and old_assignee_id is None                  # first assignment
         and "status" not in update_data
     ):
         ticket.status = TicketStatus.in_progress
         update_data["status"] = TicketStatus.in_progress
-        # If timer_start = "on_assignment" and no SLA deadline set yet, set it now
-        if timer_start_mode == "on_assignment" and ticket.sla_due_at is None:
-            ticket.sla_due_at = await _get_sla_due_at(ticket.priority, db)
+        # SLA rule: start when both created AND assigned
+        await SLAService.start(ticket, db)
 
     # Timeline entries for meaningful changes
     if "status" in update_data:
@@ -509,6 +440,79 @@ async def update_ticket(
         admins = await _get_admins(db)
         await notify_ticket_resolved(db, full, current_user.name, None, admins)
 
+    # ── Email: status-change notifications to submitter ──────────────────
+    if "status" in update_data and full.email:
+        new_st = update_data["status"]
+        email_cfg_data: dict | None = None
+
+        if new_st == TicketStatus.on_hold:
+            email_cfg_data = dict(
+                subject=f"[{full.ticket_id}] Your ticket is on hold",
+                body=(
+                    f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
+                    f"<p>Your ticket <strong>{full.subject}</strong> has been placed <strong>on hold</strong>.</p>"
+                    f"<p>We will resume work on it as soon as possible. "
+                    f"Reply to this email if you have additional information.</p>"
+                ),
+                action_label="Ticket On Hold",
+                action_color="#f59e0b",
+            )
+        elif new_st == TicketStatus.resolved:
+            resolution_note = full.resolution or ""
+            email_cfg_data = dict(
+                subject=f"[{full.ticket_id}] Your ticket has been resolved",
+                body=(
+                    f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
+                    f"<p>Your ticket <strong>{full.subject}</strong> has been <strong>resolved</strong>.</p>"
+                    + (f"<p><strong>Resolution:</strong><br/>{resolution_note}</p>" if resolution_note else "")
+                    + "<p>If your issue is not fully resolved, reply to this email and we will reopen the ticket.</p>"
+                ),
+                action_label="Ticket Resolved",
+                action_color="#10b981",
+            )
+        elif new_st == TicketStatus.closed:
+            email_cfg_data = dict(
+                subject=f"[{full.ticket_id}] Your ticket has been closed",
+                body=(
+                    f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
+                    f"<p>Your ticket <strong>{full.subject}</strong> has been <strong>closed</strong>.</p>"
+                    f"<p>Thank you for contacting us. If you need further assistance, please submit a new request.</p>"
+                ),
+                action_label="Ticket Closed",
+                action_color="#6b7280",
+            )
+        elif new_st == TicketStatus.in_progress and old_status == TicketStatus.open:
+            email_cfg_data = dict(
+                subject=f"[{full.ticket_id}] Work has started on your ticket",
+                body=(
+                    f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
+                    f"<p>Our team has started working on your ticket <strong>{full.subject}</strong>.</p>"
+                    f"<p>We will keep you updated on the progress. "
+                    f"Reply to this email if you have additional information.</p>"
+                ),
+                action_label="Ticket In Progress",
+                action_color="#8b5cf6",
+            )
+
+        if email_cfg_data:
+            await send_ticket_email(
+                db, full,
+                to_email=full.email,
+                subject=email_cfg_data["subject"],
+                body_html=email_cfg_data["body"],
+                action_label=email_cfg_data["action_label"],
+                action_color=email_cfg_data["action_color"],
+                in_reply_to=full.email_thread_id,
+                references=full.email_thread_id,
+            )
+            db.add(TicketTimeline(
+                ticket_id=full.id,
+                type=TimelineType.email_out,
+                text=f"Status update email sent to <strong>{full.email}</strong>",
+                author_id=current_user.id,
+            ))
+            await db.flush()
+
     redis = await get_redis()
     await cache_service.invalidate_tickets(redis)
 
@@ -540,7 +544,40 @@ async def add_comment(
     ticket.updated_at = datetime.now(timezone.utc)
     await db.flush()
 
+    # ── Optionally email the comment to the submitter ─────────────────────
+    if body.send_to_customer and ticket.email:
+        safe_text = body.text.replace("<", "&lt;").replace(">", "&gt;")
+        email_body = (
+            f"<p>Hi <strong>{ticket.submitter_name}</strong>,</p>"
+            f"<p>A support agent has sent you a message regarding your ticket "
+            f"<strong>{ticket.subject}</strong>:</p>"
+            f"<blockquote style='border-left:3px solid #6366f1;padding:8px 12px;"
+            f"margin:12px 0;background:#f5f5ff;border-radius:4px;"
+            f"color:#374151;white-space:pre-wrap'>{safe_text}</blockquote>"
+            f"<p>You can reply to this email to respond to the agent.</p>"
+        )
+        await send_ticket_email(
+            db, ticket,
+            to_email=ticket.email,
+            subject=f"[{ticket.ticket_id}] Update on your ticket",
+            body_html=email_body,
+            action_label="Agent Message",
+            action_color="#6366f1",
+            in_reply_to=ticket.email_thread_id,
+            references=ticket.email_thread_id,
+        )
+        db.add(TicketTimeline(
+            ticket_id=ticket.id,
+            type=TimelineType.email_out,
+            text=f"Comment sent as email to <strong>{ticket.email}</strong> by <strong>{current_user.name}</strong>",
+            author_id=current_user.id,
+        ))
+        await db.flush()
+
     full = await _get_ticket_or_404(ticket_id, db)
+
+    redis = await get_redis()
+    await cache_service.invalidate_tickets(redis)
 
     await broadcast_ticket_event(
         "ticket_comment",

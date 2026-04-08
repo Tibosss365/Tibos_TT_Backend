@@ -17,6 +17,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 
+class SLAStatus(str, enum.Enum):
+    not_started = "not_started"  # ticket exists but not yet assigned
+    active      = "active"       # SLA timer is running
+    paused      = "paused"       # SLA timer is paused (on-hold)
+    completed   = "completed"    # resolved/closed within SLA
+    overdue     = "overdue"      # past due time, still open
+
+
 class TicketCategory(str, enum.Enum):
     """
     Kept for backward-compat filtering constants.
@@ -48,11 +56,13 @@ class TicketStatus(str, enum.Enum):
 
 
 class TimelineType(str, enum.Enum):
-    created = "created"
-    assign = "assign"
-    status = "status"
-    comment = "comment"
+    created  = "created"
+    assign   = "assign"
+    status   = "status"
+    comment  = "comment"
     resolved = "resolved"
+    email_out = "email_out"   # outbound email sent to customer
+    email_in  = "email_in"    # inbound reply received from customer
 
 
 # Sequence for auto-incrementing ticket numbers
@@ -93,11 +103,34 @@ class Ticket(Base):
     asset: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
-    sla_due_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+    email_thread_id: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+
+    # ── SLA fields ──────────────────────────────────────────────────────────
+    # Legacy (kept for backward compat — mirrors sla_due_time)
+    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # v2 SLA fields
+    sla_start_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When SLA timer was started (ticket creation + assignment)",
+    )
+    sla_due_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True,
+        comment="Absolute SLA deadline = sla_start_time + priority hours",
+    )
+    sla_status: Mapped[SLAStatus] = mapped_column(
+        SAEnum(SLAStatus, name="slastatus"),
+        nullable=False,
+        default=SLAStatus.not_started,
+        server_default="not_started",
+        index=True,
     )
     sla_paused_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True), nullable=True,
+        comment="Timestamp when SLA was last paused",
+    )
+    sla_paused_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+        comment="Total accumulated pause duration in seconds",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

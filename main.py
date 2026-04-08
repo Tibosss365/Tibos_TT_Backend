@@ -9,8 +9,9 @@ from app.config import get_settings
 from app.database import Base, engine
 from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, events, notifications, tickets, ws
-from app.routers import inbound_email, categories
+from app.routers import inbound_email, categories, sla
 from app.services.email_poller import email_poller
+from app.services.sla_service import sla_breach_detector
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -85,10 +86,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  Email poller could not start: {e}")
 
+    # 5. Start SLA breach detector (runs every 60 s)
+    try:
+        sla_breach_detector.start()
+        _log("[OK] SLA breach detector started")
+    except Exception as e:
+        _log(f"  SLA breach detector could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
     email_poller.stop()
+    sla_breach_detector.stop()
     await close_redis()
     _log("[OK] Shutdown complete")
 
@@ -118,6 +127,7 @@ app.include_router(admin.router)
 app.include_router(analytics.router)
 app.include_router(inbound_email.router)
 app.include_router(categories.router)
+app.include_router(sla.router)
 app.include_router(events.router)
 app.include_router(ws.router)
 
@@ -131,5 +141,8 @@ async def health():
         "redis": redis_ok,
         "email_poller": "running" if (
             email_poller._task and not email_poller._task.done()
+        ) else "stopped",
+        "sla_breach_detector": "running" if (
+            sla_breach_detector._task and not sla_breach_detector._task.done()
         ) else "stopped",
     }

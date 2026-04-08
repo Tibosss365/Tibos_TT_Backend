@@ -117,7 +117,7 @@ async def _graph_get_unread(
         f"https://graph.microsoft.com/v1.0/users/{mailbox}"
         "/mailFolders/inbox/messages"
         "?$filter=isRead eq false"
-        "&$select=id,subject,from,body,receivedDateTime,internetMessageId"
+        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders"
         "&$top=50"
     )
     async with httpx.AsyncClient() as client:
@@ -147,7 +147,7 @@ async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
 
 # ── Ticket creation helper ────────────────────────────────────────────────────
 
-async def _create_ticket_from_email(
+async def _process_inbound_email(
     db: AsyncSession,
     inbound: InboundEmailConfig,
     message_id: str,
@@ -156,9 +156,17 @@ async def _create_ticket_from_email(
     subject: str,
     body: str,
     received_at: Optional[datetime],
-) -> tuple[Ticket, EmailTicketLog]:
+    in_reply_to: str = "",
+    references: str = "",
+) -> tuple[Ticket, EmailTicketLog, bool]:
     """
-    Create a Ticket + EmailTicketLog row for one incoming email.
+    Process one inbound email.
+
+    - If In-Reply-To (or References) matches a ticket's email_thread_id,
+      appends an email_in timeline entry to that ticket.
+    - Otherwise creates a new Ticket.
+
+    Returns (ticket, log, is_reply).
     Raises ValueError if message_id already processed (duplicate).
     """
     # De-duplicate check
@@ -168,20 +176,63 @@ async def _create_ticket_from_email(
     if dup.scalar_one_or_none():
         raise ValueError(f"Duplicate message_id: {message_id}")
 
-    # Derive company from email domain  e.g. alice@acme.com → acme.com
-    company = from_email.split("@")[1].lower() if "@" in from_email else ""
+    # ── Try to match an existing ticket via threading headers ─────────────
+    existing_ticket: Ticket | None = None
+    if in_reply_to:
+        res = await db.execute(
+            select(Ticket).where(Ticket.email_thread_id == in_reply_to)
+        )
+        existing_ticket = res.scalar_one_or_none()
 
-    # Use the configured default category; fall back to built-in "email" slug
+    if not existing_ticket and references:
+        for ref_id in references.split():
+            res = await db.execute(
+                select(Ticket).where(Ticket.email_thread_id == ref_id.strip())
+            )
+            existing_ticket = res.scalar_one_or_none()
+            if existing_ticket:
+                break
+
+    if existing_ticket:
+        # Append reply as email_in timeline entry on the existing ticket
+        safe_body = body[:2000].replace("<", "&lt;").replace(">", "&gt;")
+        db.add(TicketTimeline(
+            ticket_id=existing_ticket.id,
+            type=TimelineType.email_in,
+            text=(
+                f"<strong>{from_name or from_email}</strong> "
+                f"&lt;{from_email}&gt; replied:<br/>"
+                f"<span style='white-space:pre-wrap'>{safe_body}</span>"
+            ),
+        ))
+        existing_ticket.updated_at = received_at or datetime.now(timezone.utc)
+
+        log = EmailTicketLog(
+            inbound_config_id=inbound.id,
+            message_id=message_id,
+            from_email=from_email,
+            from_name=from_name,
+            subject=subject,
+            received_at=received_at,
+            status=EmailLogStatus.processed,
+            ticket_id=existing_ticket.id,
+        )
+        db.add(log)
+        await db.flush()
+        return existing_ticket, log, True
+
+    # ── No match — create a new ticket ───────────────────────────────────
+    company = from_email.split("@")[1].lower() if "@" in from_email else ""
     category_slug = inbound.default_category or "email"
 
     ticket = Ticket(
         subject=subject or "(no subject)",
         category=category_slug,
         priority=inbound.default_priority,
-        submitter_name=from_name or from_email,  # who submitted (sender)
-        company=company,                          # derived from email domain
-        contact_name=from_name or from_email,     # sender name as contact
-        email=from_email,                         # sender email as contact email
+        submitter_name=from_name or from_email,
+        company=company,
+        contact_name=from_name or from_email,
+        email=from_email,
         description=body or "(empty body)",
         assignee_id=inbound.default_assignee_id,
         created_at=received_at or datetime.now(timezone.utc),
@@ -190,8 +241,7 @@ async def _create_ticket_from_email(
     db.add(ticket)
     await db.flush()
 
-    # Timeline: auto-created via email
-    entry = TicketTimeline(
+    db.add(TicketTimeline(
         ticket_id=ticket.id,
         type=TimelineType.created,
         text=(
@@ -199,8 +249,7 @@ async def _create_ticket_from_email(
             f"<strong>{from_name or from_email}</strong> "
             f"&lt;{from_email}&gt;"
         ),
-    )
-    db.add(entry)
+    ))
 
     if inbound.default_assignee_id:
         db.add(TicketTimeline(
@@ -221,7 +270,7 @@ async def _create_ticket_from_email(
     )
     db.add(log)
     await db.flush()
-    return ticket, log
+    return ticket, log, False
 
 
 # ── IMAP poller ───────────────────────────────────────────────────────────────
@@ -297,7 +346,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
 
                 async with AsyncSessionLocal() as db:
                     try:
-                        ticket, log = await _create_ticket_from_email(
+                        ticket, log, is_reply = await _process_inbound_email(
                             db, inbound,
                             message_id=parsed["message_id"],
                             from_email=parsed["from_email"],
@@ -305,6 +354,8 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                             subject=parsed["subject"],
                             body=parsed["body"],
                             received_at=parsed["received_at"],
+                            in_reply_to=parsed.get("in_reply_to", ""),
+                            references=parsed.get("references", ""),
                         )
                         await db.commit()
                         processed += 1
@@ -312,8 +363,9 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                         # Invalidate cache + broadcast
                         redis = await get_redis()
                         await invalidate_tickets(redis)
+                        event_name = "ticket_updated" if is_reply else "ticket_created"
                         await broadcast_ticket_event(
-                            "ticket_created",
+                            event_name,
                             {
                                 "ticket_id": str(ticket.id),
                                 "ticket_number": ticket.ticket_id,
@@ -321,9 +373,10 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                                 "from_email": parsed["from_email"],
                             },
                         )
+                        action = "reply appended to" if is_reply else "created"
                         logger.info(
-                            f"Email→Ticket: {ticket.ticket_id} from <{parsed['from_email']}> "
-                            f"subject='{parsed['subject'][:60]}'"
+                            f"Email→Ticket {action}: {ticket.ticket_id} from "
+                            f"<{parsed['from_email']}> subject='{parsed['subject'][:60]}'"
                         )
 
                     except ValueError:
@@ -421,9 +474,19 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
 
             message_id = msg.get("internetMessageId") or f"<graph-{msg['id']}>"
 
+            # Graph API doesn't expose In-Reply-To directly; check internetMessageHeaders
+            in_reply_to = ""
+            references  = ""
+            for hdr in msg.get("internetMessageHeaders", []):
+                name = (hdr.get("name") or "").lower()
+                if name == "in-reply-to":
+                    in_reply_to = (hdr.get("value") or "").strip()
+                elif name == "references":
+                    references  = (hdr.get("value") or "").strip()
+
             async with AsyncSessionLocal() as db:
                 try:
-                    ticket, log = await _create_ticket_from_email(
+                    ticket, log, is_reply = await _process_inbound_email(
                         db, inbound,
                         message_id=message_id,
                         from_email=from_email,
@@ -431,21 +494,22 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                         subject=subject,
                         body=body_text,
                         received_at=received_at,
+                        in_reply_to=in_reply_to,
+                        references=references,
                     )
                     await db.commit()
                     processed += 1
 
                     redis = await get_redis()
                     await invalidate_tickets(redis)
+                    event_name = "ticket_updated" if is_reply else "ticket_created"
                     await broadcast_ticket_event(
-                        "ticket_created",
+                        event_name,
                         {
                             "ticket_id":     str(ticket.id),
                             "ticket_number": ticket.ticket_id,
                             "source":        "email_graph",
                             "from_email":    from_email,
-                            # company derived from domain
-                            "company": from_email.split("@")[1] if "@" in from_email else "",
                         },
                     )
 

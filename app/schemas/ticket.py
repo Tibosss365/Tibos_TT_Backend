@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, computed_field
 
-from app.models.ticket import TicketCategory, TicketPriority, TicketStatus, TimelineType
+from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType
 from app.schemas.user import UserPublic
 
 
@@ -57,8 +57,14 @@ class TicketOut(TicketBase):
     assignee_id: uuid.UUID | None
     assignee: UserPublic | None = None
     resolution: str | None = None
-    sla_due_at: datetime | None = None
+    # ── SLA fields ──────────────────────────────────────────────────────
+    sla_status: SLAStatus = SLAStatus.not_started
+    sla_start_time: datetime | None = None
+    sla_due_time: datetime | None = None
     sla_paused_at: datetime | None = None
+    sla_paused_seconds: int = 0
+    # Legacy (kept for backward compat)
+    sla_due_at: datetime | None = None
     timeline: list[TimelineEntryOut] = []
     created_at: datetime
     updated_at: datetime
@@ -66,11 +72,15 @@ class TicketOut(TicketBase):
     @computed_field
     @property
     def is_overdue(self) -> bool:
-        if self.status in (TicketStatus.resolved, TicketStatus.closed, TicketStatus.on_hold):
+        """True if SLA is active/overdue and past its due time."""
+        if self.sla_status in (SLAStatus.completed, SLAStatus.not_started, SLAStatus.paused):
             return False
-        if self.sla_due_at is None:
+        if self.sla_status == SLAStatus.overdue:
+            return True
+        # active: check wall clock
+        due = self.sla_due_time or self.sla_due_at
+        if due is None:
             return False
-        due = self.sla_due_at
         if due.tzinfo is None:
             due = due.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) > due
@@ -90,8 +100,13 @@ class TicketListOut(BaseModel):
     submitter_name: str
     company: str
     resolution: str | None = None
-    sla_due_at: datetime | None = None
+    # ── SLA fields ──────────────────────────────────────────────────────
+    sla_status: SLAStatus = SLAStatus.not_started
+    sla_start_time: datetime | None = None
+    sla_due_time: datetime | None = None
     sla_paused_at: datetime | None = None
+    sla_paused_seconds: int = 0
+    sla_due_at: datetime | None = None  # legacy
     assignee: UserPublic | None = None
     created_at: datetime
     updated_at: datetime
@@ -99,11 +114,13 @@ class TicketListOut(BaseModel):
     @computed_field
     @property
     def is_overdue(self) -> bool:
-        if self.status in (TicketStatus.resolved, TicketStatus.closed, TicketStatus.on_hold):
+        if self.sla_status in (SLAStatus.completed, SLAStatus.not_started, SLAStatus.paused):
             return False
-        if self.sla_due_at is None:
+        if self.sla_status == SLAStatus.overdue:
+            return True
+        due = self.sla_due_time or self.sla_due_at
+        if due is None:
             return False
-        due = self.sla_due_at
         if due.tzinfo is None:
             due = due.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) > due
@@ -127,6 +144,7 @@ class BulkTicketAction(BaseModel):
 
 class AddCommentRequest(BaseModel):
     text: str = Field(..., min_length=1)
+    send_to_customer: bool = False
 
 
 class PaginatedTickets(BaseModel):
