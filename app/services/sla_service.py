@@ -110,10 +110,12 @@ class SLAService:
     async def start(ticket: Ticket, db: AsyncSession) -> None:
         """
         Start the SLA timer. Should be called the moment a ticket gets its
-        first assignment. No-op if already started.
+        first assignment. No-op if already started or running.
         """
-        if ticket.sla_status != SLAStatus.not_started:
-            logger.debug(f"SLA already started for {ticket.ticket_id} ({ticket.sla_status})")
+        current = ticket.sla_status
+        # Treat None (pre-migration rows) the same as not_started
+        if current is not None and current != SLAStatus.not_started:
+            logger.debug(f"SLA already started for {ticket.ticket_id} ({current})")
             return
 
         cfg = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
@@ -237,8 +239,9 @@ class SLAService:
         Negative  → overdue by that many seconds.
         0         → not started or completed.
         """
-        if not ticket.sla_due_time or ticket.sla_status in (
-            SLAStatus.not_started, SLAStatus.completed
+        status = ticket.sla_status
+        if not ticket.sla_due_time or status in (
+            None, SLAStatus.not_started, SLAStatus.completed
         ):
             return 0
 
@@ -276,7 +279,7 @@ class SLAService:
             "is_completed": bool,
         }
         """
-        status = ticket.sla_status or SLAStatus.not_started
+        status    = ticket.sla_status or SLAStatus.not_started
         remaining = SLAService.get_remaining_seconds(ticket)
         overdue   = SLAService.get_overdue_seconds(ticket)
 
@@ -287,7 +290,7 @@ class SLAService:
         )
 
         return {
-            "sla_status":              status.value,
+            "sla_status":              status.value if status else "not_started",
             "sla_start_time":          ticket.sla_start_time.isoformat() if ticket.sla_start_time else None,
             "sla_due_time":            ticket.sla_due_time.isoformat()   if ticket.sla_due_time   else None,
             "sla_remaining_seconds":   max(remaining, 0),

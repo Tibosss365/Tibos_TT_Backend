@@ -17,6 +17,7 @@ from app.models.ticket import (
     Ticket,
     TicketCategory,
     TicketPriority,
+    SLAStatus,
     TicketStatus,
     TicketTimeline,
     TimelineType,
@@ -384,16 +385,25 @@ async def update_ticket(
     if "priority" in update_data:
         await SLAService.recalculate(ticket, db, new_priority=update_data["priority"])
 
-    # ── Auto in-progress + start SLA when first assignee is set ──────────
+    # ── Auto in-progress when ticket gets its first assignee ─────────────
     if (
         "assignee_id" in update_data
         and update_data["assignee_id"] is not None
-        and old_assignee_id is None                  # first assignment
+        and old_assignee_id is None
+        and old_status == TicketStatus.open
         and "status" not in update_data
     ):
         ticket.status = TicketStatus.in_progress
         update_data["status"] = TicketStatus.in_progress
-        # SLA rule: start when both created AND assigned
+
+    # ── SLA: start whenever an assignee is set AND SLA has not started ────
+    # This fires regardless of whether old_assignee_id was None — the guard
+    # is sla_status == not_started, which prevents double-starting.
+    if (
+        "assignee_id" in update_data
+        and update_data["assignee_id"] is not None
+        and ticket.sla_status == SLAStatus.not_started
+    ):
         await SLAService.start(ticket, db)
 
     # Timeline entries for meaningful changes

@@ -213,3 +213,42 @@ async def trigger_breach_check(
     """
     count = await sla_breach_detector.check_breaches()
     return {"breaches_detected": count}
+
+
+@router.post("/backfill")
+async def backfill_sla(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """
+    Backfill SLA for all assigned tickets whose sla_status is still 'not_started'.
+
+    Call this once after running migration 009, or whenever tickets exist that
+    have an assignee but no active SLA timer.
+
+    Returns how many tickets were updated.
+    """
+    # Find all assigned, non-terminal tickets with SLA not yet started
+    result = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.assignee))
+        .where(
+            Ticket.sla_status == SLAStatus.not_started,
+            Ticket.assignee_id.isnot(None),
+            Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
+        )
+    )
+    tickets = result.scalars().all()
+
+    started = 0
+    for ticket in tickets:
+        await SLAService.start(ticket, db)
+        started += 1
+
+    if started:
+        await db.commit()
+
+    return {
+        "backfilled": started,
+        "message": f"SLA started for {started} ticket(s) that were assigned but had no active timer.",
+    }
