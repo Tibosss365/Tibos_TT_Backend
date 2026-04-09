@@ -52,7 +52,7 @@ def upgrade() -> None:
     # Copy sla_due_at → sla_due_time for tickets that already had an SLA
     op.execute("""
         UPDATE tickets
-        SET sla_due_time = sla_due_at
+        SET sla_due_time = sla_due_at::timestamptz
         WHERE sla_due_at IS NOT NULL
     """)
 
@@ -76,7 +76,7 @@ def upgrade() -> None:
         SET sla_status = CASE
             WHEN status IN ('resolved', 'closed') AND sla_due_time IS NOT NULL
                 THEN 'completed'::slastatus
-            WHEN status = 'on-hold' AND sla_due_time IS NOT NULL
+            WHEN status = 'on_hold' AND sla_due_time IS NOT NULL
                 THEN 'paused'::slastatus
             WHEN sla_due_time IS NOT NULL AND sla_due_time < NOW() AND assignee_id IS NOT NULL
                 THEN 'overdue'::slastatus
