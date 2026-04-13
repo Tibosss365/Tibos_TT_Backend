@@ -101,6 +101,11 @@ async def dashboard_stats(
 
     return {
         "total": total,
+        "open": status_counts.get("open", 0),
+        "in_progress": status_counts.get("in-progress", 0),
+        "on_hold": status_counts.get("on-hold", 0),
+        "resolved": status_counts.get("resolved", 0),
+        "closed": status_counts.get("closed", 0),
         "critical": critical,
         "sla_overdue": sla_overdue,
         "status_counts": status_counts,
