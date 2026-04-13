@@ -22,6 +22,7 @@ class CategoryOut(BaseModel):
     description: str | None
     is_builtin: bool
     sort_order: int
+    group_id: str | None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -32,6 +33,7 @@ class CategoryCreate(BaseModel):
     color: str = Field(default="#6B7280", pattern=r"^#[0-9A-Fa-f]{6}$")
     description: str | None = None
     sort_order: int = 100
+    group_id: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -50,3 +52,4 @@ class CategoryUpdate(BaseModel):
     color: str | None = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
     description: str | None = None
     sort_order: int | None = None
+    group_id: str | None = None

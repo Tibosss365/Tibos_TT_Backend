@@ -62,6 +62,7 @@ async def create_category(
         color=body.color,
         description=body.description,
         sort_order=body.sort_order,
+        group_id=body.group_id,
         is_builtin=False,
     )
     db.add(cat)

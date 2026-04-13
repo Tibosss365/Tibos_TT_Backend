@@ -27,6 +27,7 @@ class Category(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    group_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
