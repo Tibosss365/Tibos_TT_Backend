@@ -1,11 +1,12 @@
 """
 Category CRUD router.
 
-GET    /categories          → list all categories (ordered by sort_order)
-POST   /categories          → create a new custom category (admin only)
-PATCH  /categories/{id}     → update name/color/description (admin only)
-DELETE /categories/{id}     → delete a custom category (built-in protected)
-POST   /categories/reorder  → update sort_order for multiple categories
+GET    /categories               → list all categories (ordered by sort_order)
+POST   /categories               → create a new category (admin only)
+PATCH  /categories/{id}          → update name/color/description (admin only)
+DELETE /categories/clear-builtins → delete ALL built-in categories in one shot
+DELETE /categories/{slug}        → delete any category by slug
+POST   /categories/reorder       → update sort_order for multiple categories
 """
 import re
 import uuid
