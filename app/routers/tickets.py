@@ -77,7 +77,16 @@ async def _get_admins(db: AsyncSession) -> list[User]:
     return list(res.scalars().all())
 
 
-def _apply_filters(stmt, search, status_f, priority_f, category_f, assignee_id):
+def _apply_filters(
+    stmt,
+    search,
+    status_f,
+    priority_f,
+    category_f,
+    assignee_id,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+):
     if search:
         like = f"%{search}%"
         stmt = stmt.where(
@@ -95,6 +104,10 @@ def _apply_filters(stmt, search, status_f, priority_f, category_f, assignee_id):
         stmt = stmt.where(Ticket.category == category_f)
     if assignee_id:
         stmt = stmt.where(Ticket.assignee_id == assignee_id)
+    if date_from:
+        stmt = stmt.where(Ticket.created_at >= date_from)
+    if date_to:
+        stmt = stmt.where(Ticket.created_at <= date_to)
     return stmt
 
 
@@ -125,6 +138,8 @@ async def list_tickets(
     priority: TicketPriority | None = Query(None),
     category: TicketCategory | None = Query(None),
     assignee_id: uuid.UUID | None = Query(None),
+    date_from: datetime | None = Query(None, description="Filter tickets created from this datetime (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="Filter tickets created up to this datetime (ISO 8601)"),
     sort: str = Query("newest"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -135,6 +150,8 @@ async def list_tickets(
     cache_params = {
         "search": search, "status": status, "priority": priority,
         "category": category, "assignee_id": str(assignee_id) if assignee_id else None,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
         "sort": sort, "page": page, "page_size": page_size,
     }
     cache_key = cache_service.ticket_list_key(cache_params)
@@ -143,7 +160,7 @@ async def list_tickets(
         return cached
 
     count_stmt = select(func.count()).select_from(Ticket)
-    count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id)
+    count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, date_from, date_to)
     total_res = await db.execute(count_stmt)
     total = total_res.scalar_one()
 
@@ -153,7 +170,7 @@ async def list_tickets(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    stmt = _apply_filters(stmt, search, status, priority, category, assignee_id)
+    stmt = _apply_filters(stmt, search, status, priority, category, assignee_id, date_from, date_to)
     stmt = _apply_sort(stmt, sort)
 
     result = await db.execute(stmt)
@@ -206,11 +223,13 @@ async def export_csv(
     status: TicketStatus | None = Query(None),
     priority: TicketPriority | None = Query(None),
     category: TicketCategory | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     stmt = select(Ticket).options(selectinload(Ticket.assignee))
-    stmt = _apply_filters(stmt, search, status, priority, category, None)
+    stmt = _apply_filters(stmt, search, status, priority, category, None, date_from, date_to)
     stmt = stmt.order_by(Ticket.created_at.desc())
     result = await db.execute(stmt)
     tickets = result.scalars().all()
@@ -251,7 +270,7 @@ async def create_ticket(
         subject=body.subject,
         category=body.category,
         priority=body.priority,
-        status=initial_status,
+        status=initial_status.value,
         submitter_name=body.submitter_name,
         company=body.company,
         contact_name=body.contact_name,

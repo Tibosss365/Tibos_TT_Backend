@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-
+from typing import Union
 from pydantic import BaseModel, Field, computed_field
 
 from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType
@@ -101,13 +101,13 @@ class TicketListOut(BaseModel):
     company: str
     resolution: str | None = None
     # ── SLA fields ──────────────────────────────────────────────────────
-    sla_status: SLAStatus = SLAStatus.not_started
-    sla_start_time: datetime | None = None
-    sla_due_time: datetime | None = None
-    sla_paused_at: datetime | None = None
-    sla_paused_seconds: int = 0
-    sla_due_at: datetime | None = None  # legacy
-    assignee: UserPublic | None = None
+    sla_status: Union[SLAStatus,str,None] = SLAStatus.not_started
+    sla_start_time: Union[datetime,None] | None = None
+    sla_due_time: Union[datetime,None] | None = None
+    sla_paused_at: Union[datetime,None] | None = None
+    sla_paused_seconds: Union[int,None] = 0
+    sla_due_at: Union[datetime,None] | None = None  # legacy
+    assignee: Union[UserPublic,None] | None = None
     created_at: datetime
     updated_at: datetime
 

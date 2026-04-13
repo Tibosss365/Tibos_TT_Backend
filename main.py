@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import Base, engine
 from app.redis_client import close_redis, get_redis
-from app.routers import admin, agents, analytics, auth, events, notifications, tickets, ws
+from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
 from app.routers import inbound_email, categories, sla
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
@@ -76,92 +76,92 @@ async def lifespan(app: FastAPI):
     # ── Startup ────────────────────────────────────────────────────────
     # 0. Auto-migrate: run 'alembic upgrade head' before anything else.
     #    This is idempotent — alembic skips revisions already applied.
-    try:
-        _log("  Running database migrations…")
-        await _auto_migrate()
-        _log("[OK] Database migrations up to date")
-    except Exception as e:
-        # Log but don't crash — a failed migration is better diagnosed
-        # from the alembic output than a silent server crash.
-        _log(f"  [WARN] Migration failed (will attempt to continue): {e}")
+    # try:
+    #     _log("  Running database migrations…")
+    #     await _auto_migrate()
+    #     _log("[OK] Database migrations up to date")
+    # except Exception as e:
+    #     # Log but don't crash — a failed migration is better diagnosed
+    #     # from the alembic output than a silent server crash.
+    #     _log(f"  [WARN] Migration failed (will attempt to continue): {e}")
 
-    # 1. Redis
-    redis = await get_redis()
-    await redis.ping()
-    _log("[OK] Redis connected")
+    # # 1. Redis
+    # redis = await get_redis()
+    # await redis.ping()
+    # _log("[OK] Redis connected")
 
-    # 2. Seed built-in categories if the table is empty
-    try:
-        from app.database import AsyncSessionLocal
-        from app.models.category import Category
-        async with AsyncSessionLocal() as db:
-            existing = await db.execute(select(Category))
-            if not existing.scalars().first():
-                _BUILTIN_CATS = [
-                    ("hardware", "Hardware", "#8B5CF6", "Physical equipment issues",       1),
-                    ("software", "Software", "#3B82F6", "Application and OS issues",       2),
-                    ("network",  "Network",  "#10B981", "Connectivity and network issues", 3),
-                    ("access",   "Access",   "#F59E0B", "Permissions and login issues",    4),
-                    ("email",    "Email",    "#EF4444", "Email and messaging issues",       5),
-                    ("security", "Security", "#EC4899", "Security incidents and threats",  6),
-                    ("other",    "Other",    "#6B7280", "Uncategorised requests",          7),
-                ]
-                for slug, name, color, desc, order in _BUILTIN_CATS:
-                    db.add(Category(slug=slug, name=name, color=color,
-                                    description=desc, is_builtin=True, sort_order=order))
-                await db.commit()
-                _log("[OK] Built-in categories seeded")
-    except Exception as e:
-        _log(f"  Category seeding failed: {e}")
+    # # 2. Seed built-in categories if the table is empty
+    # try:
+    #     from app.database import AsyncSessionLocal
+    #     from app.models.category import Category
+    #     async with AsyncSessionLocal() as db:
+    #         existing = await db.execute(select(Category))
+    #         if not existing.scalars().first():
+    #             _BUILTIN_CATS = [
+    #                 ("hardware", "Hardware", "#8B5CF6", "Physical equipment issues",       1),
+    #                 ("software", "Software", "#3B82F6", "Application and OS issues",       2),
+    #                 ("network",  "Network",  "#10B981", "Connectivity and network issues", 3),
+    #                 ("access",   "Access",   "#F59E0B", "Permissions and login issues",    4),
+    #                 ("email",    "Email",    "#EF4444", "Email and messaging issues",       5),
+    #                 ("security", "Security", "#EC4899", "Security incidents and threats",  6),
+    #                 ("other",    "Other",    "#6B7280", "Uncategorised requests",          7),
+    #             ]
+    #             for slug, name, color, desc, order in _BUILTIN_CATS:
+    #                 db.add(Category(slug=slug, name=name, color=color,
+    #                                 description=desc, is_builtin=True, sort_order=order))
+    #             await db.commit()
+    #             _log("[OK] Built-in categories seeded")
+    # except Exception as e:
+    #     _log(f"  Category seeding failed: {e}")
 
-    # 3. Seed default SLA config if the table is empty
-    try:
-        from app.database import AsyncSessionLocal
-        from app.models.admin import SLAConfig
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(SLAConfig))
-            if not result.scalar_one_or_none():
-                db.add(SLAConfig(critical_hours=1, high_hours=4, medium_hours=8, low_hours=24))
-                await db.commit()
-                _log("[OK] Default SLA config seeded")
-    except Exception as e:
-        _log(f"  SLA config seeding failed: {e}")
+    # # 3. Seed default SLA config if the table is empty
+    # try:
+    #     from app.database import AsyncSessionLocal
+    #     from app.models.admin import SLAConfig
+    #     async with AsyncSessionLocal() as db:
+    #         result = await db.execute(select(SLAConfig))
+    #         if not result.scalar_one_or_none():
+    #             db.add(SLAConfig(critical_hours=1, high_hours=4, medium_hours=8, low_hours=24))
+    #             await db.commit()
+    #             _log("[OK] Default SLA config seeded")
+    # except Exception as e:
+    #     _log(f"  SLA config seeding failed: {e}")
 
-    # 4. Start email poller only if inbound email is enabled in DB
-    try:
-        from app.database import AsyncSessionLocal
-        from app.models.inbound_email import InboundEmailConfig
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(select(InboundEmailConfig))
-            cfg = result.scalar_one_or_none()
-            if cfg and cfg.enabled:
-                email_poller.start()
-                _log("[OK] Email poller started")
-            else:
-                _log("  Email poller is disabled (configure via Admin -> Email -> Inbound)")
-    except Exception as e:
-        _log(f"  Email poller could not start: {e}")
+    # # 4. Start email poller only if inbound email is enabled in DB
+    # try:
+    #     from app.database import AsyncSessionLocal
+    #     from app.models.inbound_email import InboundEmailConfig
+    #     async with AsyncSessionLocal() as db:
+    #         result = await db.execute(select(InboundEmailConfig))
+    #         cfg = result.scalar_one_or_none()
+    #         if cfg and cfg.enabled:
+    #             email_poller.start()
+    #             _log("[OK] Email poller started")
+    #         else:
+    #             _log("  Email poller is disabled (configure via Admin -> Email -> Inbound)")
+    # except Exception as e:
+    #     _log(f"  Email poller could not start: {e}")
 
-    # 5. Start SLA breach detector (runs every 60 s)
-    try:
-        sla_breach_detector.start()
-        _log("[OK] SLA breach detector started")
-    except Exception as e:
-        _log(f"  SLA breach detector could not start: {e}")
+    # # 5. Start SLA breach detector (runs every 60 s)
+    # try:
+    #     sla_breach_detector.start()
+    #     _log("[OK] SLA breach detector started")
+    # except Exception as e:
+    #     _log(f"  SLA breach detector could not start: {e}")
 
-    yield
+    # yield
 
-    # ── Shutdown ───────────────────────────────────────────────────────
-    email_poller.stop()
-    sla_breach_detector.stop()
-    await close_redis()
-    _log("[OK] Shutdown complete")
-
+    # # ── Shutdown ───────────────────────────────────────────────────────
+    # email_poller.stop()
+    # sla_breach_detector.stop()
+    # await close_redis()
+    # _log("[OK] Shutdown complete")
+    ...
 
 app = FastAPI(
     title=settings.APP_TITLE,
     version=settings.APP_VERSION,
-    lifespan=lifespan,
+
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -181,6 +181,7 @@ app.include_router(tickets.router)
 app.include_router(notifications.router)
 app.include_router(admin.router)
 app.include_router(analytics.router)
+app.include_router(dashboard.router)
 app.include_router(inbound_email.router)
 app.include_router(categories.router)
 app.include_router(sla.router)
