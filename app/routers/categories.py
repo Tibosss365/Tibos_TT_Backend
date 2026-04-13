@@ -90,18 +90,16 @@ async def update_category(
     return CategoryOut.model_validate(cat)
 
 
-@router.delete("/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_category(
-    category_id: uuid.UUID,
+    slug: str,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    result = await db.execute(select(Category).where(Category.id == category_id))
+    result = await db.execute(select(Category).where(Category.slug == slug))
     cat: Category | None = result.scalar_one_or_none()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
-    if cat.is_builtin:
-        raise HTTPException(status_code=403, detail="Built-in categories cannot be deleted")
     await db.delete(cat)
 
 
