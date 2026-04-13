@@ -11,7 +11,7 @@ import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, require_admin
@@ -88,6 +88,15 @@ async def update_category(
     await db.flush()
     await db.refresh(cat)
     return CategoryOut.model_validate(cat)
+
+
+@router.delete("/clear-builtins", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_builtin_categories(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Delete all built-in (seeded) categories in one shot."""
+    await db.execute(delete(Category).where(Category.is_builtin == True))  # noqa: E712
 
 
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
