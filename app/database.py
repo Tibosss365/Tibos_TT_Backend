@@ -26,9 +26,9 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
     pool_pre_ping=True,
-    pool_size=10,
+    pool_size=3,         # keep headroom for migration + admin connections
+    max_overflow=5,      # 8 total max per process on Azure Basic tier (50 conn limit)
     connect_args=_build_connect_args(settings.DATABASE_URL),
-    max_overflow=20,
 )
 
 AsyncSessionLocal = async_sessionmaker(
