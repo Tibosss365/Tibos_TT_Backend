@@ -9,9 +9,7 @@ from app.database import get_db
 from app.models.admin import SLAConfig
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from app.models.user import User
-from app.redis_client import get_redis
 from app.schemas.analytics import AnalyticsOut
-from app.services import cache_service
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -21,12 +19,6 @@ async def get_analytics(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    redis = await get_redis()
-    cache_key = cache_service.analytics_key()
-    cached = await cache_service.cache_get(redis, cache_key)
-    if cached:
-        return cached
-
     # Status distribution
     status_dist: dict[str, int] = {}
     for s in TicketStatus:
@@ -90,9 +82,6 @@ async def get_analytics(
         sla_compliance[p.value] = round(within / total_p * 100, 1)
 
     # Tickets over time (last 30 days, grouped by day)
-    # Use literal_column("'day'") so the unit is embedded as a SQL literal,
-    # not a bind parameter — otherwise PostgreSQL rejects the GROUP BY because
-    # it sees different parameter slots ($1 vs $3) as different expressions.
     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     day_trunc = func.date_trunc(literal_column("'day'"), Ticket.created_at).label("day")
     daily_res = await db.execute(
@@ -118,7 +107,7 @@ async def get_analytics(
     avg_hours_raw = avg_res.scalar_one()
     avg_resolution_hours = round(float(avg_hours_raw), 1) if avg_hours_raw else 0.0
 
-    analytics = AnalyticsOut(
+    return AnalyticsOut(
         status_distribution=status_dist,
         category_distribution=cat_dist,
         priority_distribution=pri_dist,
@@ -127,8 +116,3 @@ async def get_analytics(
         tickets_over_time=tickets_over_time,
         avg_resolution_hours=avg_resolution_hours,
     )
-
-    await cache_service.cache_set(
-        redis, cache_key, analytics.model_dump(), cache_service.ANALYTICS_TTL
-    )
-    return analytics

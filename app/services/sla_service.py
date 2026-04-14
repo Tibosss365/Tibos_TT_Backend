@@ -32,7 +32,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -397,7 +397,7 @@ class SLABreachDetector:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Ticket).where(
-                    Ticket.sla_status == SLAStatus.active,
+                    Ticket.sla_status.cast(String) == SLAStatus.active.value,
                     Ticket.sla_due_time.isnot(None),
                     Ticket.sla_due_time < now,
                 )

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, or_, update, delete
+from sqlalchemy import func, select, or_, update, delete, String
 from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -23,7 +23,6 @@ from app.models.ticket import (
     TimelineType,
 )
 from app.models.user import User, UserRole
-from app.redis_client import get_redis
 from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
@@ -34,7 +33,6 @@ from app.schemas.ticket import (
     TicketOut,
     TicketUpdate,
 )
-from app.services import cache_service
 from app.services.notification_service import (
     broadcast_ticket_event,
     notify_ticket_assigned,
@@ -60,8 +58,6 @@ def _ticket_query(db: AsyncSession):
     )
 
 
-
-
 async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
     result = await db.execute(
         _ticket_query(db).where(Ticket.id == ticket_id)
@@ -84,6 +80,7 @@ def _apply_filters(
     priority_f,
     category_f,
     assignee_id,
+    sla_status_f=None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ):
@@ -104,6 +101,11 @@ def _apply_filters(
         stmt = stmt.where(Ticket.category == category_f)
     if assignee_id:
         stmt = stmt.where(Ticket.assignee_id == assignee_id)
+    if sla_status_f:
+        # Cast to String because the production DB stores sla_status as
+        # character varying, not a native PostgreSQL enum type. Without the
+        # cast, asyncpg emits "$1::slastatus" which causes an operator error.
+        stmt = stmt.where(Ticket.sla_status.cast(String) == sla_status_f.value)
     if date_from:
         stmt = stmt.where(Ticket.created_at >= date_from)
     if date_to:
@@ -136,55 +138,45 @@ async def list_tickets(
     search: str | None = Query(None),
     status: TicketStatus | None = Query(None),
     priority: TicketPriority | None = Query(None),
-    category: TicketCategory | None = Query(None),
+    category: str | None = Query(None),
     assignee_id: uuid.UUID | None = Query(None),
+    sla_status: SLAStatus | None = Query(None),
     date_from: datetime | None = Query(None, description="Filter tickets created from this datetime (ISO 8601)"),
     date_to: datetime | None = Query(None, description="Filter tickets created up to this datetime (ISO 8601)"),
     sort: str = Query("newest"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    # Accept 'limit' as an alias for page_size (used by analytics page)
+    limit: int | None = Query(None, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    redis = await get_redis()
-    cache_params = {
-        "search": search, "status": status, "priority": priority,
-        "category": category, "assignee_id": str(assignee_id) if assignee_id else None,
-        "date_from": date_from.isoformat() if date_from else None,
-        "date_to": date_to.isoformat() if date_to else None,
-        "sort": sort, "page": page, "page_size": page_size,
-    }
-    cache_key = cache_service.ticket_list_key(cache_params)
-    cached = await cache_service.cache_get(redis, cache_key)
-    if cached:
-        return cached
+    effective_page_size = limit if limit is not None else page_size
 
     count_stmt = select(func.count()).select_from(Ticket)
-    count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, date_from, date_to)
+    count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
     total_res = await db.execute(count_stmt)
     total = total_res.scalar_one()
 
     stmt = (
         select(Ticket)
         .options(selectinload(Ticket.assignee))
-        .offset((page - 1) * page_size)
-        .limit(page_size)
+        .offset((page - 1) * effective_page_size)
+        .limit(effective_page_size)
     )
-    stmt = _apply_filters(stmt, search, status, priority, category, assignee_id, date_from, date_to)
+    stmt = _apply_filters(stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
     stmt = _apply_sort(stmt, sort)
 
     result = await db.execute(stmt)
     tickets = result.scalars().all()
 
-    response = PaginatedTickets(
+    return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
         total=total,
         page=page,
-        page_size=page_size,
-        pages=math.ceil(total / page_size) if total else 1,
+        page_size=effective_page_size,
+        pages=math.ceil(total / effective_page_size) if total else 1,
     )
-    await cache_service.cache_set(redis, cache_key, response.model_dump(), cache_service.LIST_TTL)
-    return response
 
 
 @router.get("/mine", response_model=PaginatedTickets)
@@ -222,14 +214,14 @@ async def export_csv(
     search: str | None = Query(None),
     status: TicketStatus | None = Query(None),
     priority: TicketPriority | None = Query(None),
-    category: TicketCategory | None = Query(None),
+    category: str | None = Query(None),
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     stmt = select(Ticket).options(selectinload(Ticket.assignee))
-    stmt = _apply_filters(stmt, search, status, priority, category, None, date_from, date_to)
+    stmt = _apply_filters(stmt, search, status, priority, category, None, None, date_from, date_to)
     stmt = stmt.order_by(Ticket.created_at.desc())
     result = await db.execute(stmt)
     tickets = result.scalars().all()
@@ -242,7 +234,7 @@ async def export_csv(
     ])
     for t in tickets:
         writer.writerow([
-            t.ticket_id, t.subject, t.category.value, t.priority.value,
+            t.ticket_id, t.subject, t.category, t.priority.value,
             t.status.value,
             t.assignee.name if t.assignee else "Unassigned",
             t.submitter_name, t.company, t.email,
@@ -354,10 +346,6 @@ async def create_ticket(
             ))
             await db.flush()
 
-    # Invalidate cache
-    redis = await get_redis()
-    await cache_service.invalidate_tickets(redis)
-
     # Broadcast
     await broadcast_ticket_event(
         "ticket_created",
@@ -416,8 +404,6 @@ async def update_ticket(
         update_data["status"] = TicketStatus.in_progress
 
     # ── SLA: start whenever an assignee is set AND SLA has not started ────
-    # This fires regardless of whether old_assignee_id was None — the guard
-    # is sla_status == not_started, which prevents double-starting.
     if (
         "assignee_id" in update_data
         and update_data["assignee_id"] is not None
@@ -542,9 +528,6 @@ async def update_ticket(
             ))
             await db.flush()
 
-    redis = await get_redis()
-    await cache_service.invalidate_tickets(redis)
-
     await broadcast_ticket_event(
         "ticket_updated",
         {"ticket_id": str(ticket_id), "ticket_number": full.ticket_id},
@@ -605,9 +588,6 @@ async def add_comment(
 
     full = await _get_ticket_or_404(ticket_id, db)
 
-    redis = await get_redis()
-    await cache_service.invalidate_tickets(redis)
-
     await broadcast_ticket_event(
         "ticket_comment",
         {"ticket_id": str(ticket_id), "author": current_user.name},
@@ -625,8 +605,6 @@ async def delete_ticket(
 ):
     ticket = await _get_ticket_or_404(ticket_id, db)
     await db.delete(ticket)
-    redis = await get_redis()
-    await cache_service.invalidate_tickets(redis)
     await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
 
 
@@ -646,8 +624,6 @@ async def bulk_action(
             .values(status=new_status, updated_at=datetime.now(timezone.utc))
         )
 
-    redis = await get_redis()
-    await cache_service.invalidate_tickets(redis)
     await broadcast_ticket_event(
         "tickets_bulk_updated",
         {"action": body.action, "count": len(body.ticket_ids)},

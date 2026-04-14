@@ -1,16 +1,18 @@
 import asyncio
-import sys
+import logging
+import traceback
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.config import get_settings
-from app.database import Base, engine
+from app.database import engine
 from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
-from app.routers import inbound_email, categories, sla
+from app.routers import inbound_email, categories, sla, groups
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 
@@ -18,8 +20,9 @@ from app.services.sla_service import sla_breach_detector
 import app.models  # noqa: F401
 
 settings = get_settings()
+logger = logging.getLogger("uvicorn.error")
 
-# Safe print that never crashes on Windows cp1252 consoles
+
 def _log(msg: str) -> None:
     try:
         print(msg)
@@ -28,29 +31,11 @@ def _log(msg: str) -> None:
 
 
 async def _auto_migrate() -> None:
-    """
-    Run 'alembic upgrade head' on every app startup.
-
-    Why: Azure App Service restarts after each deployment. By running migrations
-    here, we guarantee the DB schema is always up-to-date the moment the new
-    code starts serving traffic — no manual steps, no CI secrets required.
-
-    Self-healing: If the production DB was bootstrapped with create_tables.py
-    (no alembic tracking), the first upgrade attempt fails with
-    DuplicateObjectError.  We detect that, stamp the DB to revision 006
-    (the baseline schema that already exists), then retry — so only the
-    missing revisions 007-009 are applied.
-
-    Implementation detail: alembic's env.py calls asyncio.run() internally.
-    That call creates a *new* event loop inside the thread-pool thread, so it
-    never conflicts with FastAPI's running event loop.
-    """
     def _run_sync() -> None:
         from alembic.config import Config as AlembicConfig
         from alembic import command as alembic_command
 
         cfg = AlembicConfig("alembic.ini")
-        # Override the hard-coded localhost URL in alembic.ini
         cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
         try:
@@ -58,9 +43,6 @@ async def _auto_migrate() -> None:
         except Exception as first_err:
             err_lower = str(first_err).lower()
             if "already exists" in err_lower or "duplicate" in err_lower:
-                # DB schema was created outside Alembic (e.g. create_tables.py).
-                # Stamp to revision 006 — the baseline that already exists —
-                # then upgrade so only the missing revisions (007-009) run.
                 _log("  Detected untracked schema — stamping to baseline (006)…")
                 alembic_command.stamp(cfg, "006")
                 alembic_command.upgrade(cfg, "head")
@@ -75,9 +57,7 @@ async def _auto_migrate() -> None:
 async def lifespan(app: FastAPI):
     # ── Startup ────────────────────────────────────────────────────────
 
-    # 0. Auto-migrate — runs 'alembic upgrade head' so the DB schema is
-    #    always current when a new version starts (idempotent, safe to run
-    #    every restart).
+    # 0. Auto-migrate
     try:
         _log("  Running database migrations...")
         await _auto_migrate()
@@ -85,13 +65,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Migration failed (will attempt to continue): {e}")
 
-    # 1. Redis
+    # 1. Redis (optional — caching removed, Redis not required)
     try:
         redis = await get_redis()
         await redis.ping()
         _log("[OK] Redis connected")
     except Exception as e:
-        _log(f"  [WARN] Redis unavailable: {e}")
+        _log(f"  [INFO] Redis unavailable (not required): {e}")
 
     # 2. Seed default SLA config if the table is empty
     try:
@@ -104,7 +84,7 @@ async def lifespan(app: FastAPI):
                 await db.commit()
                 _log("[OK] Default SLA config seeded")
     except Exception as e:
-        _log(f"  SLA config seeding failed: {e}")
+        _log(f"  [WARN] SLA config seeding failed: {e}")
 
     # 3. Start email poller only if inbound email is enabled in DB
     try:
@@ -119,14 +99,14 @@ async def lifespan(app: FastAPI):
             else:
                 _log("  Email poller disabled (configure via Admin -> Email -> Inbound)")
     except Exception as e:
-        _log(f"  Email poller could not start: {e}")
+        _log(f"  [WARN] Email poller could not start: {e}")
 
     # 4. Start SLA breach detector (runs every 60 s)
     try:
         sla_breach_detector.start()
         _log("[OK] SLA breach detector started")
     except Exception as e:
-        _log(f"  SLA breach detector could not start: {e}")
+        _log(f"  [WARN] SLA breach detector could not start: {e}")
 
     yield
 
@@ -134,7 +114,9 @@ async def lifespan(app: FastAPI):
     email_poller.stop()
     sla_breach_detector.stop()
     await close_redis()
+    await engine.dispose()
     _log("[OK] Shutdown complete")
+
 
 app = FastAPI(
     title=settings.APP_TITLE,
@@ -152,6 +134,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Log every unhandled exception with a full traceback so 500s are visible."""
+    tb = traceback.format_exc()
+    logger.error(f"Unhandled exception on {request.method} {request.url}\n{tb}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+    )
+
+
 # Routers
 app.include_router(auth.router)
 app.include_router(agents.router)
@@ -163,17 +157,24 @@ app.include_router(dashboard.router)
 app.include_router(inbound_email.router)
 app.include_router(categories.router)
 app.include_router(sla.router)
+app.include_router(groups.router)
 app.include_router(events.router)
 app.include_router(ws.router)
 
 
 @app.get("/health", tags=["health"])
 async def health():
-    redis = await get_redis()
-    redis_ok = await redis.ping()
+    redis_status = "unavailable"
+    try:
+        redis = await get_redis()
+        ok = await redis.ping()
+        redis_status = "ok" if ok else "unavailable"
+    except Exception:
+        redis_status = "unavailable"
+
     return {
         "status": "ok",
-        "redis": redis_ok,
+        "redis": redis_status,
         "email_poller": "running" if (
             email_poller._task and not email_poller._task.done()
         ) else "stopped",

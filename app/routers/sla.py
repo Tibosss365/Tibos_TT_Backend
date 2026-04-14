@@ -16,7 +16,7 @@ POST /sla/check-breaches       → trigger breach detection on demand
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -84,7 +84,7 @@ async def list_overdue_tickets(
     result = await db.execute(
         select(Ticket)
         .options(selectinload(Ticket.assignee))
-        .where(Ticket.sla_status == SLAStatus.overdue)
+        .where(Ticket.sla_status.cast(String) == SLAStatus.overdue.value)
         .order_by(Ticket.sla_due_time.asc())
     )
     tickets = result.scalars().all()
@@ -233,7 +233,7 @@ async def backfill_sla(
         select(Ticket)
         .options(selectinload(Ticket.assignee))
         .where(
-            Ticket.sla_status == SLAStatus.not_started,
+            Ticket.sla_status.cast(String) == SLAStatus.not_started.value,
             Ticket.assignee_id.isnot(None),
             Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
         )

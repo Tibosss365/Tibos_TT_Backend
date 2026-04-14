@@ -13,7 +13,6 @@ from app.models.admin import EmailConfig, OAuthProvider, SLAConfig
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from sqlalchemy import update as sa_update
 from app.models.user import User
-from app.redis_client import get_redis
 from app.schemas.admin import (
     AdminStats,
     EmailConfigOut,
@@ -23,7 +22,6 @@ from app.schemas.admin import (
     SLAConfigOut,
     SLAConfigUpdate,
 )
-from app.services import cache_service
 
 # Provider OAuth endpoint presets
 _OAUTH_PRESETS = {
@@ -50,7 +48,11 @@ async def get_sla(
     result = await db.execute(select(SLAConfig))
     sla = result.scalar_one_or_none()
     if not sla:
-        raise HTTPException(status_code=404, detail="SLA config not found")
+        # Auto-create default SLA config so the route always returns 200
+        sla = SLAConfig(critical_hours=1, high_hours=4, medium_hours=8, low_hours=24)
+        db.add(sla)
+        await db.flush()
+        await db.refresh(sla)
     return SLAConfigOut.model_validate(sla)
 
 
@@ -60,7 +62,7 @@ async def update_sla(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     result = await db.execute(select(SLAConfig))
     sla = result.scalar_one_or_none()
@@ -82,7 +84,6 @@ async def update_sla(
     await db.flush()
 
     # Recalculate sla_due_at for all active (non-closed, non-resolved, non-on-hold) tickets
-    # New deadline = created_at + new SLA hours for that priority
     active_statuses = [TicketStatus.open, TicketStatus.in_progress]
     hours_by_priority = {
         TicketPriority.critical: body.critical_hours,
@@ -111,7 +112,11 @@ async def get_email(
     result = await db.execute(select(EmailConfig))
     cfg = result.scalar_one_or_none()
     if not cfg:
-        raise HTTPException(status_code=404, detail="Email config not found")
+        # Auto-create a default (unconfigured) email config so the route returns 200
+        cfg = EmailConfig()
+        db.add(cfg)
+        await db.flush()
+        await db.refresh(cfg)
     return EmailConfigOut.model_validate(cfg)
 
 
@@ -261,12 +266,6 @@ async def get_stats(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    redis = await get_redis()
-    cache_key = cache_service.stats_key()
-    cached = await cache_service.cache_get(redis, cache_key)
-    if cached:
-        return cached
-
     # Count by status
     status_counts: dict[str, int] = {}
     for s in TicketStatus:
@@ -311,7 +310,7 @@ async def get_stats(
         })
 
     total = sum(status_counts.values())
-    stats = AdminStats(
+    return AdminStats(
         total_tickets=total,
         open_tickets=status_counts.get("open", 0),
         in_progress_tickets=status_counts.get("in-progress", 0),
@@ -321,6 +320,3 @@ async def get_stats(
         unassigned_tickets=unassigned,
         agent_workload=agent_workload,
     )
-
-    await cache_service.cache_set(redis, cache_key, stats.model_dump(), cache_service.STATS_TTL)
-    return stats

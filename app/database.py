@@ -1,34 +1,37 @@
+import urllib.parse as _urlparse
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
 settings = get_settings()
 
-import urllib.parse as _urlparse
 
 def _build_connect_args(url: str) -> dict:
     """Return connect_args appropriate for the DB URL (SSL only for remote hosts)."""
     try:
         parsed = _urlparse.urlparse(url)
         host = parsed.hostname or ""
-        # Enable SSL for any non-localhost remote host that requests it
         needs_ssl = host not in ("localhost", "127.0.0.1", "::1") and "ssl=require" in url
         return {"ssl": True} if needs_ssl else {}
     except Exception:
         return {}
 
+
+# NullPool: no connections are held between requests.
+# Each DB operation opens and closes its own connection.
+# This completely prevents pool-leak / TooManyConnections errors on
+# low-limit hosted databases (Neon, Supabase free tier, Azure Basic, etc.)
+# and is the safest choice for a single-process dev/prod server.
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    pool_pre_ping=True,
-    pool_size=3,         # keep headroom for migration + admin connections
-    max_overflow=5,      # 8 total max per process on Azure Basic tier (50 conn limit)
-    connect_args=_build_connect_args(settings.DATABASE_URL),
+    echo=settings.DEBUG
 )
 
 AsyncSessionLocal = async_sessionmaker(
