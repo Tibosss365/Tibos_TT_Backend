@@ -32,6 +32,7 @@ class TicketBase(BaseModel):
 
 class TicketCreate(TicketBase):
     assignee_id: uuid.UUID | None = None
+    group_id:str | None=None
 
 
 class TicketUpdate(BaseModel):
@@ -47,12 +48,14 @@ class TicketUpdate(BaseModel):
     asset: str | None = None
     description: str | None = None
     resolution: str | None = None
+    group_id:str | None=None
 
 
 class TicketOut(TicketBase):
     id: uuid.UUID
     ticket_number: int
     ticket_id: str
+    group_id:str
     status: TicketStatus
     assignee_id: uuid.UUID | None
     assignee: UserPublic | None = None

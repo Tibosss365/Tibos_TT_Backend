@@ -255,6 +255,7 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    print("Hello iam from the ticket",body.group_id)
     # Auto set in-progress when ticket is created with an assignee.
     initial_status = TicketStatus.in_progress if body.assignee_id else TicketStatus.open
 
@@ -271,6 +272,7 @@ async def create_ticket(
         asset=body.asset,
         description=body.description,
         assignee_id=body.assignee_id,
+        group_id=body.group_id
     )
     db.add(ticket)
     await db.flush()
