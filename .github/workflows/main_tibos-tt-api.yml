@@ -33,13 +33,13 @@ jobs:
       # ── Run database migrations before deploying new code ────────────────
       # This ensures the DB schema is always up-to-date before the new app
       # version starts serving traffic. Requires DATABASE_URL in repo secrets.
-      - name: Run Alembic migrations
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-placeholder-key' }}
-        run: |
-          source antenv/bin/activate
-          alembic upgrade head
+      # - name: Run Alembic migrations
+      #   env:
+      #     DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      #     SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-placeholder-key' }}
+      #   run: |
+      #     source antenv/bin/activate
+      #     alembic upgrade head
 
       # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size.
       - name: Upload artifact for deployment jobs
