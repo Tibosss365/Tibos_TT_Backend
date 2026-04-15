@@ -13,10 +13,12 @@ from app.models.admin import EmailConfig, OAuthProvider, SLAConfig
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from sqlalchemy import update as sa_update
 from app.models.user import User
+from app.services.email_sender import send_test_email
 from app.schemas.admin import (
     AdminStats,
     EmailConfigOut,
     EmailConfigUpdate,
+    EmailTestRequest,
     OAuthAuthorizeUrl,
     OAuthCallbackRequest,
     SLAConfigOut,
@@ -257,6 +259,29 @@ async def oauth_revoke(
     await db.flush()
     await db.refresh(cfg)
     return EmailConfigOut.model_validate(cfg)
+
+
+@router.post("/email/test")
+async def test_email(
+    body: EmailTestRequest,
+    _: User = Depends(require_admin),
+):
+    """
+    Send a test email using the credentials provided in the request body.
+    Credentials come directly from the frontend form — DB is NOT read.
+    This lets the user test before saving.
+    Works for SMTP, M365 (Microsoft Graph), and OAuth 2.0.
+    """
+    from app.services.email_sender import send_test_from_request
+    try:
+        await send_test_from_request(body)
+        return {"ok": True, "message": f"Test email sent successfully to {body.to_email}"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 
 # ── Stats / Overview ───────────────────────────────────────────────────────

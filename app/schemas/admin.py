@@ -1,9 +1,39 @@
 import uuid
 from datetime import datetime
+from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from app.models.admin import EmailType, OAuthProvider, SMTPSecurity
+
+
+class EmailTestRequest(BaseModel):
+    """
+    Request body for POST /admin/email/test.
+    All credentials come from the frontend form state — NOT read from DB.
+    This allows testing credentials before saving.
+    """
+    to_email: EmailStr
+    type: str  # "smtp" | "m365" | "oauth"
+
+    # SMTP fields
+    smtp_host:     Optional[str] = None
+    smtp_port:     Optional[str] = "587"
+    smtp_security: Optional[str] = "tls"   # "tls" | "ssl" | "none"
+    smtp_from:     Optional[str] = None
+    smtp_user:     Optional[str] = None
+    smtp_pass:     Optional[str] = None
+
+    # M365 / Microsoft Graph fields
+    m365_tenant_id:     Optional[str] = None
+    m365_client_id:     Optional[str] = None
+    m365_client_secret: Optional[str] = None
+    m365_from:          Optional[str] = None
+
+    # OAuth fields
+    oauth_provider:     Optional[str] = None   # "google" | "microsoft" | "custom"
+    oauth_from:         Optional[str] = None
+    oauth_access_token: Optional[str] = None
 
 
 class SLAConfigOut(BaseModel):
