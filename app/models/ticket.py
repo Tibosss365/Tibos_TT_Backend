@@ -105,6 +105,12 @@ class Ticket(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
     email_thread_id: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    # Ticket group slug — matches Category.group_id / DEFAULT_GROUPS ids
+    # e.g. "microsoft-365", "security-compliance", "end-user-support"
+    group_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, index=True,
+        comment="Group/team this ticket belongs to (matches category group slugs)",
+    )
 
     # ── SLA fields ──────────────────────────────────────────────────────────
     # Legacy (kept for backward compat — mirrors sla_due_time)

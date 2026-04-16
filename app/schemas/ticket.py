@@ -55,7 +55,7 @@ class TicketOut(TicketBase):
     id: uuid.UUID
     ticket_number: int
     ticket_id: str
-    group_id:str
+    group_id: str | None = None   # nullable — not all tickets belong to a group
     status: TicketStatus
     assignee_id: uuid.UUID | None
     assignee: UserPublic | None = None
@@ -103,14 +103,17 @@ class TicketListOut(BaseModel):
     submitter_name: str
     company: str
     resolution: str | None = None
+    # group + assignee — required by normalizeTicket() and dashboard group/agent filter
+    group_id: str | None = None
+    assignee_id: uuid.UUID | None = None
+    assignee: Union[UserPublic, None] | None = None
     # ── SLA fields ──────────────────────────────────────────────────────
-    sla_status: Union[SLAStatus,str,None] = SLAStatus.not_started
-    sla_start_time: Union[datetime,None] | None = None
-    sla_due_time: Union[datetime,None] | None = None
-    sla_paused_at: Union[datetime,None] | None = None
-    sla_paused_seconds: Union[int,None] = 0
-    sla_due_at: Union[datetime,None] | None = None  # legacy
-    assignee: Union[UserPublic,None] | None = None
+    sla_status: Union[SLAStatus, str, None] = SLAStatus.not_started
+    sla_start_time: Union[datetime, None] | None = None
+    sla_due_time: Union[datetime, None] | None = None
+    sla_paused_at: Union[datetime, None] | None = None
+    sla_paused_seconds: Union[int, None] = 0
+    sla_due_at: Union[datetime, None] | None = None  # legacy
     created_at: datetime
     updated_at: datetime
 

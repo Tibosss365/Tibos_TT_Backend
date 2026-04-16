@@ -22,8 +22,9 @@ class OAuthProvider(str, enum.Enum):
 
 
 class SMTPSecurity(str, enum.Enum):
-    tls = "tls"
-    ssl = "ssl"
+    tls  = "tls"
+    ssl  = "ssl"
+    none = "none"   # no encryption — frontend option "None / Plain"
 
 
 class SLAConfig(Base):

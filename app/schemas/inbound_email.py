@@ -1,10 +1,11 @@
 import uuid
 from datetime import datetime
+from typing import Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.inbound_email import InboundAuthType, EmailLogStatus
-from app.models.ticket import TicketCategory, TicketPriority
+from app.models.ticket import TicketPriority
 
 
 class InboundEmailConfigOut(BaseModel):
@@ -17,7 +18,8 @@ class InboundEmailConfigOut(BaseModel):
     imap_user: str | None
     imap_folder: str
     graph_mailbox: str | None
-    default_category: TicketCategory
+    # Plain string — supports any custom category slug, not just built-in enum values
+    default_category: str
     default_priority: TicketPriority
     default_assignee_id: uuid.UUID | None
     poll_interval_minutes: int
@@ -33,19 +35,59 @@ class InboundEmailConfigOut(BaseModel):
 class InboundEmailConfigUpdate(BaseModel):
     enabled: bool | None = None
     auth_type: InboundAuthType | None = None
+
+    # ── IMAP connection ──────────────────────────────────────────────────────
     imap_host: str | None = None
-    imap_port: int | None = None
+    # Accept string OR int — frontend sends the port as a string from an <input>
+    imap_port: Union[int, str, None] = None
     imap_ssl: bool | None = None
     imap_user: str | None = None
-    imap_pass: str | None = None      # write-only; not returned in Out
+    imap_pass: str | None = None          # write-only; never returned in Out
     imap_folder: str | None = None
+
+    # ── Microsoft Graph ──────────────────────────────────────────────────────
     graph_mailbox: str | None = None
-    default_category: TicketCategory | None = None
+
+    # ── Auto-ticket defaults ─────────────────────────────────────────────────
+    # Plain string so custom category slugs are accepted (not restricted to enum)
+    default_category: str | None = None
     default_priority: TicketPriority | None = None
-    default_assignee_id: uuid.UUID | None = None
+    # Accept UUID string, UUID object, or the sentinel "unassigned" → stored as NULL
+    default_assignee_id: Union[uuid.UUID, str, None] = None
+
+    # ── Polling ──────────────────────────────────────────────────────────────
     poll_interval_minutes: int | None = Field(None, ge=1, le=1440)
     mark_seen: bool | None = None
     move_to_folder: str | None = None
+
+    # ── Validators ──────────────────────────────────────────────────────────
+
+    @field_validator("imap_port", mode="before")
+    @classmethod
+    def coerce_port(cls, v):
+        """Convert string port ('993') → int (993)."""
+        if v is None:
+            return v
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            raise ValueError(f"imap_port must be a valid integer, got: {v!r}")
+
+    @field_validator("default_assignee_id", mode="before")
+    @classmethod
+    def coerce_assignee(cls, v):
+        """
+        Convert 'unassigned' sentinel → None.
+        Also accept plain UUID strings so the frontend can pass either form.
+        """
+        if v is None or v == "unassigned" or v == "":
+            return None
+        if isinstance(v, uuid.UUID):
+            return v
+        try:
+            return uuid.UUID(str(v))
+        except (ValueError, AttributeError):
+            raise ValueError(f"default_assignee_id must be a valid UUID or 'unassigned', got: {v!r}")
 
 
 class EmailTicketLogOut(BaseModel):

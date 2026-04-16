@@ -39,10 +39,18 @@ async def get_inbound_config(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
+    """
+    Return the inbound email configuration.
+    Auto-creates a disabled default row on first call so the frontend
+    always gets a 200 (same pattern as GET /admin/sla and GET /admin/email).
+    """
     result = await db.execute(select(InboundEmailConfig))
     cfg = result.scalar_one_or_none()
     if not cfg:
-        raise HTTPException(status_code=404, detail="Inbound email not configured yet")
+        cfg = InboundEmailConfig()   # all defaults: enabled=False, basic IMAP, etc.
+        db.add(cfg)
+        await db.flush()
+        await db.refresh(cfg)
     return InboundEmailConfigOut.model_validate(cfg)
 
 
