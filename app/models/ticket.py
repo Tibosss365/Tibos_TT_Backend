@@ -86,7 +86,6 @@ class Ticket(Base):
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
     # Plain varchar slug — references Category.slug; supports any admin-created category
     category: Mapped[str] = mapped_column(String(80), nullable=False, default="other", index=True)
-    group_id: Mapped[str] =mapped_column(String, default="", index=True)
     priority: Mapped[TicketPriority] = mapped_column(
         SAEnum(TicketPriority, name="ticketpriority"), nullable=False, default=TicketPriority.medium
     )
