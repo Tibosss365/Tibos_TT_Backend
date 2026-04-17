@@ -154,6 +154,22 @@ class OAuthAuthorizeUrl(BaseModel):
     state: str
 
 
+class TicketSettingsOut(BaseModel):
+    number_prefix:    str
+    number_digits:    int
+    default_status:   str
+    default_priority: str
+
+    model_config = {"from_attributes": True}
+
+
+class TicketSettingsUpdate(BaseModel):
+    number_prefix:    str = "TKT"
+    number_digits:    int = 4
+    default_status:   str = "open"
+    default_priority: str = "medium"
+
+
 class AdminStats(BaseModel):
     total_tickets: int
     open_tickets: int

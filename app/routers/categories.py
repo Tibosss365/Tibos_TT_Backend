@@ -9,7 +9,7 @@ DELETE /categories/{slug}        → delete any category by slug
 POST   /categories/reorder       → update sort_order for multiple categories
 """
 import re
-import uuid
+import uuid  # still needed for reorder endpoint
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select
@@ -71,14 +71,14 @@ async def create_category(
     return CategoryOut.model_validate(cat)
 
 
-@router.patch("/{category_id}", response_model=CategoryOut)
+@router.patch("/{slug}", response_model=CategoryOut)
 async def update_category(
-    category_id: uuid.UUID,
+    slug: str,
     body: CategoryUpdate,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    result = await db.execute(select(Category).where(Category.id == category_id))
+    result = await db.execute(select(Category).where(Category.slug == slug))
     cat: Category | None = result.scalar_one_or_none()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")

@@ -2,30 +2,26 @@
 Enterprise SLA Service
 ======================
 
-Rules
------
-- SLA starts ONLY when a ticket is BOTH created AND assigned to an agent.
-- Priority deadlines (configurable in SLAConfig, defaults below):
-    Critical → 1 h   High → 4 h   Medium → 8 h   Low → 24 h
-- Pause: when ticket moves into a "pause" status (default: on-hold).
-  Accumulated pause time is stored so the deadline extends correctly on resume.
-- Stop: when ticket is resolved or closed → sla_status = completed.
-- Breach detection: a background job runs every 60 s and marks active tickets
-  whose sla_due_time has passed as overdue.
+Rules (respects SLAConfig settings)
+-------------------------------------
+- timer_start = "on_creation":      SLA clock starts when ticket is created.
+- timer_start = "on_assignment":     SLA clock starts only when first assigned to an agent.
+- countdown_mode = "24_7":           SLA counts every wall-clock hour.
+- countdown_mode = "business_hours": SLA only counts time inside configured work days/hours.
+- pause_on:   SLA pauses when ticket enters any of these statuses (default: on-hold).
+- stop:       SLA completes when ticket is resolved or closed.
 
 Public API
 ----------
-  SLAService.start(ticket, db)          → start timer (called on first assignment)
+  SLAService.start(ticket, db, is_assignment=False)  → start timer
   SLAService.pause(ticket, db)          → pause timer
-  SLAService.resume(ticket, db)         → resume timer, extend deadline
+  SLAService.resume(ticket, db)         → resume, extending deadline correctly
   SLAService.stop(ticket, db)           → mark completed (resolved/closed)
-  SLAService.get_remaining_seconds(t)   → int (negative = overdue)
-  SLAService.get_status_info(t)         → dict for API responses
   SLAService.recalculate(ticket, db)    → recalculate due time after priority change
-
+  SLAService.handle_status_change(...)  → apply correct SLA action for status transition
   SLABreachDetector.start()             → start background asyncio task
   SLABreachDetector.stop()              → cancel it
-  SLABreachDetector.check_breaches()    → run one check cycle (also callable on demand)
+  SLABreachDetector.check_breaches()    → run one check cycle
 """
 
 import asyncio
@@ -49,17 +45,13 @@ DEFAULT_HOURS: dict[TicketPriority, int] = {
     TicketPriority.low:      24,
 }
 
-# Statuses that pause the SLA timer (can be overridden by SLAConfig.pause_on)
 DEFAULT_PAUSE_STATUSES = {"on-hold"}
-
-# Statuses that stop the SLA timer
 STOP_STATUSES = {TicketStatus.resolved, TicketStatus.closed}
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# ── Config helpers ─────────────────────────────────────────────────────────────
 
 def _hours_for(priority: TicketPriority, cfg: SLAConfig | None) -> int:
-    """Return SLA hours for the given priority, using config if available."""
     if cfg:
         mapping = {
             TicketPriority.critical: cfg.critical_hours,
@@ -84,7 +76,7 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 def _fmt_duration(total_seconds: int) -> str:
-    """Format seconds into human-readable 'Xh YYm' or 'YYm ZZs'."""
+    """Format seconds into human-readable 'Xh YYm'."""
     total_seconds = abs(total_seconds)
     days  = total_seconds // 86400
     hours = (total_seconds % 86400) // 3600
@@ -99,10 +91,143 @@ def _fmt_duration(total_seconds: int) -> str:
     return f"{secs}s"
 
 
+# ── Business Hours helpers ─────────────────────────────────────────────────────
+
+def _parse_work_bounds(cfg: SLAConfig):
+    """Return (work_days_set, open_td, close_td, ws_h, ws_m, we_h, we_m)."""
+    ws_h, ws_m = map(int, cfg.work_start.split(":"))
+    we_h, we_m = map(int, cfg.work_end.split(":"))
+    work_days_set = set(cfg.work_days)  # 0=Mon … 6=Sun
+    open_td  = timedelta(hours=ws_h, minutes=ws_m)
+    close_td = timedelta(hours=we_h, minutes=we_m)
+    return work_days_set, open_td, close_td, ws_h, ws_m, we_h, we_m
+
+
+def _time_of_day_td(dt: datetime) -> timedelta:
+    return timedelta(hours=dt.hour, minutes=dt.minute, seconds=dt.second)
+
+
+def _advance_to_business(
+    dt: datetime,
+    work_days_set: set,
+    open_td: timedelta,
+    close_td: timedelta,
+    ws_h: int,
+    ws_m: int,
+) -> datetime:
+    """
+    Advance dt to the next moment inside business hours.
+    Returns dt unchanged if already inside business hours.
+    Scans at most 14 calendar days (handles weekends + holidays).
+    """
+    for _ in range(14):
+        tod = _time_of_day_td(dt)
+        if dt.weekday() in work_days_set and open_td <= tod < close_td:
+            return dt  # already inside business hours
+        if dt.weekday() not in work_days_set or tod >= close_td:
+            # Non-work day or past close → next calendar day at open
+            dt = (dt + timedelta(days=1)).replace(
+                hour=ws_h, minute=ws_m, second=0, microsecond=0
+            )
+        else:
+            # Before open today → move to today's open
+            dt = dt.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+    return dt  # unreachable with sane config
+
+
+def _add_business_hours(start: datetime, hours: float, cfg: SLAConfig) -> datetime:
+    """
+    Advance `start` by exactly `hours` worth of business-hours time.
+    Non-work days and time outside work_start–work_end are skipped.
+    Falls back to wall-clock if the business window is zero/invalid.
+    """
+    work_days_set, open_td, close_td, ws_h, ws_m, we_h, we_m = _parse_work_bounds(cfg)
+
+    # Guard: zero or negative work window → fall back to simple wall clock
+    work_secs_per_day = int((close_td - open_td).total_seconds())
+    if work_secs_per_day <= 0 or not work_days_set:
+        return _ensure_utc(start) + timedelta(hours=hours)
+
+    remaining = int(hours * 3600)
+    current   = _ensure_utc(start)
+    current   = _advance_to_business(current, work_days_set, open_td, close_td, ws_h, ws_m)
+
+    while remaining > 0:
+        day_close_dt = current.replace(
+            hour=we_h, minute=we_m, second=0, microsecond=0
+        )
+        avail = max(0, int((day_close_dt - current).total_seconds()))
+
+        if avail == 0:
+            # At or past close; move to next business window
+            next_open = (current + timedelta(days=1)).replace(
+                hour=ws_h, minute=ws_m, second=0, microsecond=0
+            )
+            current = _advance_to_business(next_open, work_days_set, open_td, close_td, ws_h, ws_m)
+            continue
+
+        if remaining <= avail:
+            current += timedelta(seconds=remaining)
+            remaining = 0
+        else:
+            remaining -= avail
+            next_open = (current + timedelta(days=1)).replace(
+                hour=ws_h, minute=ws_m, second=0, microsecond=0
+            )
+            current = _advance_to_business(next_open, work_days_set, open_td, close_td, ws_h, ws_m)
+
+    return current
+
+
+def _business_hours_elapsed(start: datetime, end: datetime, cfg: SLAConfig) -> float:
+    """
+    Return the number of business hours between start and end.
+    Used to preserve remaining SLA time across pause/resume cycles.
+    """
+    if end <= start:
+        return 0.0
+
+    work_days_set, open_td, close_td, ws_h, ws_m, we_h, we_m = _parse_work_bounds(cfg)
+    work_secs_per_day = int((close_td - open_td).total_seconds())
+    if work_secs_per_day <= 0 or not work_days_set:
+        return (end - start).total_seconds() / 3600.0
+
+    total_secs = 0
+    current    = _ensure_utc(start)
+    end_utc    = _ensure_utc(end)
+
+    while current < end_utc:
+        tod = _time_of_day_td(current)
+        if current.weekday() not in work_days_set or tod >= close_td:
+            next_open = (current + timedelta(days=1)).replace(
+                hour=ws_h, minute=ws_m, second=0, microsecond=0
+            )
+            current = _advance_to_business(next_open, work_days_set, open_td, close_td, ws_h, ws_m)
+            continue
+        if tod < open_td:
+            current = current.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+            continue
+
+        # Inside business hours — count until close or end, whichever comes first
+        day_close_dt = current.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
+        window_end   = min(day_close_dt, end_utc)
+        total_secs  += int((window_end - current).total_seconds())
+        current      = day_close_dt  # jump to end of window
+
+    return total_secs / 3600.0
+
+
+def _calculate_due_time(t0: datetime, hours: int, cfg: SLAConfig | None) -> datetime:
+    """Calculate the SLA due time from t0, respecting countdown_mode."""
+    if cfg and cfg.countdown_mode == "business_hours":
+        return _add_business_hours(t0, hours, cfg)
+    return _ensure_utc(t0) + timedelta(hours=hours)
+
+
 # ── SLAService ────────────────────────────────────────────────────────────────
 
 class SLAService:
-    """Stateless SLA operations. All methods take a Ticket ORM object."""
+    """Stateless SLA operations. All methods operate on a Ticket ORM object."""
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -111,51 +236,59 @@ class SLAService:
         ticket: Ticket,
         db: AsyncSession,
         start_time: datetime | None = None,
+        is_assignment: bool = False,
     ) -> None:
         """
-        Start the SLA timer. Called at ticket creation (SLA begins immediately).
-        No-op if already started or running.
+        Start the SLA timer, respecting the timer_start config:
+          - "on_creation":   starts on ticket creation (is_assignment not required)
+          - "on_assignment": starts only when an agent is first assigned
 
         Args:
-            start_time: Override when the SLA clock starts. Defaults to now.
-                        Pass ticket.created_at when backfilling existing tickets
-                        so the deadline is relative to creation, not backfill time.
+            start_time:    Override the clock-start moment. Defaults to now.
+            is_assignment: Set True when called from an agent-assignment event.
         """
         current = ticket.sla_status
-        # Treat None (pre-migration rows) the same as not_started
         if current is not None and current != SLAStatus.not_started:
             logger.debug(f"SLA already started for {ticket.ticket_id} ({current})")
             return
 
-        cfg = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
+        cfg          = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
+        timer_start  = cfg.timer_start if cfg else "on_creation"
+
+        # Honour the timer_start policy
+        if timer_start == "on_assignment" and not is_assignment:
+            logger.debug(
+                f"SLA deferred for {ticket.ticket_id} "
+                f"(timer_start=on_assignment — waiting for agent assignment)"
+            )
+            return  # leave sla_status = not_started until assignment
+
         hours = _hours_for(ticket.priority, cfg)
         t0    = _ensure_utc(start_time) if start_time else datetime.now(timezone.utc)
+        due   = _calculate_due_time(t0, hours, cfg)
 
         ticket.sla_start_time     = t0
-        ticket.sla_due_time       = t0 + timedelta(hours=hours)
-        ticket.sla_due_at         = ticket.sla_due_time      # keep legacy in sync
+        ticket.sla_due_time       = due
+        ticket.sla_due_at         = due  # keep legacy field in sync
         ticket.sla_status         = SLAStatus.active
         ticket.sla_paused_at      = None
         ticket.sla_paused_seconds = 0
 
-        # If the calculated due time is already in the past, mark overdue immediately
-        if ticket.sla_due_time < datetime.now(timezone.utc):
+        if due < datetime.now(timezone.utc):
             ticket.sla_status = SLAStatus.overdue
 
         logger.info(
             f"SLA started for {ticket.ticket_id} | priority={ticket.priority.value} "
-            f"| hours={hours} | start={t0.isoformat()} | due={ticket.sla_due_time.isoformat()}"
+            f"| hours={hours} | mode={cfg.countdown_mode if cfg else '24_7'} "
+            f"| timer_start={timer_start} "
+            f"| start={t0.isoformat()} | due={due.isoformat()}"
         )
 
     @staticmethod
     async def pause(ticket: Ticket, db: AsyncSession) -> None:
-        """
-        Pause the SLA timer. Records the pause timestamp for later resumption.
-        No-op if already paused or not active.
-        """
+        """Pause the SLA timer. No-op if not currently active."""
         if ticket.sla_status != SLAStatus.active:
             return
-
         ticket.sla_status    = SLAStatus.paused
         ticket.sla_paused_at = datetime.now(timezone.utc)
         logger.info(f"SLA paused for {ticket.ticket_id}")
@@ -163,27 +296,35 @@ class SLAService:
     @staticmethod
     async def resume(ticket: Ticket, db: AsyncSession) -> None:
         """
-        Resume a paused SLA timer.
-        Extends sla_due_time by the duration spent paused and accumulates
-        paused_seconds for auditing.
+        Resume a paused SLA timer, extending the deadline to preserve the
+        exact remaining time (business hours or wall-clock, matching the config).
         """
         if ticket.sla_status != SLAStatus.paused:
             return
 
         now = datetime.now(timezone.utc)
+        cfg = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
+        countdown = cfg.countdown_mode if cfg else "24_7"
 
         if ticket.sla_paused_at and ticket.sla_due_time:
-            paused_since  = _ensure_utc(ticket.sla_paused_at)
-            pause_delta   = now - paused_since
-            pause_secs    = int(pause_delta.total_seconds())
+            paused_since = _ensure_utc(ticket.sla_paused_at)
+            due          = _ensure_utc(ticket.sla_due_time)
+            pause_secs   = max(0, int((now - paused_since).total_seconds()))
 
-            ticket.sla_due_time       = _ensure_utc(ticket.sla_due_time) + pause_delta
-            ticket.sla_due_at         = ticket.sla_due_time              # keep legacy in sync
+            if countdown == "business_hours" and cfg:
+                # Preserve the remaining business hours at the time of pause
+                remaining_biz = max(0.0, _business_hours_elapsed(paused_since, due, cfg))
+                new_due = _add_business_hours(now, remaining_biz, cfg)
+            else:
+                # 24/7: extend deadline by the wall-clock pause duration
+                new_due = due + timedelta(seconds=pause_secs)
+
+            ticket.sla_due_time       = new_due
+            ticket.sla_due_at         = new_due  # legacy
             ticket.sla_paused_seconds = (ticket.sla_paused_seconds or 0) + pause_secs
 
         ticket.sla_paused_at = None
 
-        # Re-evaluate: may already be overdue
         if ticket.sla_due_time and now > _ensure_utc(ticket.sla_due_time):
             ticket.sla_status = SLAStatus.overdue
         else:
@@ -196,23 +337,23 @@ class SLAService:
 
     @staticmethod
     async def stop(ticket: Ticket, db: AsyncSession) -> None:
-        """
-        Stop the SLA — ticket has been resolved or closed.
-        Marks sla_status = completed regardless of whether it was on time.
-        """
+        """Stop the SLA — ticket resolved or closed."""
         if ticket.sla_status in (SLAStatus.completed, SLAStatus.not_started):
             return
-
         ticket.sla_status    = SLAStatus.completed
         ticket.sla_paused_at = None
         logger.info(f"SLA completed for {ticket.ticket_id}")
 
     @staticmethod
-    async def recalculate(ticket: Ticket, db: AsyncSession, new_priority: TicketPriority | None = None) -> None:
+    async def recalculate(
+        ticket: Ticket,
+        db: AsyncSession,
+        new_priority: TicketPriority | None = None,
+    ) -> None:
         """
         Recalculate sla_due_time after a priority change.
-        Preserves the original sla_start_time; only the deadline shifts.
-        No-op if SLA has not started yet.
+        Preserves sla_start_time; only the deadline shifts.
+        Respects countdown_mode.
         """
         if ticket.sla_status == SLAStatus.not_started or not ticket.sla_start_time:
             return
@@ -221,16 +362,17 @@ class SLAService:
         priority = new_priority or ticket.priority
         hours    = _hours_for(priority, cfg)
         start    = _ensure_utc(ticket.sla_start_time)
-        new_due  = start + timedelta(hours=hours)
+        new_due  = _calculate_due_time(start, hours, cfg)
 
-        # Extend by accumulated pause time so pauses aren't "lost"
-        if ticket.sla_paused_seconds:
+        # For 24/7 mode, add back accumulated pause seconds so they aren't lost
+        # Business-hours mode handles this inside pause/resume via _business_hours_elapsed
+        countdown = cfg.countdown_mode if cfg else "24_7"
+        if ticket.sla_paused_seconds and countdown != "business_hours":
             new_due += timedelta(seconds=ticket.sla_paused_seconds)
 
         ticket.sla_due_time = new_due
-        ticket.sla_due_at   = new_due  # keep legacy in sync
+        ticket.sla_due_at   = new_due
 
-        # Re-evaluate overdue status
         now = datetime.now(timezone.utc)
         if ticket.sla_status == SLAStatus.active and now > new_due:
             ticket.sla_status = SLAStatus.overdue
@@ -247,10 +389,8 @@ class SLAService:
     @staticmethod
     def get_remaining_seconds(ticket: Ticket) -> int:
         """
-        Return seconds remaining until SLA due time.
-        Positive  → time remaining.
-        Negative  → overdue by that many seconds.
-        0         → not started or completed.
+        Seconds remaining until SLA due time.
+        Positive → time left. Negative → overdue. 0 → not started / completed.
         """
         status = ticket.sla_status
         if not ticket.sla_due_time or status in (
@@ -260,8 +400,8 @@ class SLAService:
 
         due = _ensure_utc(ticket.sla_due_time)
 
-        # If paused: remaining is measured from the pause moment, not now
-        if ticket.sla_status == SLAStatus.paused and ticket.sla_paused_at:
+        # When paused, measure remaining from the pause moment (frozen)
+        if status == SLAStatus.paused and ticket.sla_paused_at:
             paused_at = _ensure_utc(ticket.sla_paused_at)
             return int((due - paused_at).total_seconds())
 
@@ -269,39 +409,17 @@ class SLAService:
 
     @staticmethod
     def get_overdue_seconds(ticket: Ticket) -> int:
-        """Return how many seconds overdue the ticket is (0 if not overdue)."""
         return max(0, -SLAService.get_remaining_seconds(ticket))
 
     @staticmethod
     def get_status_info(ticket: Ticket) -> dict:
-        """
-        Return a full SLA status dict suitable for API responses and the frontend.
-
-        Shape:
-        {
-            "sla_status": "active" | "paused" | "overdue" | "completed" | "not_started",
-            "sla_start_time": ISO string | null,
-            "sla_due_time":   ISO string | null,
-            "sla_remaining_seconds": int (0 if completed/not started),
-            "sla_overdue_seconds":   int (0 if not overdue),
-            "sla_paused_seconds":    int (total accumulated pause seconds),
-            "sla_remaining_display": "2h 15m" | null,
-            "sla_overdue_display":   "2h 15m overdue" | null,
-            "is_overdue":  bool,
-            "is_paused":   bool,
-            "is_completed": bool,
-        }
-        """
         status    = ticket.sla_status or SLAStatus.not_started
         remaining = SLAService.get_remaining_seconds(ticket)
         overdue   = SLAService.get_overdue_seconds(ticket)
-
-        # Consider "active" tickets that are past their due time as overdue
         is_overdue = (
             status == SLAStatus.overdue
             or (status == SLAStatus.active and remaining < 0)
         )
-
         return {
             "sla_status":              status.value if status else "not_started",
             "sla_start_time":          ticket.sla_start_time.isoformat() if ticket.sla_start_time else None,
@@ -316,7 +434,7 @@ class SLAService:
             "is_completed":            status == SLAStatus.completed,
         }
 
-    # ── Convenience: apply SLA changes based on ticket status transition ───
+    # ── Status-change dispatcher ───────────────────────────────────────────
 
     @staticmethod
     async def handle_status_change(
@@ -327,17 +445,17 @@ class SLAService:
     ) -> None:
         """
         Apply the correct SLA action for a ticket status transition.
-        Called from the PATCH endpoint after validating the new status.
+        Called from the PATCH endpoint after the new status is validated.
         """
-        cfg = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
+        cfg      = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
         pause_on = _pause_statuses(cfg)
 
         new_str = new_status.value if hasattr(new_status, "value") else str(new_status)
         old_str = old_status.value if hasattr(old_status, "value") else str(old_status)
 
-        entering_pause  = new_str in pause_on and old_str not in pause_on
-        leaving_pause   = old_str in pause_on and new_str not in pause_on
-        entering_stop   = new_status in STOP_STATUSES
+        entering_pause = new_str in pause_on and old_str not in pause_on
+        leaving_pause  = old_str in pause_on and new_str not in pause_on
+        entering_stop  = new_status in STOP_STATUSES
 
         if entering_stop:
             await SLAService.stop(ticket, db)
@@ -351,11 +469,9 @@ class SLAService:
 
 class SLABreachDetector:
     """
-    Background asyncio task that runs every 60 seconds.
+    Background asyncio task (runs every 60 s).
     Finds tickets with sla_status=active whose sla_due_time has passed
-    and marks them as overdue.
-
-    Also importable standalone via check_breaches() for on-demand use.
+    and marks them overdue.
     """
 
     def __init__(self) -> None:
@@ -387,13 +503,9 @@ class SLABreachDetector:
                 logger.error(f"SLA breach detector error: {e}")
 
     async def check_breaches(self) -> int:
-        """
-        Mark all active tickets whose sla_due_time has elapsed as overdue.
-        Returns the number of tickets updated.
-        """
-        now = datetime.now(timezone.utc)
+        """Mark all active tickets whose sla_due_time has elapsed as overdue."""
+        now     = datetime.now(timezone.utc)
         updated = 0
-
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Ticket).where(
@@ -409,10 +521,8 @@ class SLABreachDetector:
             if tickets:
                 await db.commit()
                 logger.info(
-                    f"SLA breach check: {updated} ticket(s) newly overdue "
-                    f"at {now.isoformat()}"
+                    f"SLA breach check: {updated} ticket(s) newly overdue at {now.isoformat()}"
                 )
-
         return updated
 
 

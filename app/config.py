@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # JWT
     SECRET_KEY: str = "changeme-secret-key"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
 
     # App
     APP_TITLE: str = "IT Helpdesk API"

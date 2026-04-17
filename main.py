@@ -86,6 +86,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] SLA config seeding failed: {e}")
 
+    # 2b. Seed default groups if the table is empty
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.group import Group
+        DEFAULT_GROUPS = [
+            {"id": "microsoft-365",         "name": "Microsoft 365",           "description": "Exchange Online, Teams, SharePoint, Intune and all M365 workloads", "color": "#0078D4"},
+            {"id": "migration-services",    "name": "Migration Services",      "description": "Mailbox, tenant-to-tenant and file-share migration projects",        "color": "#7C3AED"},
+            {"id": "security-compliance",   "name": "Security & Compliance",   "description": "Defender, Conditional Access, DLP, Purview and threat response",     "color": "#DC2626"},
+            {"id": "infrastructure-network","name": "Infrastructure & Network","description": "Active Directory, networking, servers and virtualisation",            "color": "#059669"},
+            {"id": "end-user-support",      "name": "End User Support L1",     "description": "First-line support for accounts, hardware, software and email",      "color": "#D97706"},
+            {"id": "azure-cloud",           "name": "Azure & Cloud",           "description": "Azure infrastructure, Entra ID, backup and cloud cost management",   "color": "#2563EB"},
+        ]
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Group))
+            existing_ids = {g.id for g in result.scalars().all()}
+            seeded = 0
+            for g in DEFAULT_GROUPS:
+                if g["id"] not in existing_ids:
+                    db.add(Group(id=g["id"], name=g["name"], description=g["description"], color=g["color"], is_builtin=False))
+                    seeded += 1
+            if seeded:
+                await db.commit()
+                _log(f"[OK] Seeded {seeded} default group(s)")
+    except Exception as e:
+        _log(f"  [WARN] Group seeding failed: {e}")
+
     # 3. Start email poller only if inbound email is enabled in DB
     try:
         from app.database import AsyncSessionLocal

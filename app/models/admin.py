@@ -27,6 +27,28 @@ class SMTPSecurity(str, enum.Enum):
     none = "none"   # no encryption — frontend option "None / Plain"
 
 
+class TicketSettings(Base):
+    """Admin-configurable ticket number format and creation defaults."""
+    __tablename__ = "ticket_settings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # Ticket ID formatting
+    number_prefix: Mapped[str] = mapped_column(String(20), default="TKT",    nullable=False)
+    number_digits:  Mapped[int] = mapped_column(Integer,   default=4,         nullable=False)
+    # Creation defaults
+    default_status:   Mapped[str] = mapped_column(String(20), default="open",   nullable=False)
+    default_priority: Mapped[str] = mapped_column(String(20), default="medium", nullable=False)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
 class SLAConfig(Base):
     __tablename__ = "sla_config"
 

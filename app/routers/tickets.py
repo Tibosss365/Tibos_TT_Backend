@@ -23,6 +23,7 @@ from app.models.ticket import (
     TimelineType,
 )
 from app.models.user import User, UserRole
+from app.models.admin import TicketSettings
 from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
@@ -255,15 +256,31 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    print("Hello iam from the ticket",body.group_id)
-    # Auto set in-progress when ticket is created with an assignee.
-    initial_status = TicketStatus.in_progress if body.assignee_id else TicketStatus.open
+    # ── Load ticket settings (prefix, digits, defaults) ──────────────────
+    ts_result = await db.execute(select(TicketSettings).limit(1))
+    ts = ts_result.scalar_one_or_none()
+
+    number_prefix    = (ts.number_prefix.strip().upper() if ts and ts.number_prefix else "TKT")
+    number_digits    = (ts.number_digits if ts and ts.number_digits else 4)
+    default_status_str = (ts.default_status if ts and ts.default_status else "open")
+
+    # If a ticket is created with an assignee, always start in-progress.
+    # Otherwise use the admin-configured default status.
+    if body.assignee_id:
+        initial_status = TicketStatus.in_progress
+    else:
+        try:
+            initial_status = TicketStatus(default_status_str)
+        except ValueError:
+            initial_status = TicketStatus.open
 
     ticket = Ticket(
         subject=body.subject,
         category=body.category,
         priority=body.priority,
         status=initial_status.value,
+        ticket_prefix=number_prefix,
+        ticket_number_digits=number_digits,
         submitter_name=body.submitter_name,
         company=body.company,
         contact_name=body.contact_name,
@@ -300,8 +317,10 @@ async def create_ticket(
             author_id=current_user.id,
         ))
 
-    # SLA starts immediately when ticket is created (clock runs from creation)
-    await SLAService.start(ticket, db)
+    # Start SLA — respects timer_start config:
+    #   "on_creation"  → starts now regardless of assignee
+    #   "on_assignment"→ starts only if an assignee was provided at creation
+    await SLAService.start(ticket, db, is_assignment=bool(body.assignee_id))
 
     await db.flush()
     await db.refresh(ticket)
@@ -405,13 +424,13 @@ async def update_ticket(
         ticket.status = TicketStatus.in_progress
         update_data["status"] = TicketStatus.in_progress
 
-    # ── SLA: start whenever an assignee is set AND SLA has not started ────
+    # ── SLA: start on first agent assignment (handles on_assignment timer_start) ──
     if (
         "assignee_id" in update_data
         and update_data["assignee_id"] is not None
         and ticket.sla_status == SLAStatus.not_started
     ):
-        await SLAService.start(ticket, db)
+        await SLAService.start(ticket, db, is_assignment=True)
 
     # Timeline entries for meaningful changes
     if "status" in update_data:

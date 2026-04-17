@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, require_admin
 from app.database import get_db
-from app.models.admin import EmailConfig, OAuthProvider, SLAConfig
+from app.models.admin import EmailConfig, OAuthProvider, SLAConfig, TicketSettings
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from sqlalchemy import update as sa_update
 from app.models.user import User
@@ -23,6 +23,8 @@ from app.schemas.admin import (
     OAuthCallbackRequest,
     SLAConfigOut,
     SLAConfigUpdate,
+    TicketSettingsOut,
+    TicketSettingsUpdate,
 )
 
 # Provider OAuth endpoint presets
@@ -38,6 +40,45 @@ _OAUTH_PRESETS = {
 }
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# ── Ticket Settings ────────────────────────────────────────────────────────
+
+@router.get("/ticket-settings", response_model=TicketSettingsOut)
+async def get_ticket_settings(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    result = await db.execute(select(TicketSettings).limit(1))
+    ts = result.scalar_one_or_none()
+    if not ts:
+        ts = TicketSettings()
+        db.add(ts)
+        await db.flush()
+        await db.refresh(ts)
+    return TicketSettingsOut.model_validate(ts)
+
+
+@router.put("/ticket-settings", response_model=TicketSettingsOut)
+async def update_ticket_settings(
+    body: TicketSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    result = await db.execute(select(TicketSettings).limit(1))
+    ts = result.scalar_one_or_none()
+    if not ts:
+        ts = TicketSettings()
+        db.add(ts)
+
+    ts.number_prefix    = body.number_prefix.strip().upper() or "TKT"
+    ts.number_digits    = max(1, min(8, body.number_digits))
+    ts.default_status   = body.default_status
+    ts.default_priority = body.default_priority
+
+    await db.flush()
+    await db.refresh(ts)
+    return TicketSettingsOut.model_validate(ts)
 
 
 # ── SLA ────────────────────────────────────────────────────────────────────

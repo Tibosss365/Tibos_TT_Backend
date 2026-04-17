@@ -83,6 +83,11 @@ class Ticket(Base):
         nullable=False,
         index=True,
     )
+    # Ticket ID formatting — stored per ticket so historical IDs remain stable
+    # even if the admin later changes the prefix or digit count.
+    ticket_prefix:        Mapped[str | None] = mapped_column(String(20),  nullable=True, default="TKT")
+    ticket_number_digits: Mapped[int | None] = mapped_column(Integer,     nullable=True, default=4)
+
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
     # Plain varchar slug — references Category.slug; supports any admin-created category
     category: Mapped[str] = mapped_column(String(80), nullable=False, default="other", index=True)
@@ -167,7 +172,9 @@ class Ticket(Base):
 
     @property
     def ticket_id(self) -> str:
-        return f"TKT-{self.ticket_number:04d}"
+        prefix = (self.ticket_prefix or "TKT").strip().upper()
+        digits = self.ticket_number_digits or 4
+        return f"{prefix}-{str(self.ticket_number).zfill(digits)}"
 
 
 class TicketTimeline(Base):
