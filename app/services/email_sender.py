@@ -27,8 +27,16 @@ logger = logging.getLogger(__name__)
 
 # ── HTML template builder ─────────────────────────────────────────────────────
 
-def _build_html(subject: str, ticket: Ticket, body: str, action_label: str, action_color: str = "#6366f1") -> str:
-    """Build a clean HTML email for ticket communication."""
+def _build_html(
+    subject: str,
+    ticket: Ticket,
+    body: str,
+    action_label: str,
+    action_color: str = "#6366f1",
+    assignee_name: str | None = None,
+    reopen_url: str | None = None,
+) -> str:
+    """Build a clean branded HTML email for ticket communication."""
     priority_colors = {
         "critical": "#ef4444",
         "high":     "#f97316",
@@ -47,33 +55,116 @@ def _build_html(subject: str, ticket: Ticket, body: str, action_label: str, acti
     pri_val   = ticket.priority.value if hasattr(ticket.priority, 'value') else str(ticket.priority)
     sta_val   = ticket.status.value   if hasattr(ticket.status,   'value') else str(ticket.status)
 
+    # ── Agent card (rendered when assignee_name is provided) ─────────────
+    agent_block = ""
+    if assignee_name:
+        initial = assignee_name[0].upper()
+        agent_block = f"""
+        <tr><td style="padding:0 28px 20px;">
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:#f8f9ff;border-radius:8px;border:1px solid #e8eaf6;">
+            <tr><td style="padding:10px 16px;border-bottom:1px solid #eef0f6;">
+              <span style="font-size:11px;font-weight:700;color:#6b7280;
+                           text-transform:uppercase;letter-spacing:.5px;">Assigned Agent</span>
+            </td></tr>
+            <tr><td style="padding:12px 16px;">
+              <table cellpadding="0" cellspacing="0"><tr>
+                <td style="width:32px;height:32px;background:{action_color};border-radius:50%;
+                            text-align:center;vertical-align:middle;">
+                  <span style="color:#fff;font-weight:700;font-size:13px;line-height:32px;">{initial}</span>
+                </td>
+                <td style="padding-left:10px;font-size:14px;font-weight:600;
+                            color:#374151;vertical-align:middle;">{assignee_name}</td>
+              </tr></table>
+            </td></tr>
+          </table>
+        </td></tr>"""
+
+    # ── Reopen button (only for resolved emails) ──────────────────────────
+    reopen_block = ""
+    if reopen_url:
+        reopen_block = f"""
+        <tr><td style="padding:4px 28px 20px;text-align:center;">
+          <a href="{reopen_url}"
+             style="display:inline-block;padding:12px 32px;background:#10b981;color:#ffffff;
+                    text-decoration:none;border-radius:8px;font-size:14px;font-weight:700;
+                    letter-spacing:0.3px;">&#8635;&nbsp; Reopen Ticket</a>
+          <p style="font-size:12px;color:#9ca3af;margin:8px 0 0;">
+            Issue not fully resolved? Click above to reopen this ticket.
+          </p>
+        </td></tr>"""
+
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"/></head>
 <body style="margin:0;padding:0;background:#f4f4f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 16px;">
     <tr><td align="center">
-      <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
-        <!-- Header -->
-        <tr><td style="background:{action_color};padding:20px 28px;">
-          <span style="color:#fff;font-size:13px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;">{action_label}</span>
-          <h2 style="color:#fff;margin:6px 0 0;font-size:18px;font-weight:700;">{subject}</h2>
+      <table width="600" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
+
+        <!-- ── Tibos logo bar ── -->
+        <tr><td style="padding:16px 28px 14px;border-bottom:1px solid #f0f0f4;">
+          <a href="https://tibos.co.in" style="text-decoration:none;display:inline-block;">
+            <table cellpadding="0" cellspacing="0"><tr>
+              <td style="width:28px;height:28px;background:#6366f1;border-radius:6px;
+                          text-align:center;vertical-align:middle;">
+                <span style="color:#fff;font-weight:900;font-size:14px;line-height:28px;">T</span>
+              </td>
+              <td style="padding-left:8px;font-size:15px;font-weight:800;color:#1f2937;
+                          letter-spacing:0.5px;vertical-align:middle;">TIBOS</td>
+            </tr></table>
+          </a>
         </td></tr>
-        <!-- Ticket meta chips -->
+
+        <!-- ── Colored action header ── -->
+        <tr><td style="background:{action_color};padding:20px 28px;">
+          <span style="color:rgba(255,255,255,0.85);font-size:11px;font-weight:700;
+                        letter-spacing:.6px;text-transform:uppercase;">{action_label}</span>
+          <h2 style="color:#fff;margin:6px 0 0;font-size:18px;font-weight:700;line-height:1.3;">{subject}</h2>
+        </td></tr>
+
+        <!-- ── Ticket meta chips ── -->
         <tr><td style="padding:16px 28px 0;border-bottom:1px solid #f0f0f4;">
           <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:{pri_color}22;color:{pri_color};border:1px solid {pri_color}44;margin-right:6px;">{pri_val.upper()}</span>
           <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:{sta_color}22;color:{sta_color};border:1px solid {sta_color}44;margin-right:6px;">{sta_val.upper()}</span>
           <span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#6366f122;color:#6366f1;border:1px solid #6366f144;">{ticket.ticket_id}</span>
         </td></tr>
-        <!-- Body -->
+
+        <!-- ── Body ── -->
         <tr><td style="padding:20px 28px;font-size:14px;color:#374151;line-height:1.7;">
           {body}
         </td></tr>
-        <!-- Footer -->
-        <tr><td style="padding:16px 28px;background:#f9f9fc;border-top:1px solid #f0f0f4;font-size:11px;color:#9ca3af;">
-          This is an automated message from the Help Desk system. Ticket ID: <strong>{ticket.ticket_id}</strong>.<br/>
-          Reply to this email to add a comment to the ticket.
+
+        {agent_block}
+        {reopen_block}
+
+        <!-- ── Footer / Tibos signature ── -->
+        <tr><td style="padding:20px 28px;background:#f9f9fc;border-top:1px solid #f0f0f4;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td style="padding-bottom:10px;">
+              <table cellpadding="0" cellspacing="0"><tr>
+                <td style="width:20px;height:20px;background:#6366f1;border-radius:4px;
+                            text-align:center;vertical-align:middle;">
+                  <span style="color:#fff;font-weight:900;font-size:10px;line-height:20px;">T</span>
+                </td>
+                <td style="padding-left:6px;font-size:13px;font-weight:700;color:#374151;
+                            vertical-align:middle;">Tibos</td>
+                <td style="padding-left:5px;font-size:12px;color:#9ca3af;
+                            vertical-align:middle;">· IT Support</td>
+              </tr></table>
+            </td></tr>
+            <tr><td style="font-size:11px;color:#9ca3af;line-height:1.8;">
+              This is an automated message from the Tibos Help Desk system.
+              Ticket ID: <strong style="color:#6b7280;">{ticket.ticket_id}</strong>.<br/>
+              Reply to this email to add a comment to the ticket.
+              &nbsp;·&nbsp;
+              <a href="https://tibos.co.in"
+                 style="color:#6366f1;text-decoration:none;font-weight:600;">tibos.co.in</a>
+            </td></tr>
+          </table>
         </td></tr>
+
       </table>
     </td></tr>
   </table>
@@ -485,11 +576,16 @@ async def send_ticket_email(
     action_color: str = "#6366f1",
     in_reply_to: str | None = None,
     references: str | None = None,
+    assignee_name: str | None = None,
+    include_reopen: bool = False,
 ) -> str | None:
     """
     Send an HTML email for a ticket event.
     Returns the Message-ID of the sent email (for thread tracking), or None on failure.
     Reads EmailConfig from DB; silently logs and returns None if email not configured.
+
+    assignee_name  — when set, renders an "Assigned Agent" card in the email.
+    include_reopen — when True (resolved emails only), renders a "Reopen Ticket" mailto button.
     """
     result = await db.execute(select(EmailConfig))
     cfg: EmailConfig | None = result.scalar_one_or_none()
@@ -500,13 +596,37 @@ async def send_ticket_email(
 
     email_type = cfg.type.value if cfg.type else "smtp"
 
+    # Build reopen mailto URL from the helpdesk's from-address
+    reopen_url: str | None = None
+    if include_reopen:
+        import urllib.parse
+        from_addr = (
+            (cfg.smtp_from or cfg.smtp_user or "")   if email_type == "smtp"
+            else (cfg.m365_from  or "")               if email_type == "m365"
+            else (cfg.oauth_from or "")
+        )
+        if from_addr:
+            enc_subj = urllib.parse.quote(
+                f"REOPEN: [{ticket.ticket_id}] {ticket.subject}", safe=""
+            )
+            reopen_url = f"mailto:{from_addr}?subject={enc_subj}"
+
     try:
         if email_type == "smtp":
-            return await _send_ticket_via_smtp(cfg, ticket, to_email, subject, body_html, action_label, action_color, in_reply_to, references)
+            return await _send_ticket_via_smtp(
+                cfg, ticket, to_email, subject, body_html, action_label, action_color,
+                in_reply_to, references, assignee_name, reopen_url,
+            )
         elif email_type == "m365":
-            return await _send_ticket_via_m365(cfg, ticket, to_email, subject, body_html, action_label, action_color)
+            return await _send_ticket_via_m365(
+                cfg, ticket, to_email, subject, body_html, action_label, action_color,
+                assignee_name, reopen_url,
+            )
         elif email_type == "oauth":
-            return await _send_ticket_via_oauth(cfg, ticket, to_email, subject, body_html, action_label, action_color)
+            return await _send_ticket_via_oauth(
+                cfg, ticket, to_email, subject, body_html, action_label, action_color,
+                assignee_name, reopen_url,
+            )
         else:
             logger.warning(f"Unknown email type '{email_type}' — skipping ticket email")
             return None
@@ -525,13 +645,16 @@ async def _send_ticket_via_smtp(
     action_color: str,
     in_reply_to: Optional[str],
     references: Optional[str],
+    assignee_name: Optional[str] = None,
+    reopen_url: Optional[str] = None,
 ) -> Optional[str]:
     from_addr = cfg.smtp_from or cfg.smtp_user or ""
     if not from_addr or not cfg.smtp_host:
         logger.debug("SMTP not fully configured — skipping ticket email")
         return None
 
-    html_body = _build_html(subject, ticket, body_html, action_label, action_color)
+    html_body = _build_html(subject, ticket, body_html, action_label, action_color,
+                             assignee_name=assignee_name, reopen_url=reopen_url)
     msg_id    = make_msgid(domain=(from_addr.split("@")[-1] if "@" in from_addr else "helpdesk"))
 
     msg = MIMEMultipart("alternative")
@@ -574,13 +697,16 @@ async def _send_ticket_via_m365(
     body_html: str,
     action_label: str,
     action_color: str,
+    assignee_name: Optional[str] = None,
+    reopen_url: Optional[str] = None,
 ) -> Optional[str]:
     if not cfg.m365_tenant_id or not cfg.m365_client_id or not cfg.m365_client_secret or not cfg.m365_from:
         logger.debug("M365 not fully configured — skipping ticket email")
         return None
 
     token = await _get_graph_token(cfg.m365_tenant_id, cfg.m365_client_id, cfg.m365_client_secret)
-    html_body = _build_html(subject, ticket, body_html, action_label, action_color)
+    html_body = _build_html(subject, ticket, body_html, action_label, action_color,
+                             assignee_name=assignee_name, reopen_url=reopen_url)
     msg_id = make_msgid(domain=(cfg.m365_from.split("@")[-1] if "@" in cfg.m365_from else "helpdesk"))
 
     await _send_via_graph(
@@ -603,13 +729,16 @@ async def _send_ticket_via_oauth(
     body_html: str,
     action_label: str,
     action_color: str,
+    assignee_name: Optional[str] = None,
+    reopen_url: Optional[str] = None,
 ) -> Optional[str]:
     if not cfg.oauth_access_token or not cfg.oauth_from:
         logger.debug("OAuth not authorized — skipping ticket email")
         return None
 
     provider = str(cfg.oauth_provider.value if cfg.oauth_provider else "")
-    html_body = _build_html(subject, ticket, body_html, action_label, action_color)
+    html_body = _build_html(subject, ticket, body_html, action_label, action_color,
+                             assignee_name=assignee_name, reopen_url=reopen_url)
     msg_id = make_msgid(domain=(cfg.oauth_from.split("@")[-1] if "@" in cfg.oauth_from else "helpdesk"))
 
     if provider in ("microsoft", ""):

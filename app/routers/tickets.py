@@ -340,12 +340,20 @@ async def create_ticket(
 
     # ── Email: ticket created confirmation to submitter ────────────────
     if full.email:
+        description_block = ""
+        if full.description:
+            safe_desc = full.description.replace("<", "&lt;").replace(">", "&gt;")
+            description_block = (
+                f"<p><strong>Description:</strong><br/>"
+                f"<span style='white-space:pre-wrap;color:#374151'>{safe_desc}</span></p>"
+            )
         email_body = (
             f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
             f"<p>Your support request has been received. Here are the details:</p>"
             f"<p><strong>Subject:</strong> {full.subject}<br/>"
             f"<strong>Priority:</strong> {full.priority.value if hasattr(full.priority,'value') else full.priority}<br/>"
             f"<strong>Category:</strong> {full.category}</p>"
+            + description_block +
             f"<p>We will get back to you as soon as possible. You can reply to this email to add more information.</p>"
         )
         msg_id = await send_ticket_email(
@@ -355,6 +363,7 @@ async def create_ticket(
             body_html=email_body,
             action_label="New Ticket Created",
             action_color="#6366f1",
+            assignee_name=full.assignee.name if full.assignee else None,
         )
         if msg_id:
             # Store thread ID for reply matching and log in timeline
@@ -454,17 +463,41 @@ async def update_ticket(
 
     if "assignee_id" in update_data and update_data["assignee_id"] != old_assignee_id:
         new_assignee_id = update_data["assignee_id"]
+
+        # Build a meaningful timeline message
+        if new_assignee_id is None:
+            assign_text = f"Unassigned by <strong>{current_user.name}</strong>"
+        elif old_assignee_id is None:
+            # First assignment — check if self-pickup or admin assign
+            if new_assignee_id == current_user.id:
+                assign_text = f"Picked up by <strong>{current_user.name}</strong>"
+            else:
+                assignee_res = await db.execute(select(User).where(User.id == new_assignee_id))
+                new_agent = assignee_res.scalar_one_or_none()
+                assign_text = (
+                    f"Assigned to <strong>{new_agent.name if new_agent else 'agent'}</strong>"
+                    f" by <strong>{current_user.name}</strong>"
+                )
+        else:
+            assignee_res = await db.execute(select(User).where(User.id == new_assignee_id))
+            new_agent = assignee_res.scalar_one_or_none()
+            assign_text = (
+                f"Reassigned to <strong>{new_agent.name if new_agent else 'agent'}</strong>"
+                f" by <strong>{current_user.name}</strong>"
+            )
+
         assign_entry = TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.assign,
-            text=f"Reassigned by <strong>{current_user.name}</strong>",
+            text=assign_text,
             author_id=current_user.id,
         )
         db.add(assign_entry)
 
+        # Notify the assignee (but not if they assigned it to themselves)
         if new_assignee_id and new_assignee_id != current_user.id:
-            assignee_res = await db.execute(select(User).where(User.id == new_assignee_id))
-            assignee = assignee_res.scalar_one_or_none()
+            assignee_res2 = await db.execute(select(User).where(User.id == new_assignee_id))
+            assignee = assignee_res2.scalar_one_or_none()
             if assignee:
                 await notify_ticket_assigned(db, ticket, assignee, current_user.name)
 
@@ -480,6 +513,7 @@ async def update_ticket(
     if "status" in update_data and full.email:
         new_st = update_data["status"]
         email_cfg_data: dict | None = None
+        _agent = full.assignee.name if full.assignee else None
 
         if new_st == TicketStatus.on_hold:
             email_cfg_data = dict(
@@ -492,6 +526,7 @@ async def update_ticket(
                 ),
                 action_label="Ticket On Hold",
                 action_color="#f59e0b",
+                include_reopen=False,
             )
         elif new_st == TicketStatus.resolved:
             resolution_note = full.resolution or ""
@@ -501,10 +536,10 @@ async def update_ticket(
                     f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
                     f"<p>Your ticket <strong>{full.subject}</strong> has been <strong>resolved</strong>.</p>"
                     + (f"<p><strong>Resolution:</strong><br/>{resolution_note}</p>" if resolution_note else "")
-                    + "<p>If your issue is not fully resolved, reply to this email and we will reopen the ticket.</p>"
                 ),
                 action_label="Ticket Resolved",
                 action_color="#10b981",
+                include_reopen=True,
             )
         elif new_st == TicketStatus.closed:
             email_cfg_data = dict(
@@ -516,6 +551,7 @@ async def update_ticket(
                 ),
                 action_label="Ticket Closed",
                 action_color="#6b7280",
+                include_reopen=False,
             )
         elif new_st == TicketStatus.in_progress and old_status == TicketStatus.open:
             email_cfg_data = dict(
@@ -528,6 +564,7 @@ async def update_ticket(
                 ),
                 action_label="Ticket In Progress",
                 action_color="#8b5cf6",
+                include_reopen=False,
             )
 
         if email_cfg_data:
@@ -540,6 +577,8 @@ async def update_ticket(
                 action_color=email_cfg_data["action_color"],
                 in_reply_to=full.email_thread_id,
                 references=full.email_thread_id,
+                assignee_name=_agent,
+                include_reopen=email_cfg_data.get("include_reopen", False),
             )
             db.add(TicketTimeline(
                 ticket_id=full.id,
@@ -598,6 +637,7 @@ async def add_comment(
             action_color="#6366f1",
             in_reply_to=ticket.email_thread_id,
             references=ticket.email_thread_id,
+            assignee_name=current_user.name,
         )
         db.add(TicketTimeline(
             ticket_id=ticket.id,

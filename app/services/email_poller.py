@@ -46,7 +46,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
-from app.models.admin import EmailConfig
+from app.models.admin import EmailConfig, TicketSettings
 from app.models.inbound_email import (
     EmailLogStatus,
     EmailTicketLog,
@@ -98,14 +98,76 @@ async def _refresh_google_token(cfg: EmailConfig, db: AsyncSession) -> str:
 
 
 async def _ensure_valid_token(cfg: EmailConfig, db: AsyncSession) -> str:
-    """Return a valid (non-expired) access token, refreshing if needed."""
+    """Return a valid (non-expired) Google OAuth access token, refreshing if needed."""
     if cfg.oauth_token_expiry:
         remaining = cfg.oauth_token_expiry - datetime.now(timezone.utc)
         if remaining.total_seconds() < 300:  # refresh within 5 min of expiry
             return await _refresh_google_token(cfg, db)
     if not cfg.oauth_access_token:
-        raise RuntimeError("No OAuth access token stored. Re-authorize first.")
+        raise RuntimeError(
+            "No OAuth access token stored. Go to Admin → Email → Outbound, "
+            "switch to OAuth tab, and click Authorize to connect your account."
+        )
     return cfg.oauth_access_token
+
+
+async def _get_m365_graph_token(cfg: EmailConfig, db: AsyncSession) -> str:
+    """
+    Acquire (or reuse) a Microsoft Graph access token using the
+    client-credentials flow.  No interactive login required —
+    uses the Tenant ID / Client ID / Client Secret stored in EmailConfig.
+    The token is cached in EmailConfig until it expires.
+    """
+    # Reuse a still-valid cached token
+    if cfg.oauth_access_token and cfg.oauth_token_expiry:
+        remaining = cfg.oauth_token_expiry - datetime.now(timezone.utc)
+        if remaining.total_seconds() > 300:
+            return cfg.oauth_access_token
+
+    if not cfg.m365_tenant_id:
+        raise RuntimeError(
+            "M365 Tenant ID not configured — fill it in under Admin → Email → Outbound (M365 tab) and save."
+        )
+    if not cfg.m365_client_id:
+        raise RuntimeError(
+            "M365 Client (Application) ID not configured — fill it in under Admin → Email → Outbound (M365 tab) and save."
+        )
+    if not cfg.m365_client_secret:
+        raise RuntimeError(
+            "M365 Client Secret not configured — fill it in under Admin → Email → Outbound (M365 tab) and save."
+        )
+
+    url = (
+        f"https://login.microsoftonline.com/{cfg.m365_tenant_id}"
+        "/oauth2/v2.0/token"
+    )
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            url,
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     cfg.m365_client_id,
+                "client_secret": cfg.m365_client_secret,
+                "scope":         "https://graph.microsoft.com/.default",
+            },
+            timeout=15,
+        )
+
+    if resp.status_code != 200:
+        err = resp.json()
+        desc = err.get("error_description") or err.get("error") or resp.text
+        raise RuntimeError(f"M365 token acquisition failed: {desc}")
+
+    data = resp.json()
+    access_token = data["access_token"]
+    expires_in   = int(data.get("expires_in", 3600))
+
+    # Cache token in EmailConfig for reuse
+    cfg.oauth_access_token = access_token
+    cfg.oauth_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    await db.flush()
+
+    return access_token
 
 
 # ── Graph API helpers ─────────────────────────────────────────────────────────
@@ -222,6 +284,16 @@ async def _process_inbound_email(
         return existing_ticket, log, True
 
     # ── No match — create a new ticket ───────────────────────────────────
+    # Load ticket settings so prefix/digits/default-status honour admin config
+    ts_res = await db.execute(select(TicketSettings).limit(1))
+    ts = ts_res.scalar_one_or_none()
+    number_prefix  = (ts.number_prefix.strip().upper() if ts and ts.number_prefix else "TKT")
+    number_digits  = (ts.number_digits if ts and ts.number_digits else 4)
+    default_status = (ts.default_status if ts and ts.default_status else "open")
+
+    # Use admin default status unless an assignee is being set
+    initial_status = "in_progress" if inbound.default_assignee_id else default_status
+
     company = from_email.split("@")[1].lower() if "@" in from_email else ""
     category_slug = inbound.default_category or "email"
 
@@ -229,12 +301,15 @@ async def _process_inbound_email(
         subject=subject or "(no subject)",
         category=category_slug,
         priority=inbound.default_priority,
+        status=initial_status,
         submitter_name=from_name or from_email,
         company=company,
         contact_name=from_name or from_email,
         email=from_email,
         description=body or "(empty body)",
         assignee_id=inbound.default_assignee_id,
+        ticket_prefix=number_prefix,
+        ticket_number_digits=number_digits,
         created_at=received_at or datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -438,14 +513,39 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
 # ── Graph poller ──────────────────────────────────────────────────────────────
 
 async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int:
+    """
+    Poll the Microsoft Graph API for unread messages.
+
+    Token strategy (in priority order):
+      1. M365 client-credentials flow — uses Tenant ID + Client ID + Secret from
+         EmailConfig (type == 'm365').  No interactive login needed.
+      2. Stored OAuth access token — for providers that use the interactive OAuth
+         flow (type == 'oauth').
+    """
+    if not email_cfg:
+        raise RuntimeError(
+            "No email config found — configure M365 credentials under "
+            "Admin → Email → Outbound (M365 tab) first."
+        )
+
     processed = 0
     async with AsyncSessionLocal() as db:
-        access_token = await _ensure_valid_token(email_cfg, db)
+        # Reload email_cfg inside the session so we can write back the cached token
+        from app.models.admin import EmailType
+        res = await db.execute(select(EmailConfig))
+        live_cfg = res.scalar_one_or_none()
+        if not live_cfg:
+            raise RuntimeError("Email config missing from database.")
+
+        if live_cfg.type == EmailType.m365:
+            access_token = await _get_m365_graph_token(live_cfg, db)
+        else:
+            access_token = await _ensure_valid_token(live_cfg, db)
         await db.commit()
 
     mailbox = inbound.graph_mailbox or ""
     if not mailbox:
-        raise RuntimeError("graph_mailbox not configured")
+        raise RuntimeError("Shared mailbox address not configured — fill it in and save.")
 
     messages = await _graph_get_unread(mailbox, access_token)
     logger.info(f"Graph poller: found {len(messages)} unread message(s)")
@@ -590,9 +690,57 @@ class EmailPoller:
             email_cfg: EmailConfig | None = email_cfg_res.scalar_one_or_none()
 
         if not inbound:
-            raise RuntimeError("Inbound email not configured")
+            raise RuntimeError("Inbound email not configured — save your settings first")
         if not inbound.enabled:
-            raise RuntimeError("Inbound email is disabled")
+            raise RuntimeError("Inbound email is disabled — toggle it on and save first")
+
+        # ── Pre-flight validation ─────────────────────────────────────────────
+        if inbound.auth_type == InboundAuthType.basic:
+            if not inbound.imap_host:
+                raise RuntimeError("IMAP host not configured — fill in the IMAP Host field and save")
+            if not inbound.imap_user:
+                raise RuntimeError("IMAP username not configured — fill in the Email/Username field and save")
+            if not inbound.imap_pass:
+                raise RuntimeError(
+                    "IMAP password not saved — re-enter your password (or app password) and click Save"
+                )
+        elif inbound.auth_type == InboundAuthType.oauth:
+            if not email_cfg or not email_cfg.oauth_access_token:
+                raise RuntimeError(
+                    "OAuth IMAP requires outbound OAuth to be authorized first — "
+                    "go to Admin → Email → Outbound, switch to the OAuth tab, and click Authorize."
+                )
+        elif inbound.auth_type == InboundAuthType.graph:
+            if not inbound.graph_mailbox:
+                raise RuntimeError(
+                    "Shared mailbox address not configured — "
+                    "fill in the mailbox address (e.g. helpdesk@yourorg.com) and save."
+                )
+            if not email_cfg:
+                raise RuntimeError(
+                    "No outbound email config found — configure M365 credentials "
+                    "under Admin → Email → Outbound (M365 tab) first."
+                )
+            from app.models.admin import EmailType
+            if email_cfg.type == EmailType.m365:
+                # Client-credentials flow — validate M365 fields
+                missing = []
+                if not email_cfg.m365_tenant_id:     missing.append("Tenant ID")
+                if not email_cfg.m365_client_id:     missing.append("Client ID")
+                if not email_cfg.m365_client_secret: missing.append("Client Secret")
+                if missing:
+                    raise RuntimeError(
+                        f"M365 Graph API requires {', '.join(missing)} — "
+                        f"fill them in under Admin → Email → Outbound (M365 tab) and save."
+                    )
+            else:
+                # Interactive OAuth flow — token must already be stored
+                if not email_cfg.oauth_access_token:
+                    raise RuntimeError(
+                        "Graph API requires OAuth authorization — "
+                        "go to Admin → Email → Outbound (OAuth tab) and click Authorize."
+                    )
+        # ─────────────────────────────────────────────────────────────────────
 
         start = datetime.now(timezone.utc)
         processed = 0
@@ -600,12 +748,8 @@ class EmailPoller:
 
         try:
             if inbound.auth_type == InboundAuthType.graph:
-                if not email_cfg:
-                    raise RuntimeError("OAuth email config missing for Graph API")
-                processed = await _poll_graph(inbound, email_cfg)
+                processed = await _poll_graph(inbound, email_cfg)  # type: ignore[arg-type]
             else:
-                if not inbound.imap_host:
-                    raise RuntimeError("IMAP host not configured")
                 processed = await _poll_imap(inbound, email_cfg)  # type: ignore[arg-type]
 
         except Exception as e:
