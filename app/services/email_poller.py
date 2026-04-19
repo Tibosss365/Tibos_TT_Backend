@@ -57,9 +57,56 @@ from app.models.ticket import Ticket, TicketTimeline, TimelineType
 from app.services.email_parser import parse_raw_email
 from app.services.notification_service import broadcast_ticket_event
 from app.services.cache_service import invalidate_tickets
+from app.services.sla_service import SLAService
 from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
+
+
+# ── Filter rules ──────────────────────────────────────────────────────────────
+
+class FilteredEmailError(Exception):
+    """Raised when an inbound email matches a filter rule and should be skipped."""
+
+
+def _check_filter_rules(
+    rules: list[dict], subject: str, from_email: str
+) -> tuple[bool, str]:
+    """
+    Check if the email matches any filter rule.
+
+    Returns (matched: bool, rule_description: str).
+    Returns (False, '') when no rule matches or rules is empty.
+    """
+    for rule in (rules or []):
+        field    = rule.get("field", "subject")
+        operator = rule.get("operator", "contains")
+        raw_val  = (rule.get("value") or "").strip()
+        if not raw_val:
+            continue
+
+        value = raw_val.lower()
+        if field == "subject":
+            text = subject.lower()
+        elif field == "from_email":
+            text = from_email.lower()
+        elif field == "from_domain":
+            text = from_email.split("@")[1].lower() if "@" in from_email else ""
+        else:
+            continue
+
+        matched = False
+        if   operator == "contains":     matched = value in text
+        elif operator == "not_contains": matched = value not in text
+        elif operator == "starts_with":  matched = text.startswith(value)
+        elif operator == "ends_with":    matched = text.endswith(value)
+        elif operator == "equals":       matched = text == value
+
+        if matched:
+            return True, f"{field} {operator} '{raw_val}'"
+
+    return False, ""
+
 
 # ── OAuth helpers ─────────────────────────────────────────────────────────────
 
@@ -188,6 +235,32 @@ async def _graph_get_unread(
             headers={"Authorization": f"Bearer {token}"},
             timeout=20,
         )
+    if resp.status_code == 403:
+        err_code = ""
+        try:
+            err_code = resp.json().get("error", {}).get("code", "")
+        except Exception:
+            pass
+        if err_code == "ErrorAccessDenied":
+            raise RuntimeError(
+                f"Graph API 403 ErrorAccessDenied for mailbox '{mailbox}'. "
+                "Permissions are granted, so this is usually a configuration mismatch. Check:\n"
+                "1. Mailbox address — make sure '{mailbox}' is the exact address of an "
+                "Exchange Online mailbox in YOUR tenant (no typos, correct domain).\n"
+                "2. Tenant ID — the Tenant ID in Admin → Email → Outbound must match the "
+                "tenant where that mailbox lives (check Azure Portal → Overview for your "
+                "Directory/Tenant ID).\n"
+                "3. Mailbox type — the mailbox must be Exchange Online (not on-premises). "
+                "Shared mailboxes work; distribution lists do not."
+            )
+        raise RuntimeError(
+            f"Graph API 403 for mailbox '{mailbox}': {resp.text}"
+        )
+    if resp.status_code == 404:
+        raise RuntimeError(
+            f"Graph API 404 — mailbox '{mailbox}' not found in this tenant. "
+            "Verify the shared mailbox address is correct and exists in Exchange Online."
+        )
     if resp.status_code != 200:
         raise RuntimeError(f"Graph API error {resp.status_code}: {resp.text}")
     return resp.json().get("value", [])
@@ -230,7 +303,15 @@ async def _process_inbound_email(
 
     Returns (ticket, log, is_reply).
     Raises ValueError if message_id already processed (duplicate).
+    Raises FilteredEmailError if the email matches a filter rule.
     """
+    # ── Filter rules check (before dup check so filtered emails are skipped fast)
+    rules = inbound.filter_rules or []
+    if rules:
+        is_filtered, rule_desc = _check_filter_rules(rules, subject, from_email)
+        if is_filtered:
+            raise FilteredEmailError(f"Filtered by rule: {rule_desc}")
+
     # De-duplicate check
     dup = await db.execute(
         select(EmailTicketLog).where(EmailTicketLog.message_id == message_id)
@@ -315,6 +396,14 @@ async def _process_inbound_email(
     )
     db.add(ticket)
     await db.flush()
+
+    # Start SLA — uses the email's received_at as the anchor so the clock
+    # reflects when the message actually arrived, not when we processed it.
+    await SLAService.start(
+        ticket, db,
+        is_assignment=bool(inbound.default_assignee_id),
+        start_time=ticket.created_at,
+    )
 
     db.add(TicketTimeline(
         ticket_id=ticket.id,
@@ -452,6 +541,26 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                         logger.info(
                             f"Email→Ticket {action}: {ticket.ticket_id} from "
                             f"<{parsed['from_email']}> subject='{parsed['subject'][:60]}'"
+                        )
+
+                    except FilteredEmailError as e:
+                        # Email matched a filter rule — log as filtered, skip ticket creation
+                        async with AsyncSessionLocal() as filt_db:
+                            filt_log = EmailTicketLog(
+                                inbound_config_id=inbound.id,
+                                message_id=parsed["message_id"],
+                                from_email=parsed["from_email"],
+                                from_name=parsed["from_name"],
+                                subject=parsed["subject"],
+                                received_at=parsed["received_at"],
+                                status=EmailLogStatus.filtered,
+                                error_message=str(e),
+                            )
+                            filt_db.add(filt_log)
+                            await filt_db.commit()
+                        logger.debug(
+                            f"Email filtered: '{parsed['subject'][:50]}' "
+                            f"from <{parsed['from_email']}> — {e}"
                         )
 
                     except ValueError:
@@ -611,6 +720,26 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                             "source":        "email_graph",
                             "from_email":    from_email,
                         },
+                    )
+
+                except FilteredEmailError as e:
+                    # Email matched a filter rule — log as filtered, skip ticket
+                    async with AsyncSessionLocal() as filt_db:
+                        filt_log = EmailTicketLog(
+                            inbound_config_id=inbound.id,
+                            message_id=message_id,
+                            from_email=from_email,
+                            from_name=from_name,
+                            subject=subject,
+                            received_at=received_at,
+                            status=EmailLogStatus.filtered,
+                            error_message=str(e),
+                        )
+                        filt_db.add(filt_log)
+                        await filt_db.commit()
+                    logger.debug(
+                        f"Graph email filtered: '{subject[:50]}' "
+                        f"from <{from_email}> — {e}"
                     )
 
                 except ValueError:

@@ -6,7 +6,7 @@ from sqlalchemy import (
     String, Boolean, Integer, Text, DateTime, ForeignKey,
     Enum as SAEnum,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -23,6 +23,7 @@ class EmailLogStatus(str, enum.Enum):
     processed = "processed"
     duplicate = "duplicate"
     error     = "error"
+    filtered  = "filtered"
 
 
 class InboundEmailConfig(Base):
@@ -73,6 +74,15 @@ class InboundEmailConfig(Base):
     # After processing, mark messages as Seen and optionally move them
     mark_seen: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     move_to_folder: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # ── Filter rules ──────────────────────────────────────────────────
+    # List of {field, operator, value} dicts.
+    # field:    "subject" | "from_email" | "from_domain"
+    # operator: "contains" | "not_contains" | "starts_with" | "ends_with" | "equals"
+    # Matching emails are logged as EmailLogStatus.filtered and skipped.
+    filter_rules: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
 
     # ── Stats (updated by poller) ─────────────────────────────────────
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

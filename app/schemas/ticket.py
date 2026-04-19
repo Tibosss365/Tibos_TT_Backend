@@ -1,10 +1,24 @@
 import uuid
 from datetime import datetime, timezone
 from typing import Union
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_serializer
 
 from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType
 from app.schemas.user import UserPublic
+
+
+def _utc_iso(dt: datetime | None) -> str | None:
+    """Serialize a datetime to ISO-8601 with explicit UTC offset.
+
+    Naive datetimes from the DB are assumed to be UTC and tagged accordingly
+    so that JavaScript ``new Date()`` always interprets them as UTC, not local
+    time — preventing the "+5:30 IST offset" display bug.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 
 class TimelineEntryOut(BaseModel):
@@ -13,6 +27,10 @@ class TimelineEntryOut(BaseModel):
     text: str
     author: UserPublic | None = None
     created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def _ser_created_at(self, v: datetime | None) -> str | None:
+        return _utc_iso(v)
 
     model_config = {"from_attributes": True}
 
@@ -72,6 +90,14 @@ class TicketOut(TicketBase):
     created_at: datetime
     updated_at: datetime
 
+    @field_serializer(
+        "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
+        "created_at", "updated_at",
+        when_used="json",
+    )
+    def _ser_dt(self, v: datetime | None) -> str | None:
+        return _utc_iso(v)
+
     @computed_field
     @property
     def is_overdue(self) -> bool:
@@ -116,6 +142,14 @@ class TicketListOut(BaseModel):
     sla_due_at: Union[datetime, None] | None = None  # legacy
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer(
+        "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
+        "created_at", "updated_at",
+        when_used="json",
+    )
+    def _ser_dt(self, v: datetime | None) -> str | None:
+        return _utc_iso(v)
 
     @computed_field
     @property

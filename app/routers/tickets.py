@@ -320,7 +320,14 @@ async def create_ticket(
     # Start SLA — respects timer_start config:
     #   "on_creation"  → starts now regardless of assignee
     #   "on_assignment"→ starts only if an assignee was provided at creation
-    await SLAService.start(ticket, db, is_assignment=bool(body.assignee_id))
+    # Pass ticket.created_at so the SLA clock is anchored to the exact
+    # moment recorded on the ticket, not a floating datetime.now() inside
+    # the service (which could be a few milliseconds later).
+    await SLAService.start(
+        ticket, db,
+        is_assignment=bool(body.assignee_id),
+        start_time=ticket.created_at,
+    )
 
     await db.flush()
     await db.refresh(ticket)
@@ -434,12 +441,14 @@ async def update_ticket(
         update_data["status"] = TicketStatus.in_progress
 
     # ── SLA: start on first agent assignment (handles on_assignment timer_start) ──
+    # Anchor start_time to ticket.updated_at (already set above) so the SLA
+    # start timestamp exactly matches the update event recorded on the ticket.
     if (
         "assignee_id" in update_data
         and update_data["assignee_id"] is not None
         and ticket.sla_status == SLAStatus.not_started
     ):
-        await SLAService.start(ticket, db, is_assignment=True)
+        await SLAService.start(ticket, db, is_assignment=True, start_time=ticket.updated_at)
 
     # Timeline entries for meaningful changes
     if "status" in update_data:

@@ -25,6 +25,8 @@ class InboundEmailConfigOut(BaseModel):
     poll_interval_minutes: int
     mark_seen: bool
     move_to_folder: str | None
+    # Filter rules — list of {field, operator, value} dicts
+    filter_rules: list[dict] = []
     last_polled_at: datetime | None
     processed_count: int
     updated_at: datetime
@@ -59,6 +61,10 @@ class InboundEmailConfigUpdate(BaseModel):
     poll_interval_minutes: int | None = Field(None, ge=1, le=1440)
     mark_seen: bool | None = None
     move_to_folder: str | None = None
+
+    # ── Filter rules ─────────────────────────────────────────────────────────
+    # Each item: {"field": str, "operator": str, "value": str}
+    filter_rules: list[dict] | None = None
 
     # ── Validators ──────────────────────────────────────────────────────────
 
