@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 from app.models.admin import EmailType, OAuthProvider, SMTPSecurity
 
@@ -185,12 +185,14 @@ class AlertSettingsOut(BaseModel):
     conditions: dict
     reports: dict
     recipients: dict
+    alert_email_config: dict | None = Field(default=None, alias="alertEmailConfig")
     updated_at: datetime
 
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 class AlertSettingsUpdate(BaseModel):
     conditions: dict
     reports: dict
     recipients: dict
+    alert_email_config: dict | None = Field(default=None, alias="alertEmailConfig")

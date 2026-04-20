@@ -109,6 +109,12 @@ class AlertSettings(Base):
         "includeAdmin": True,
         "emails": [],
     })
+    alert_email_config: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=lambda: {
+        "useSameAsEmail": True,
+        "type": "smtp",
+        "smtp": {"host": "", "port": "587", "security": "tls", "from": "", "user": "", "pass": ""},
+        "m365": {"tenantId": "", "clientId": "", "clientSecret": "", "from": ""},
+    })
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

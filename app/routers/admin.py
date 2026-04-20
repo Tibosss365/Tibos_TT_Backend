@@ -1,11 +1,20 @@
+import asyncio
+import logging
 import secrets
+import smtplib
+import ssl
 import urllib.parse
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from app.core.deps import get_current_user, require_admin
 from app.database import get_db
@@ -403,7 +412,7 @@ async def _get_or_create_alert_settings(db: AsyncSession) -> AlertSettings:
     return settings
 
 
-@router.get("/alerts", response_model=AlertSettingsOut)
+@router.get("/alerts", response_model=AlertSettingsOut, response_model_by_alias=True)
 async def get_alert_settings(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
@@ -412,16 +421,17 @@ async def get_alert_settings(
     return AlertSettingsOut.model_validate(settings)
 
 
-@router.put("/alerts", response_model=AlertSettingsOut)
+@router.put("/alerts", response_model=AlertSettingsOut, response_model_by_alias=True)
 async def update_alert_settings(
     body: AlertSettingsUpdate,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     settings = await _get_or_create_alert_settings(db)
-    settings.conditions = body.conditions
-    settings.reports    = body.reports
-    settings.recipients = body.recipients
+    settings.conditions         = body.conditions
+    settings.reports            = body.reports
+    settings.recipients         = body.recipients
+    settings.alert_email_config = body.alert_email_config
     await db.flush()
     await db.refresh(settings)
     return AlertSettingsOut.model_validate(settings)
@@ -433,62 +443,140 @@ async def test_alert(
     current_user: User = Depends(require_admin),
 ):
     """
-    Send an immediate alert summary email to all configured recipients.
-    Queries the live ticket state and sends via the stored email config.
+    Send an immediate alert-summary email to all configured recipients.
+    All blocking I/O (SMTP) runs in a thread-pool executor so the async
+    event loop is never blocked.  A top-level try/except guarantees that
+    the client always receives a proper HTTP response (never a bare drop).
     """
-    from datetime import timezone as _tz
+    try:
+        return await _run_test_alert(db, current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled error in test_alert: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Internal error: {exc}")
+
+
+async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
+    """Inner implementation — separated so the outer handler can catch everything."""
 
     # ── 1. Load alert settings ────────────────────────────────────────────
     alert_cfg = await _get_or_create_alert_settings(db)
     recipients_cfg: dict = alert_cfg.recipients or {}
 
-    # Build recipient list
+    # Build recipient list — username is used as email if it looks like one
     to_emails: list[str] = list(recipients_cfg.get("emails") or [])
     if recipients_cfg.get("includeAdmin", True):
-        if current_user.email:
-            to_emails.insert(0, current_user.email)
+        admin_email = current_user.username if "@" in (current_user.username or "") else None
+        if admin_email and admin_email not in to_emails:
+            to_emails.insert(0, admin_email)
 
     if not to_emails:
         raise HTTPException(
             status_code=400,
-            detail="No recipients configured — add at least one email address or enable Admin Account.",
+            detail=(
+                "No recipients configured. "
+                "Add custom email addresses in Alerts → Recipients, "
+                "or make sure the Admin username is a valid email address."
+            ),
         )
 
-    # ── 2. Load email config ──────────────────────────────────────────────
-    email_result = await db.execute(select(EmailConfig))
-    email_cfg: EmailConfig | None = email_result.scalar_one_or_none()
-    if not email_cfg:
-        raise HTTPException(
-            status_code=400,
-            detail="Email is not configured — set up SMTP / M365 in the Email tab first.",
-        )
+    # ── 2. Resolve email credentials ─────────────────────────────────────
+    alert_email_cfg: dict = (alert_cfg.alert_email_config or {})
+    use_same = alert_email_cfg.get("useSameAsEmail", True)
+    send_params: dict  # will be passed to _send_smtp_alert or _send_graph_alert
 
-    email_type = email_cfg.type.value if email_cfg.type else "smtp"
-    from_addr = (
-        (email_cfg.smtp_from or email_cfg.smtp_user or "")   if email_type == "smtp"
-        else (email_cfg.m365_from or "")                      if email_type == "m365"
-        else (email_cfg.oauth_from or "")
-    )
-    if not from_addr:
-        raise HTTPException(
-            status_code=400,
-            detail="Email sender address is not set — configure it in the Email tab.",
-        )
+    if use_same:
+        email_result = await db.execute(select(EmailConfig))
+        sys_cfg: EmailConfig | None = email_result.scalar_one_or_none()
+        if not sys_cfg:
+            raise HTTPException(
+                status_code=400,
+                detail="Email is not configured — set up SMTP / M365 in the Email tab first.",
+            )
+        email_type = sys_cfg.type.value if sys_cfg.type else "smtp"
+        if email_type == "smtp":
+            from_addr = sys_cfg.smtp_from or sys_cfg.smtp_user or ""
+            if not sys_cfg.smtp_host or not from_addr:
+                raise HTTPException(
+                    status_code=400,
+                    detail="SMTP is not fully configured — fill in Host and From Address in the Email tab.",
+                )
+            send_params = {
+                "method": "smtp",
+                "host": sys_cfg.smtp_host,
+                "port": int(sys_cfg.smtp_port or 587),
+                "security": (sys_cfg.smtp_security.value if sys_cfg.smtp_security else "tls"),
+                "user": sys_cfg.smtp_user or "",
+                "password": sys_cfg.smtp_pass or "",
+                "from_addr": from_addr,
+            }
+        elif email_type == "m365":
+            from_addr = sys_cfg.m365_from or ""
+            if not sys_cfg.m365_tenant_id or not sys_cfg.m365_client_id or not from_addr:
+                raise HTTPException(
+                    status_code=400,
+                    detail="M365 is not fully configured — fill in Tenant ID, Client ID, and From Address.",
+                )
+            send_params = {
+                "method": "m365",
+                "tenant_id": sys_cfg.m365_tenant_id,
+                "client_id": sys_cfg.m365_client_id,
+                "client_secret": sys_cfg.m365_client_secret or "",
+                "from_addr": from_addr,
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Email type '{email_type}' is not supported for alert emails. Use SMTP or M365.",
+            )
+    else:
+        # Dedicated alert email config
+        atype = alert_email_cfg.get("type", "smtp")
+        if atype == "smtp":
+            sc = alert_email_cfg.get("smtp") or {}
+            from_addr = sc.get("from") or sc.get("user") or ""
+            if not sc.get("host") or not from_addr:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Alert SMTP is incomplete — fill in Host and From Address in Alerts → Alert Email Account.",
+                )
+            send_params = {
+                "method": "smtp",
+                "host": sc.get("host", ""),
+                "port": int(sc.get("port") or 587),
+                "security": sc.get("security", "tls"),
+                "user": sc.get("user", ""),
+                "password": sc.get("pass", ""),
+                "from_addr": from_addr,
+            }
+        elif atype == "m365":
+            mc = alert_email_cfg.get("m365") or {}
+            from_addr = mc.get("from", "")
+            if not mc.get("tenantId") or not mc.get("clientId") or not from_addr:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Alert M365 is incomplete — fill in Tenant ID, Client ID, and From Address.",
+                )
+            send_params = {
+                "method": "m365",
+                "tenant_id": mc.get("tenantId", ""),
+                "client_id": mc.get("clientId", ""),
+                "client_secret": mc.get("clientSecret", ""),
+                "from_addr": from_addr,
+            }
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported alert email type: '{atype}'")
 
-    # ── 3. Gather live ticket stats ───────────────────────────────────────
-    now = datetime.now(_tz.utc)
-    active_statuses = [TicketStatus.open, TicketStatus.in_progress, TicketStatus.on_hold]
+    # ── 3. Gather live ticket counts ──────────────────────────────────────
+    now = datetime.now(timezone.utc)
 
-    # Unassigned
     unassigned_res = await db.execute(
         select(func.count()).select_from(Ticket).where(
             Ticket.assignee_id.is_(None),
             Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress]),
         )
     )
-    unassigned_count = unassigned_res.scalar_one()
-
-    # SLA breached (sla_due_at in the past, ticket still active)
     sla_res = await db.execute(
         select(func.count()).select_from(Ticket).where(
             Ticket.sla_due_at.isnot(None),
@@ -496,15 +584,9 @@ async def test_alert(
             Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress]),
         )
     )
-    sla_breach_count = sla_res.scalar_one()
-
-    # On-hold
     on_hold_res = await db.execute(
         select(func.count()).select_from(Ticket).where(Ticket.status == TicketStatus.on_hold)
     )
-    on_hold_count = on_hold_res.scalar_one()
-
-    # Open today (created since midnight UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     open_today_res = await db.execute(
         select(func.count()).select_from(Ticket).where(
@@ -512,178 +594,148 @@ async def test_alert(
             Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
         )
     )
-    open_today_count = open_today_res.scalar_one()
+    counts = {
+        "unassigned":  unassigned_res.scalar_one(),
+        "sla_breach":  sla_res.scalar_one(),
+        "on_hold":     on_hold_res.scalar_one(),
+        "open_today":  open_today_res.scalar_one(),
+    }
 
-    # ── 4. Build alert email HTML ─────────────────────────────────────────
-    date_str = now.strftime("%B %d, %Y at %H:%M UTC")
+    # ── 4. Build HTML email ───────────────────────────────────────────────
+    subject = "Alert Summary: Ticket Health Report — " + now.strftime("%b %d, %Y")
+    html_body = _build_alert_html(counts, now)
 
-    def _stat_row(color: str, emoji: str, label: str, count: int, note: str = "") -> str:
-        bg = {"red": "#fef2f2", "amber": "#fffbeb", "violet": "#f5f3ff", "blue": "#eff6ff"}.get(color, "#f9fafb")
-        bd = {"red": "#fecaca", "amber": "#fde68a", "violet": "#ddd6fe", "blue": "#bfdbfe"}.get(color, "#e5e7eb")
-        tx = {"red": "#dc2626", "amber": "#d97706", "violet": "#7c3aed", "blue": "#2563eb"}.get(color, "#374151")
-        return f"""
-        <tr>
-          <td style="padding:10px 24px;border-bottom:1px solid #f3f4f6;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-              <tr>
-                <td style="width:40px;height:40px;background:{bg};border:1px solid {bd};
-                            border-radius:10px;text-align:center;vertical-align:middle;font-size:18px;">{emoji}</td>
-                <td style="padding-left:14px;vertical-align:middle;">
-                  <div style="font-size:13px;font-weight:600;color:#374151;">{label}</div>
-                  {f'<div style="font-size:11px;color:#9ca3af;margin-top:1px;">{note}</div>' if note else ''}
-                </td>
-                <td style="text-align:right;vertical-align:middle;">
-                  <span style="font-size:22px;font-weight:800;color:{tx};">{count}</span>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>"""
-
-    stats_rows = (
-        _stat_row("amber", "👤", "Unassigned Tickets",  unassigned_count,  "No agent assigned yet") +
-        _stat_row("red",   "⚠️",  "SLA Breaches",        sla_breach_count,  "Past response deadline") +
-        _stat_row("violet","⏸",  "On-Hold Tickets",     on_hold_count,     "Awaiting action") +
-        _stat_row("blue",  "📬", "Opened Today",        open_today_count,  f"Since midnight UTC")
-    )
-
-    html_body = f"""
-    <!DOCTYPE html>
-    <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-    <body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-      <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 16px;">
-        <tr><td align="center">
-          <table width="560" cellpadding="0" cellspacing="0"
-                 style="background:#fff;border-radius:16px;overflow:hidden;
-                        box-shadow:0 4px 24px rgba(0,0,0,.08);">
-
-            <!-- Header -->
-            <tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">
-              <table width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td>
-                  <div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);
-                               text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">
-                    🔔 Alert Summary
-                  </div>
-                  <div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>
-                  <div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_str}</div>
-                </td>
-                <td style="text-align:right;font-size:40px;">📊</td>
-              </tr></table>
-            </td></tr>
-
-            <!-- Stats -->
-            <tr><td style="padding:20px 0 8px;">
-              <div style="font-size:11px;font-weight:700;color:#9ca3af;
-                           text-transform:uppercase;letter-spacing:.8px;
-                           padding:0 24px 12px;">Current Status</div>
-              <table width="100%" cellpadding="0" cellspacing="0">{stats_rows}</table>
-            </td></tr>
-
-            <!-- Footer -->
-            <tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">
-              <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-                This is a test alert sent from your Tibos Helpdesk admin panel.<br>
-                Manage alert settings in <strong>Admin → Alerts</strong>.
-              </p>
-            </td></tr>
-
-          </table>
-        </td></tr>
-      </table>
-    </body></html>
-    """
-
-    # ── 5. Send to all recipients ─────────────────────────────────────────
-    subject = f"🔔 [Helpdesk Alert] Ticket Summary — {now.strftime('%b %d, %Y')}"
+    # ── 5. Send (non-blocking) ────────────────────────────────────────────
     errors: list[str] = []
-
     for to_email in to_emails:
         try:
-            await _send_alert_email(email_cfg, from_addr, to_email, subject, html_body)
+            await _dispatch_alert_email(send_params, to_email, subject, html_body)
         except Exception as exc:
-            logger.warning(f"Alert email to {to_email} failed: {exc}")
-            errors.append(str(exc))
+            logger.warning("Alert email to %s failed: %s", to_email, exc)
+            errors.append(f"{to_email}: {exc}")
 
     if errors and len(errors) == len(to_emails):
-        # All sends failed
-        raise HTTPException(status_code=502, detail=f"All alert sends failed: {errors[0]}")
+        raise HTTPException(status_code=502, detail=f"Email delivery failed — {errors[0]}")
 
-    sent = len(to_emails) - len(errors)
-    return {"ok": True, "sent": sent, "recipients": to_emails}
+    return {"ok": True, "sent": len(to_emails) - len(errors), "recipients": to_emails}
 
 
-# ── Shared alert email sender ──────────────────────────────────────────────
+# ── HTML builder ───────────────────────────────────────────────────────────
 
-import logging as _logging
-_logger = _logging.getLogger(__name__)
+def _build_alert_html(counts: dict, now: datetime) -> str:
+    date_str = now.strftime("%B %d, %Y at %H:%M UTC")
+    rows = ""
+    for color, emoji, label, key, note in [
+        ("amber",  "&#128100;", "Unassigned Tickets", "unassigned", "No agent assigned yet"),
+        ("red",    "&#9888;",   "SLA Breaches",        "sla_breach", "Past response deadline"),
+        ("violet", "&#9208;",   "On-Hold Tickets",     "on_hold",    "Awaiting action"),
+        ("blue",   "&#128236;", "Opened Today",        "open_today", "Since midnight UTC"),
+    ]:
+        bg = {"red":"#fef2f2","amber":"#fffbeb","violet":"#f5f3ff","blue":"#eff6ff"}[color]
+        bd = {"red":"#fecaca","amber":"#fde68a","violet":"#ddd6fe","blue":"#bfdbfe"}[color]
+        tx = {"red":"#dc2626","amber":"#d97706","violet":"#7c3aed","blue":"#2563eb"}[color]
+        n  = counts.get(key, 0)
+        rows += (
+            f'<tr><td style="padding:10px 24px;border-bottom:1px solid #f3f4f6;">'
+            f'<table width="100%" cellpadding="0" cellspacing="0"><tr>'
+            f'<td style="width:40px;height:40px;background:{bg};border:1px solid {bd};'
+            f'border-radius:10px;text-align:center;vertical-align:middle;font-size:18px;">{emoji}</td>'
+            f'<td style="padding-left:14px;vertical-align:middle;">'
+            f'<div style="font-size:13px;font-weight:600;color:#374151;">{label}</div>'
+            f'<div style="font-size:11px;color:#9ca3af;margin-top:1px;">{note}</div>'
+            f'</td><td style="text-align:right;vertical-align:middle;">'
+            f'<span style="font-size:22px;font-weight:800;color:{tx};">{n}</span>'
+            f'</td></tr></table></td></tr>'
+        )
+    return (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        '<body style="margin:0;padding:0;background:#f3f4f6;'
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+        '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 16px;">'
+        '<tr><td align="center">'
+        '<table width="560" cellpadding="0" cellspacing="0" '
+        'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
+        '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
+        '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);'
+        'text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">&#128276; Alert Summary</div>'
+        f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
+        f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_str}</div>'
+        '</td></tr>'
+        '<tr><td style="padding:20px 0 8px;">'
+        '<div style="font-size:11px;font-weight:700;color:#9ca3af;text-transform:uppercase;'
+        'letter-spacing:.8px;padding:0 24px 12px;">Current Status</div>'
+        f'<table width="100%" cellpadding="0" cellspacing="0">{rows}</table>'
+        '</td></tr>'
+        '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
+        '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
+        'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
+        'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
+        '</td></tr>'
+        '</table></td></tr></table></body></html>'
+    )
 
-import smtplib as _smtplib
-import ssl as _ssl
-from email.mime.multipart import MIMEMultipart as _MIMEMultipart
-from email.mime.text import MIMEText as _MIMEText
-from email.utils import formatdate as _formatdate, make_msgid as _make_msgid
 
+# ── Non-blocking email dispatcher ─────────────────────────────────────────
 
-async def _send_alert_email(
-    cfg: EmailConfig,
-    from_addr: str,
-    to_email: str,
-    subject: str,
-    html_body: str,
+async def _dispatch_alert_email(
+    params: dict, to_email: str, subject: str, html_body: str
 ) -> None:
-    """Send a plain HTML alert email using the stored EmailConfig."""
-    email_type = cfg.type.value if cfg.type else "smtp"
+    """
+    Route to the correct sending method.
+    SMTP runs in a thread-pool executor (run_in_executor) so the async
+    event loop is never blocked by synchronous socket I/O.
+    M365 / Graph API uses httpx (native async).
+    """
+    method = params.get("method", "smtp")
 
-    if email_type == "smtp":
-        if not cfg.smtp_host:
-            raise RuntimeError("SMTP host not configured")
-        msg = _MIMEMultipart("alternative")
+    if method == "smtp":
+        from_addr = params["from_addr"]
+        host      = params["host"]
+        port      = params["port"]
+        security  = params.get("security", "tls")
+        user      = params.get("user", "")
+        password  = params.get("password", "")
+
+        # Build the MIME message synchronously (cheap, no I/O)
+        msg = MIMEMultipart("alternative")
         msg["Subject"]    = subject
         msg["From"]       = from_addr
         msg["To"]         = to_email
-        msg["Date"]       = _formatdate(localtime=False)
-        msg["Message-ID"] = _make_msgid(domain=(from_addr.split("@")[-1] if "@" in from_addr else "helpdesk"))
-        msg.attach(_MIMEText(html_body, "html", "utf-8"))
+        msg["Date"]       = formatdate(localtime=False)
+        msg["Message-ID"] = make_msgid(domain=(from_addr.split("@")[-1] if "@" in from_addr else "helpdesk"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        raw = msg.as_bytes()
 
-        port = int(cfg.smtp_port or 587)
-        host = cfg.smtp_host
-
-        from app.models.admin import SMTPSecurity
-        if cfg.smtp_security == SMTPSecurity.ssl:
-            ctx = _ssl.create_default_context()
-            with _smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as srv:
-                srv.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-                srv.sendmail(from_addr, [to_email], msg.as_bytes())
-        else:
-            with _smtplib.SMTP(host, port, timeout=15) as srv:
-                srv.ehlo()
-                if cfg.smtp_security == SMTPSecurity.tls:
-                    srv.starttls(context=_ssl.create_default_context())
+        def _smtp_send() -> None:
+            if security == "ssl":
+                ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(host, port, context=ctx, timeout=20) as srv:
+                    srv.login(user, password)
+                    srv.sendmail(from_addr, [to_email], raw)
+            else:
+                with smtplib.SMTP(host, port, timeout=20) as srv:
                     srv.ehlo()
-                srv.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-                srv.sendmail(from_addr, [to_email], msg.as_bytes())
+                    if security == "tls":
+                        srv.starttls(context=ssl.create_default_context())
+                        srv.ehlo()
+                    srv.login(user, password)
+                    srv.sendmail(from_addr, [to_email], raw)
 
-    elif email_type == "m365":
+        # Run blocking SMTP in a thread so the event loop stays free
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _smtp_send)
+
+    elif method == "m365":
         from app.services.email_sender import _get_graph_token, _send_via_graph
         token = await _get_graph_token(
-            cfg.m365_tenant_id or "", cfg.m365_client_id or "", cfg.m365_client_secret or ""
+            params["tenant_id"], params["client_id"], params["client_secret"]
         )
         await _send_via_graph(
-            token=token, from_email=from_addr, to_email=to_email,
-            subject=subject, html_body=html_body,
+            token=token,
+            from_email=params["from_addr"],
+            to_email=to_email,
+            subject=subject,
+            html_body=html_body,
         )
-
-    elif email_type == "oauth":
-        from app.services.email_sender import _send_via_graph
-        provider = (cfg.oauth_provider.value if cfg.oauth_provider else "").lower()
-        if provider in ("microsoft", ""):
-            await _send_via_graph(
-                token=cfg.oauth_access_token or "",
-                from_email=from_addr, to_email=to_email,
-                subject=subject, html_body=html_body,
-            )
-        else:
-            raise RuntimeError(f"OAuth provider '{provider}' not supported for alert emails yet")
     else:
-        raise RuntimeError(f"Unknown email type '{email_type}'")
+        raise RuntimeError(f"Unsupported send method: {method}")
