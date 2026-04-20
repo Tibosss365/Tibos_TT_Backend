@@ -179,3 +179,18 @@ class AdminStats(BaseModel):
     critical_tickets: int
     unassigned_tickets: int
     agent_workload: list[dict]
+
+
+class AlertSettingsOut(BaseModel):
+    conditions: dict
+    reports: dict
+    recipients: dict
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AlertSettingsUpdate(BaseModel):
+    conditions: dict
+    reports: dict
+    recipients: dict

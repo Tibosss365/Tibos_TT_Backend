@@ -86,6 +86,38 @@ class SLAConfig(Base):
     )
 
 
+class AlertSettings(Base):
+    """Admin-configurable alert conditions, scheduled reports, and recipients."""
+    __tablename__ = "alert_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+
+    # JSON blobs — structure mirrors the frontend DEFAULT_ALERT_SETTINGS shape
+    conditions: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
+        "unassigned":  {"enabled": True,  "thresholdMins": 30},
+        "slaBreach":   {"enabled": True,  "includeWarning": True},
+        "openToday":   {"enabled": False},
+        "onHold":      {"enabled": False, "thresholdHours": 24},
+        "inProgress":  {"enabled": False, "thresholdHours": 48},
+    })
+    reports: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
+        "daily":   {"enabled": False, "time": "08:00"},
+        "weekly":  {"enabled": False, "day": "monday",  "time": "08:00"},
+        "monthly": {"enabled": False, "dayOfMonth": 1,  "time": "08:00"},
+    })
+    recipients: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
+        "includeAdmin": True,
+        "emails": [],
+    })
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
 class EmailConfig(Base):
     __tablename__ = "email_config"
 
