@@ -15,6 +15,7 @@ from app.routers import admin, agents, analytics, auth, dashboard, events, notif
 from app.routers import inbound_email, categories, sla, groups
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
+from app.services.report_scheduler import report_scheduler
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -134,11 +135,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] SLA breach detector could not start: {e}")
 
+    # 5. Start scheduled report sender (checks every 60 s)
+    try:
+        report_scheduler.start()
+        _log("[OK] Report scheduler started")
+    except Exception as e:
+        _log(f"  [WARN] Report scheduler could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
     email_poller.stop()
     sla_breach_detector.stop()
+    report_scheduler.stop()
     await close_redis()
     await engine.dispose()
     _log("[OK] Shutdown complete")
@@ -207,4 +216,5 @@ async def health():
         "sla_breach_detector": "running" if (
             sla_breach_detector._task and not sla_breach_detector._task.done()
         ) else "stopped",
+        "report_scheduler": "running" if report_scheduler.is_running else "stopped",
     }

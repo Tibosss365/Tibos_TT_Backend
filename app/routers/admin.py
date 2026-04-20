@@ -675,29 +675,37 @@ def _build_alert_html(
     now: datetime,
     agent_stats: list | None = None,
     template: dict | None = None,
+    report_type: str | None = None,
 ) -> str:
     """
     Build the full alert/report HTML email.
 
     `template` mirrors the frontend template object (includeUnassigned, includeSla, …).
     When None (e.g. for the test-send endpoint), every section is shown.
+    `report_type` is "daily" | "weekly" | "monthly" — affects period labels.
     """
     def _show(key: str) -> bool:
-        """Return True if the section should be included."""
         if template is None:
             return True
         return template.get(key, True) is not False
 
     date_str = now.strftime("%B %d, %Y at %H:%M UTC")
 
+    # ── Period-aware labels for created/resolved counts ───────────────────
+    _PERIOD = {
+        "daily":   ("Today",      "since midnight UTC"),
+        "weekly":  ("This Week",  "since Monday midnight UTC"),
+        "monthly": ("This Month", "since the 1st of the month"),
+    }.get(report_type or "daily", ("Today", "since midnight UTC"))
+
     # ── Stat rows (ticket counts) ─────────────────────────────────────────
     _STAT_DEFS = [
-        ("amber",   "&#128100;", "Unassigned Tickets",  "unassigned",    "includeUnassigned",    "No agent assigned yet"),
-        ("red",     "&#9888;",   "SLA Breaches",         "sla_breach",    "includeSla",           "Past response deadline"),
-        ("violet",  "&#9208;",   "On-Hold Tickets",      "on_hold",       "includeOnHold",        "Awaiting action"),
-        ("blue",    "&#128236;", "Currently Open",       "open_today",    "includeOpenToday",     "Active tickets right now"),
-        ("emerald", "&#128229;", "Created Today",        "created_today", "includeCreatedToday",  "New tickets since midnight"),
-        ("green",   "&#9989;",   "Resolved Today",       "resolved_today","includeResolvedToday", "Closed since midnight"),
+        ("amber",   "&#128100;", "Unassigned Tickets",          "unassigned",    "includeUnassigned",    "No agent assigned yet"),
+        ("red",     "&#9888;",   "SLA Breaches",                "sla_breach",    "includeSla",           "Past response deadline"),
+        ("violet",  "&#9208;",   "On-Hold Tickets",             "on_hold",       "includeOnHold",        "Awaiting action"),
+        ("blue",    "&#128236;", "Currently Open",              "open_today",    "includeOpenToday",     "Active tickets right now"),
+        ("emerald", "&#128229;", f"Created {_PERIOD[0]}",       "created_today", "includeCreatedToday",  f"New tickets {_PERIOD[1]}"),
+        ("green",   "&#9989;",   f"Resolved {_PERIOD[0]}",      "resolved_today","includeResolvedToday", f"Tickets closed {_PERIOD[1]}"),
     ]
     _BG = {"red":"#fef2f2","amber":"#fffbeb","violet":"#f5f3ff","blue":"#eff6ff",
            "emerald":"#ecfdf5","green":"#f0fdf4"}
@@ -792,7 +800,9 @@ def _build_alert_html(
         'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
         '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
         '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);'
-        'text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">&#128276; Alert Summary</div>'
+        'text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">&#128276; '
+        + {"daily": "Daily Report", "weekly": "Weekly Report", "monthly": "Monthly Report"}.get(report_type or "", "Alert Summary") +
+        '</div>'
         f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
         f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_str}</div>'
         '</td></tr>'

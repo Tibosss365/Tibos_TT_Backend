@@ -115,6 +115,9 @@ class AlertSettings(Base):
         "smtp": {"host": "", "port": "587", "security": "tls", "from": "", "user": "", "pass": ""},
         "m365": {"tenantId": "", "clientId": "", "clientSecret": "", "from": ""},
     })
+    # Tracks when each report type was last successfully sent
+    # {"daily": "2026-04-21T08:00:00+00:00", "weekly": "...", "monthly": "..."}
+    last_reports_sent: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
