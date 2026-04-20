@@ -227,7 +227,43 @@ async def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -
             "grant_type":    "client_credentials",
         })
     if resp.status_code != 200:
-        raise RuntimeError(f"Token request failed ({resp.status_code}): {resp.text}")
+        # Parse Microsoft's error JSON for a clean, actionable message
+        try:
+            err = resp.json()
+            desc: str = err.get("error_description", "") or ""
+            code: str = err.get("error", "")
+            # Strip the trace/timestamp noise — keep only the first sentence
+            clean = desc.split(" Trace ID:")[0].strip()
+            # Map known AADSTS codes to a developer-friendly hint
+            hints = {
+                "AADSTS7000215": (
+                    "Invalid Client Secret — you entered the secret ID (a GUID), "
+                    "not the secret Value. "
+                    "In Azure Portal → App registrations → your app → "
+                    "Certificates & secrets, copy the VALUE column, not the ID column."
+                ),
+                "AADSTS700016": (
+                    "Application not found — the Client (Application) ID is wrong or "
+                    "the app does not exist in this tenant."
+                ),
+                "AADSTS90002": (
+                    "Tenant not found — check that the Tenant ID is correct. "
+                    "Find it in Azure Portal → Azure Active Directory → Overview."
+                ),
+                "AADSTS7000222": (
+                    "Client Secret has expired — generate a new secret in Azure Portal → "
+                    "App registrations → your app → Certificates & secrets."
+                ),
+            }
+            for aadsts_code, hint in hints.items():
+                if aadsts_code in desc:
+                    raise RuntimeError(hint)
+            # Fall back to the cleaned description if no known code matched
+            raise RuntimeError(clean or f"Microsoft authentication failed ({resp.status_code}) — {code}")
+        except RuntimeError:
+            raise
+        except Exception:
+            raise RuntimeError(f"Token request failed ({resp.status_code}): {resp.text}")
     return resp.json()["access_token"]
 
 
