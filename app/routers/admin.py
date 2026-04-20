@@ -11,7 +11,7 @@ from email.utils import formatdate, make_msgid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case as sa_case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -594,16 +594,64 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
             Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
         )
     )
+    created_today_res = await db.execute(
+        select(func.count()).select_from(Ticket).where(Ticket.created_at >= midnight)
+    )
+    resolved_today_res = await db.execute(
+        select(func.count()).select_from(Ticket).where(
+            Ticket.updated_at >= midnight,
+            Ticket.status.in_([TicketStatus.resolved, TicketStatus.closed]),
+        )
+    )
+
+    # Agent stats — all active users, merged with per-status ticket counts
+    # Step 1: fetch every active user
+    all_users_res = await db.execute(select(User).where(User.is_active == True))
+    all_users = all_users_res.scalars().all()
+
+    # Step 2: per-assignee ticket counts via a single GROUP BY query
+    ticket_counts_q = await db.execute(
+        select(
+            Ticket.assignee_id,
+            func.count().label("total"),
+            func.sum(sa_case((Ticket.status == TicketStatus.open,        1), else_=0)).label("open"),
+            func.sum(sa_case((Ticket.status == TicketStatus.in_progress, 1), else_=0)).label("in_progress"),
+            func.sum(sa_case((Ticket.status == TicketStatus.on_hold,     1), else_=0)).label("on_hold"),
+            func.sum(sa_case((Ticket.status == TicketStatus.resolved,    1), else_=0)).label("resolved"),
+            func.sum(sa_case((Ticket.status == TicketStatus.closed,      1), else_=0)).label("closed"),
+        ).where(
+            Ticket.assignee_id.isnot(None)
+        ).group_by(Ticket.assignee_id)
+    )
+    ticket_rows = {str(r.assignee_id): r for r in ticket_counts_q.fetchall()}
+
+    # Step 3: merge — every user gets a row (zeros if no tickets)
+    agent_stats = sorted([
+        {
+            "name":        u.name or u.username,
+            "initials":    (u.initials or "".join(w[0].upper() for w in (u.name or u.username or "?").split()[:2]) or "?"),
+            "total":       int((ticket_rows[str(u.id)].total       if str(u.id) in ticket_rows else 0) or 0),
+            "open":        int((ticket_rows[str(u.id)].open        if str(u.id) in ticket_rows else 0) or 0),
+            "in_progress": int((ticket_rows[str(u.id)].in_progress if str(u.id) in ticket_rows else 0) or 0),
+            "on_hold":     int((ticket_rows[str(u.id)].on_hold     if str(u.id) in ticket_rows else 0) or 0),
+            "resolved":    int(((ticket_rows[str(u.id)].resolved if str(u.id) in ticket_rows else 0) or 0)
+                             + ((ticket_rows[str(u.id)].closed   if str(u.id) in ticket_rows else 0) or 0)),
+        }
+        for u in all_users
+    ], key=lambda x: x["total"], reverse=True)
+
     counts = {
-        "unassigned":  unassigned_res.scalar_one(),
-        "sla_breach":  sla_res.scalar_one(),
-        "on_hold":     on_hold_res.scalar_one(),
-        "open_today":  open_today_res.scalar_one(),
+        "unassigned":    unassigned_res.scalar_one(),
+        "sla_breach":    sla_res.scalar_one(),
+        "on_hold":       on_hold_res.scalar_one(),
+        "open_today":    open_today_res.scalar_one(),
+        "created_today": created_today_res.scalar_one(),
+        "resolved_today": resolved_today_res.scalar_one(),
     }
 
     # ── 4. Build HTML email ───────────────────────────────────────────────
     subject = "Alert Summary: Ticket Health Report — " + now.strftime("%b %d, %Y")
-    html_body = _build_alert_html(counts, now)
+    html_body = _build_alert_html(counts, now, agent_stats=agent_stats)
 
     # ── 5. Send (non-blocking) ────────────────────────────────────────────
     errors: list[str] = []
@@ -622,38 +670,125 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
 
 # ── HTML builder ───────────────────────────────────────────────────────────
 
-def _build_alert_html(counts: dict, now: datetime) -> str:
+def _build_alert_html(
+    counts: dict,
+    now: datetime,
+    agent_stats: list | None = None,
+    template: dict | None = None,
+) -> str:
+    """
+    Build the full alert/report HTML email.
+
+    `template` mirrors the frontend template object (includeUnassigned, includeSla, …).
+    When None (e.g. for the test-send endpoint), every section is shown.
+    """
+    def _show(key: str) -> bool:
+        """Return True if the section should be included."""
+        if template is None:
+            return True
+        return template.get(key, True) is not False
+
     date_str = now.strftime("%B %d, %Y at %H:%M UTC")
-    rows = ""
-    for color, emoji, label, key, note in [
-        ("amber",  "&#128100;", "Unassigned Tickets", "unassigned", "No agent assigned yet"),
-        ("red",    "&#9888;",   "SLA Breaches",        "sla_breach", "Past response deadline"),
-        ("violet", "&#9208;",   "On-Hold Tickets",     "on_hold",    "Awaiting action"),
-        ("blue",   "&#128236;", "Opened Today",        "open_today", "Since midnight UTC"),
-    ]:
-        bg = {"red":"#fef2f2","amber":"#fffbeb","violet":"#f5f3ff","blue":"#eff6ff"}[color]
-        bd = {"red":"#fecaca","amber":"#fde68a","violet":"#ddd6fe","blue":"#bfdbfe"}[color]
-        tx = {"red":"#dc2626","amber":"#d97706","violet":"#7c3aed","blue":"#2563eb"}[color]
-        n  = counts.get(key, 0)
-        rows += (
+
+    # ── Stat rows (ticket counts) ─────────────────────────────────────────
+    _STAT_DEFS = [
+        ("amber",   "&#128100;", "Unassigned Tickets",  "unassigned",    "includeUnassigned",    "No agent assigned yet"),
+        ("red",     "&#9888;",   "SLA Breaches",         "sla_breach",    "includeSla",           "Past response deadline"),
+        ("violet",  "&#9208;",   "On-Hold Tickets",      "on_hold",       "includeOnHold",        "Awaiting action"),
+        ("blue",    "&#128236;", "Currently Open",       "open_today",    "includeOpenToday",     "Active tickets right now"),
+        ("emerald", "&#128229;", "Created Today",        "created_today", "includeCreatedToday",  "New tickets since midnight"),
+        ("green",   "&#9989;",   "Resolved Today",       "resolved_today","includeResolvedToday", "Closed since midnight"),
+    ]
+    _BG = {"red":"#fef2f2","amber":"#fffbeb","violet":"#f5f3ff","blue":"#eff6ff",
+           "emerald":"#ecfdf5","green":"#f0fdf4"}
+    _BD = {"red":"#fecaca","amber":"#fde68a","violet":"#ddd6fe","blue":"#bfdbfe",
+           "emerald":"#a7f3d0","green":"#bbf7d0"}
+    _TX = {"red":"#dc2626","amber":"#d97706","violet":"#7c3aed","blue":"#2563eb",
+           "emerald":"#059669","green":"#16a34a"}
+
+    stat_rows = ""
+    for color, emoji, label, count_key, tmpl_key, note in _STAT_DEFS:
+        if not _show(tmpl_key):
+            continue
+        n = counts.get(count_key, 0)
+        stat_rows += (
             f'<tr><td style="padding:10px 24px;border-bottom:1px solid #f3f4f6;">'
             f'<table width="100%" cellpadding="0" cellspacing="0"><tr>'
-            f'<td style="width:40px;height:40px;background:{bg};border:1px solid {bd};'
+            f'<td style="width:40px;height:40px;background:{_BG[color]};border:1px solid {_BD[color]};'
             f'border-radius:10px;text-align:center;vertical-align:middle;font-size:18px;">{emoji}</td>'
             f'<td style="padding-left:14px;vertical-align:middle;">'
             f'<div style="font-size:13px;font-weight:600;color:#374151;">{label}</div>'
             f'<div style="font-size:11px;color:#9ca3af;margin-top:1px;">{note}</div>'
             f'</td><td style="text-align:right;vertical-align:middle;">'
-            f'<span style="font-size:22px;font-weight:800;color:{tx};">{n}</span>'
+            f'<span style="font-size:22px;font-weight:800;color:{_TX[color]};">{n}</span>'
             f'</td></tr></table></td></tr>'
         )
+
+    # ── Agent Status Table ────────────────────────────────────────────────
+    agent_section = ""
+    if _show("includeAgentStats") and agent_stats is not None:
+        # Colour palette for avatar circles (cycles through list)
+        _AVATAR_COLORS = ["#4f46e5","#0891b2","#059669","#d97706","#dc2626","#7c3aed","#0284c7","#16a34a"]
+        header_cells = "".join(
+            f'<th style="padding:10px 14px;text-align:{align};font-size:10px;font-weight:700;'
+            f'color:#6b7280;text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid #e5e7eb;">{h}</th>'
+            for h, align in [
+                ("Agent", "left"), ("Total", "right"), ("Open", "right"),
+                ("In Progress", "right"), ("On Hold", "right"), ("Resolved", "right"),
+            ]
+        )
+        agent_body = ""
+        for i, ag in enumerate(agent_stats):
+            row_bg     = "#f9fafb" if i % 2 == 0 else "#ffffff"
+            avatar_bg  = _AVATAR_COLORS[i % len(_AVATAR_COLORS)]
+            initials   = ag.get("initials") or "?"
+            total      = ag["total"]
+            open_c     = ag["open"]
+            inp_c      = ag["in_progress"]
+            hold_c     = ag["on_hold"]
+            res_c      = ag["resolved"]
+
+            def _badge(val: int, color: str) -> str:
+                """Coloured number — grey when zero."""
+                c = color if val > 0 else "#d1d5db"
+                return (f'<span style="font-size:13px;font-weight:{"700" if val>0 else "500"};'
+                        f'color:{c};">{val}</span>')
+
+            agent_body += (
+                f'<tr style="background:{row_bg};">'
+                f'<td style="padding:10px 14px;">'
+                f'<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr>'
+                f'<td style="width:30px;height:30px;min-width:30px;background:{avatar_bg};border-radius:50%;'
+                f'text-align:center;vertical-align:middle;font-size:11px;font-weight:700;color:#fff;">{initials}</td>'
+                f'<td style="padding-left:10px;font-size:13px;font-weight:600;color:#374151;white-space:nowrap;">{ag["name"]}</td>'
+                f'</tr></table></td>'
+                f'<td style="padding:10px 14px;text-align:right;">'
+                f'<span style="font-size:13px;font-weight:700;color:#111827;">{total}</span></td>'
+                f'<td style="padding:10px 14px;text-align:right;">{_badge(open_c,  "#2563eb")}</td>'
+                f'<td style="padding:10px 14px;text-align:right;">{_badge(inp_c,   "#7c3aed")}</td>'
+                f'<td style="padding:10px 14px;text-align:right;">{_badge(hold_c,  "#d97706")}</td>'
+                f'<td style="padding:10px 14px;text-align:right;">{_badge(res_c,   "#059669")}</td>'
+                f'</tr>'
+            )
+        agent_section = (
+            '<tr><td style="padding:24px 24px 8px;">'
+            '<div style="font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;'
+            'letter-spacing:.8px;margin-bottom:12px;">&#128100;&nbsp; Agent Wise Ticket Count</div>'
+            '<table width="100%" cellpadding="0" cellspacing="0" '
+            'style="border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;border-collapse:separate;border-spacing:0;">'
+            f'<thead style="background:#f9fafb;"><tr>{header_cells}</tr></thead>'
+            f'<tbody>{agent_body}</tbody>'
+            '</table>'
+            '</td></tr>'
+        )
+
     return (
         '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
         '<body style="margin:0;padding:0;background:#f3f4f6;'
         'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
         '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 16px;">'
         '<tr><td align="center">'
-        '<table width="560" cellpadding="0" cellspacing="0" '
+        '<table width="600" cellpadding="0" cellspacing="0" '
         'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
         '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
         '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);'
@@ -661,12 +796,16 @@ def _build_alert_html(counts: dict, now: datetime) -> str:
         f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
         f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_str}</div>'
         '</td></tr>'
-        '<tr><td style="padding:20px 0 8px;">'
-        '<div style="font-size:11px;font-weight:700;color:#9ca3af;text-transform:uppercase;'
-        'letter-spacing:.8px;padding:0 24px 12px;">Current Status</div>'
-        f'<table width="100%" cellpadding="0" cellspacing="0">{rows}</table>'
-        '</td></tr>'
-        '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
+        + (
+            '<tr><td style="padding:20px 0 8px;">'
+            '<div style="font-size:11px;font-weight:700;color:#9ca3af;text-transform:uppercase;'
+            f'letter-spacing:.8px;padding:0 24px 12px;">Current Status</div>'
+            f'<table width="100%" cellpadding="0" cellspacing="0">{stat_rows}</table>'
+            '</td></tr>'
+            if stat_rows else ""
+        )
+        + agent_section
+        + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
         'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
         'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
