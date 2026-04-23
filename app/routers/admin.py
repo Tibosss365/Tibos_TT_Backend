@@ -191,6 +191,7 @@ async def update_email(
         cfg.trigger_new = body.triggers.trigger_new
         cfg.trigger_assign = body.triggers.trigger_assign
         cfg.trigger_resolve = body.triggers.trigger_resolve
+        cfg.trigger_timezone = body.triggers.trigger_timezone
 
     if body.smtp and body.type.value == "smtp":
         cfg.smtp_host = body.smtp.host

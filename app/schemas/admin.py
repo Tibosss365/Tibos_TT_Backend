@@ -101,6 +101,7 @@ class EmailTriggers(BaseModel):
     trigger_new: bool = True
     trigger_assign: bool = True
     trigger_resolve: bool = True
+    trigger_timezone: str = "UTC"
 
 
 class EmailConfigOut(BaseModel):
@@ -129,6 +130,7 @@ class EmailConfigOut(BaseModel):
     trigger_new: bool
     trigger_assign: bool
     trigger_resolve: bool
+    trigger_timezone: str
     updated_at: datetime
 
     model_config = {"from_attributes": True}

@@ -104,13 +104,25 @@ class ReportScheduler:
 
     async def _check_and_send(self) -> None:
         now_utc = datetime.now(timezone.utc)
-        today   = now_utc.date()
 
         async with AsyncSessionLocal() as db:
             result     = await db.execute(select(AlertSettings))
             alert_cfg: AlertSettings | None = result.scalar_one_or_none()
             if not alert_cfg:
                 return
+
+            email_res = await db.execute(select(EmailConfig))
+            email_cfg: EmailConfig | None = email_res.scalar_one_or_none()
+            tz_name = email_cfg.trigger_timezone if email_cfg and getattr(email_cfg, 'trigger_timezone', None) else "UTC"
+
+            import zoneinfo
+            try:
+                tz = zoneinfo.ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+
+            now_tz = now_utc.astimezone(tz)
+            today = now_tz.date()
 
             reports   = alert_cfg.reports or {}
             last_sent = dict(alert_cfg.last_reports_sent or {})
@@ -120,12 +132,12 @@ class ReportScheduler:
                 rep = reports.get(report_type) or {}
                 if not rep.get("enabled", False):
                     continue
-                if not _is_due(report_type, rep, last_sent, now_utc, today):
+                if not _is_due(report_type, rep, last_sent, now_tz, today):
                     continue
 
                 logger.info("Report scheduler: %s report is due — sending…", report_type)
                 try:
-                    await self._send_report(db, alert_cfg, report_type, rep, now_utc)
+                    await self._send_report(db, alert_cfg, report_type, rep, now_tz)
                     last_sent[report_type] = now_utc.isoformat()
                     changed = True
                     logger.info(
@@ -150,7 +162,7 @@ class ReportScheduler:
         alert_cfg: AlertSettings,
         report_type: str,
         rep: dict,
-        now_utc: datetime,
+        now_tz: datetime,
     ) -> None:
         template = rep.get("template") or {}
 
@@ -178,8 +190,8 @@ class ReportScheduler:
         send_params = await _resolve_email_params(db, alert_cfg)
 
         # ── Ticket data for the correct period ────────────────────────────
-        period_start = _period_start(report_type, now_utc)
-        counts, agent_stats = await _gather_data(db, period_start)
+        period_start_utc = _period_start(report_type, now_tz)
+        counts, agent_stats = await _gather_data(db, period_start_utc)
 
         # ── Subject ───────────────────────────────────────────────────────
         default_subjects = {
@@ -194,12 +206,12 @@ class ReportScheduler:
             .replace("&#128202;", "📊").replace("&#128198;", "📆")
             .replace("&#128197;&#65039;", "🗓️").replace("&#8212;", "—")
         )
-        day_str = f"{now_utc.day} {now_utc.strftime('%b')} {now_utc.year}"
+        day_str = f"{now_tz.day} {now_tz.strftime('%b')} {now_tz.year}"
         subject = (
             raw_subject
             .replace("{date}",        day_str)
-            .replace("{month}",       now_utc.strftime("%B"))
-            .replace("{year}",        str(now_utc.year))
+            .replace("{month}",       now_tz.strftime("%B"))
+            .replace("{year}",        str(now_tz.year))
             .replace("{system_name}", "Tibos Helpdesk")
         )
 
@@ -207,7 +219,7 @@ class ReportScheduler:
         # Import here to avoid circular import at module load time
         from app.routers.admin import _build_alert_html
         html_body = _build_alert_html(
-            counts, now_utc,
+            counts, now_tz,
             agent_stats=agent_stats,
             template=template,
             report_type=report_type,
@@ -237,7 +249,7 @@ def _is_due(
     report_type: str,
     rep: dict,
     last_sent: dict,
-    now_utc: datetime,
+    now_tz: datetime,
     today: date,
 ) -> bool:
     """Return True if this report type should be sent right now."""
@@ -249,9 +261,9 @@ def _is_due(
         logger.warning("Report scheduler: invalid time %r — skipping", time_str)
         return False
 
-    # Current time must be at or past the scheduled time today (UTC)
-    scheduled_today = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
-    if now_utc < scheduled_today:
+    # Current time must be at or past the scheduled time today
+    scheduled_today = now_tz.replace(hour=h, minute=m, second=0, microsecond=0)
+    if now_tz < scheduled_today:
         return False  # Not yet time today
 
     # Guard against duplicate sends on the same day
@@ -261,7 +273,7 @@ def _is_due(
             last_dt = datetime.fromisoformat(last_str)
             if last_dt.tzinfo is None:
                 last_dt = last_dt.replace(tzinfo=timezone.utc)
-            if last_dt.date() >= today:
+            if last_dt.astimezone(now_tz.tzinfo).date() >= today:
                 return False  # Already sent today
         except (ValueError, TypeError):
             pass  # Malformed timestamp — treat as never sent
@@ -272,7 +284,7 @@ def _is_due(
     if report_type == "weekly":
         day_name = (rep.get("day") or "monday").lower()
         target   = _DAY_NAME_MAP.get(day_name, 0)
-        return now_utc.weekday() == target
+        return now_tz.weekday() == target
 
     if report_type == "monthly":
         try:
@@ -286,14 +298,17 @@ def _is_due(
     return False
 
 
-def _period_start(report_type: str, now_utc: datetime) -> datetime:
+def _period_start(report_type: str, now_tz: datetime) -> datetime:
     """Return the UTC midnight that starts the current reporting period."""
-    midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
     if report_type == "weekly":
-        return midnight - timedelta(days=now_utc.weekday())   # Monday
-    if report_type == "monthly":
-        return midnight.replace(day=1)
-    return midnight  # daily
+        start_tz = midnight - timedelta(days=now_tz.weekday())   # Monday
+    elif report_type == "monthly":
+        start_tz = midnight.replace(day=1)
+    else:
+        start_tz = midnight  # daily
+    
+    return start_tz.astimezone(timezone.utc)
 
 
 async def _gather_data(
