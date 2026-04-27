@@ -101,7 +101,7 @@ class EmailTriggers(BaseModel):
     trigger_new: bool = True
     trigger_assign: bool = True
     trigger_resolve: bool = True
-    trigger_timezone: str = "UTC"
+    trigger_timezone: str = "Asia/Kolkata"
 
 
 class EmailConfigOut(BaseModel):

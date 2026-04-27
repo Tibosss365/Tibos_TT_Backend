@@ -13,7 +13,11 @@ Schedule logic
 - Monthly : send at the configured ``time`` on ``dayOfMonth``
             (clamped to the last day of the month for short months)
 
-All times are interpreted as UTC.
+Timezone
+--------
+Resolved in priority order: ``reports["timezone"]`` key in AlertSettings →
+``email_config.trigger_timezone`` → "Asia/Kolkata" (IST, default fallback).
+All configured HH:MM times (daily/weekly/monthly) are in that timezone.
 
 "Due" definition
 ----------------
@@ -31,6 +35,7 @@ import calendar
 import logging
 import smtplib
 import ssl
+import zoneinfo
 from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -113,22 +118,28 @@ class ReportScheduler:
 
             email_res = await db.execute(select(EmailConfig))
             email_cfg: EmailConfig | None = email_res.scalar_one_or_none()
-            tz_name = email_cfg.trigger_timezone if email_cfg and getattr(email_cfg, 'trigger_timezone', None) else "UTC"
 
-            import zoneinfo
+            reports   = alert_cfg.reports or {}
+
+            # Timezone priority: reports dict > EmailConfig trigger_timezone > "Asia/Kolkata"
+            tz_name = (
+                reports.get("timezone")
+                or (email_cfg.trigger_timezone if email_cfg and getattr(email_cfg, "trigger_timezone", None) else None)
+                or "Asia/Kolkata"
+            )
+
             try:
                 tz = zoneinfo.ZoneInfo(tz_name)
             except Exception:
-                tz = timezone.utc
+                logger.warning("Report scheduler: invalid timezone %r — falling back to Asia/Kolkata", tz_name)
+                tz = zoneinfo.ZoneInfo("Asia/Kolkata")
 
             now_tz = now_utc.astimezone(tz)
             today = now_tz.date()
-
-            reports   = alert_cfg.reports or {}
             last_sent = dict(alert_cfg.last_reports_sent or {})
             changed   = False
 
-            for report_type in ("daily", "weekly", "monthly"):
+            for report_type in ("daily", "weekly", "monthly"):  # "timezone" key is intentionally skipped
                 rep = reports.get(report_type) or {}
                 if not rep.get("enabled", False):
                     continue

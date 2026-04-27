@@ -101,9 +101,10 @@ class AlertSettings(Base):
         "inProgress":  {"enabled": False, "thresholdHours": 48},
     })
     reports: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
-        "daily":   {"enabled": False, "time": "08:00"},
-        "weekly":  {"enabled": False, "day": "monday",  "time": "08:00"},
-        "monthly": {"enabled": False, "dayOfMonth": 1,  "time": "08:00"},
+        "timezone": "Asia/Kolkata",
+        "daily":    {"enabled": False, "time": "08:00"},
+        "weekly":   {"enabled": False, "day": "monday",  "time": "08:00"},
+        "monthly":  {"enabled": False, "dayOfMonth": 1,  "time": "08:00"},
     })
     recipients: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
         "includeAdmin": True,
@@ -169,7 +170,7 @@ class EmailConfig(Base):
     trigger_new: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     trigger_assign: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     trigger_resolve: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    trigger_timezone: Mapped[str] = mapped_column(String(50), default="UTC", nullable=False)
+    trigger_timezone: Mapped[str] = mapped_column(String(50), default="Asia/Kolkata", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
