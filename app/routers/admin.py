@@ -4,6 +4,7 @@ import secrets
 import smtplib
 import ssl
 import urllib.parse
+import zoneinfo
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -570,7 +571,14 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
             raise HTTPException(status_code=400, detail=f"Unsupported alert email type: '{atype}'")
 
     # ── 3. Gather live ticket counts ──────────────────────────────────────
-    now = datetime.now(timezone.utc)
+    _reports_cfg: dict = alert_cfg.reports or {}
+    _tz_name = (
+        _reports_cfg.get("timezone")
+        or (sys_cfg.trigger_timezone if use_same and sys_cfg and getattr(sys_cfg, "trigger_timezone", None) else None)
+        or "Asia/Kolkata"
+    )
+    _tz = zoneinfo.ZoneInfo(_tz_name)
+    now = datetime.now(timezone.utc).astimezone(_tz)
 
     unassigned_res = await db.execute(
         select(func.count()).select_from(Ticket).where(
@@ -690,7 +698,7 @@ def _build_alert_html(
             return True
         return template.get(key, True) is not False
 
-    date_str = now.strftime("%B %d, %Y at %H:%M UTC")
+    date_str = now.strftime("%B %d, %Y at %H:%M ") + (now.strftime("%Z") or "UTC")
 
     # ── Period-aware labels for created/resolved counts ───────────────────
     _PERIOD = {
