@@ -210,6 +210,37 @@ async def my_tickets(
     )
 
 
+@router.get("/my-requests", response_model=PaginatedTickets)
+async def my_requests(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Tickets submitted by the current end-user (requester_id = current user)."""
+    count_res = await db.execute(
+        select(func.count()).select_from(Ticket).where(Ticket.requester_id == current_user.id)
+    )
+    total = count_res.scalar_one()
+
+    result = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.assignee))
+        .where(Ticket.requester_id == current_user.id)
+        .order_by(Ticket.updated_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    tickets = result.scalars().all()
+    return PaginatedTickets(
+        items=[TicketListOut.model_validate(t) for t in tickets],
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=math.ceil(total / page_size) if total else 1,
+    )
+
+
 @router.get("/export")
 async def export_csv(
     search: str | None = Query(None),
@@ -274,6 +305,15 @@ async def create_ticket(
         except ValueError:
             initial_status = TicketStatus.open
 
+    # For end-users: auto-fill contact info and link as requester
+    is_end_user = current_user.role == UserRole.user
+    requester_id = current_user.id if is_end_user else None
+    submitter_name = body.submitter_name or (current_user.name if is_end_user else body.submitter_name)
+    contact_name   = body.contact_name   or (current_user.name if is_end_user else body.contact_name)
+    email          = body.email          or (current_user.username if is_end_user and "@" in (current_user.username or "") else body.email)
+    # End-users cannot self-assign tickets
+    assignee_id    = None if is_end_user else body.assignee_id
+
     ticket = Ticket(
         subject=body.subject,
         category=body.category,
@@ -281,15 +321,16 @@ async def create_ticket(
         status=initial_status.value,
         ticket_prefix=number_prefix,
         ticket_number_digits=number_digits,
-        submitter_name=body.submitter_name,
+        submitter_name=submitter_name,
         company=body.company,
-        contact_name=body.contact_name,
-        email=body.email,
+        contact_name=contact_name,
+        email=email,
         phone=body.phone,
         asset=body.asset,
         description=body.description,
-        assignee_id=body.assignee_id,
-        group_id=body.group_id
+        assignee_id=assignee_id,
+        group_id=body.group_id,
+        requester_id=requester_id,
     )
     db.add(ticket)
     await db.flush()
@@ -303,7 +344,7 @@ async def create_ticket(
     )
     db.add(entry)
 
-    if body.assignee_id:
+    if assignee_id:
         db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.assign,
@@ -317,15 +358,9 @@ async def create_ticket(
             author_id=current_user.id,
         ))
 
-    # Start SLA — respects timer_start config:
-    #   "on_creation"  → starts now regardless of assignee
-    #   "on_assignment"→ starts only if an assignee was provided at creation
-    # Pass ticket.created_at so the SLA clock is anchored to the exact
-    # moment recorded on the ticket, not a floating datetime.now() inside
-    # the service (which could be a few milliseconds later).
     await SLAService.start(
         ticket, db,
-        is_assignment=bool(body.assignee_id),
+        is_assignment=bool(assignee_id),
         start_time=ticket.created_at,
     )
 

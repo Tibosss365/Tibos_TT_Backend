@@ -12,6 +12,7 @@ from app.database import Base
 class UserRole(str, enum.Enum):
     technician = "technician"
     admin = "admin"
+    user = "user"
 
 
 class User(Base):
@@ -38,6 +39,9 @@ class User(Base):
     # Relationships
     assigned_tickets: Mapped[list["Ticket"]] = relationship(  # type: ignore[name-defined]
         "Ticket", back_populates="assignee", foreign_keys="Ticket.assignee_id"
+    )
+    submitted_tickets: Mapped[list["Ticket"]] = relationship(  # type: ignore[name-defined]
+        "Ticket", back_populates="requester", foreign_keys="Ticket.requester_id"
     )
     timeline_entries: Mapped[list["TicketTimeline"]] = relationship(  # type: ignore[name-defined]
         "TicketTimeline", back_populates="author"

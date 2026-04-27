@@ -100,6 +100,9 @@ class Ticket(Base):
     assignee_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    requester_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     submitter_name: Mapped[str] = mapped_column(String(100), nullable=False)
     company: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     contact_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
@@ -159,6 +162,9 @@ class Ticket(Base):
     # Relationships
     assignee: Mapped["User | None"] = relationship(  # type: ignore[name-defined]
         "User", back_populates="assigned_tickets", foreign_keys=[assignee_id]
+    )
+    requester: Mapped["User | None"] = relationship(  # type: ignore[name-defined]
+        "User", back_populates="submitted_tickets", foreign_keys=[requester_id]
     )
     timeline: Mapped[list["TicketTimeline"]] = relationship(
         "TicketTimeline",

@@ -77,6 +77,7 @@ class TicketOut(TicketBase):
     status: TicketStatus
     assignee_id: uuid.UUID | None
     assignee: UserPublic | None = None
+    requester_id: uuid.UUID | None = None
     resolution: str | None = None
     # ── SLA fields ──────────────────────────────────────────────────────
     sla_status: SLAStatus = SLAStatus.not_started
@@ -133,6 +134,7 @@ class TicketListOut(BaseModel):
     group_id: str | None = None
     assignee_id: uuid.UUID | None = None
     assignee: Union[UserPublic, None] | None = None
+    requester_id: uuid.UUID | None = None
     # ── SLA fields ──────────────────────────────────────────────────────
     sla_status: Union[SLAStatus, str, None] = SLAStatus.not_started
     sla_start_time: Union[datetime, None] | None = None
