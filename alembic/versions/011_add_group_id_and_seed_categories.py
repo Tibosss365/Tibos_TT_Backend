@@ -16,9 +16,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Add group_id column to categories
-    op.add_column("categories", sa.Column("group_id", sa.String(80), nullable=True))
-    op.create_index("ix_categories_group_id", "categories", ["group_id"])
+    # 1. Add group_id column to categories (idempotent)
+    op.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS group_id VARCHAR(80)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_categories_group_id ON categories (group_id)")
 
     # 2. Seed the 35 support-topic categories across 6 groups
     op.execute("""

@@ -17,15 +17,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "alert_settings",
-        sa.Column(
-            "last_reports_sent",
-            JSONB,
-            nullable=True,
-            server_default=None,
-        ),
-    )
+    op.execute("ALTER TABLE alert_settings ADD COLUMN IF NOT EXISTS last_reports_sent JSONB")
 
 
 def downgrade() -> None:

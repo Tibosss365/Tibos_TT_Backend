@@ -23,14 +23,9 @@ _DEFAULT_EMAIL_CFG = (
 
 
 def upgrade() -> None:
-    op.add_column(
-        "alert_settings",
-        sa.Column(
-            "alert_email_config",
-            JSONB,
-            nullable=True,
-            server_default=sa.text(f"'{_DEFAULT_EMAIL_CFG}'::jsonb"),
-        ),
+    op.execute(
+        f"ALTER TABLE alert_settings ADD COLUMN IF NOT EXISTS "
+        f"alert_email_config JSONB DEFAULT '{_DEFAULT_EMAIL_CFG}'::jsonb"
     )
 
 

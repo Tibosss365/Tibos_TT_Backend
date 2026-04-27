@@ -22,33 +22,26 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Create ticket_settings table (single-row config)
-    op.create_table(
-        "ticket_settings",
-        sa.Column("id",               PG_UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("number_prefix",    sa.String(20),  nullable=False, server_default="TKT"),
-        sa.Column("number_digits",    sa.Integer(),   nullable=False, server_default="4"),
-        sa.Column("default_status",   sa.String(20),  nullable=False, server_default="open"),
-        sa.Column("default_priority", sa.String(20),  nullable=False, server_default="medium"),
-        sa.Column("updated_at",       sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("now()")),
-    )
-
-    # Seed one default row so GET /admin/ticket-settings always returns data
+    # 1. Create ticket_settings table (idempotent)
+    op.execute(f"""
+        CREATE TABLE IF NOT EXISTS ticket_settings (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            number_prefix    VARCHAR(20)  NOT NULL DEFAULT 'TKT',
+            number_digits    INTEGER      NOT NULL DEFAULT 4,
+            default_status   VARCHAR(20)  NOT NULL DEFAULT 'open',
+            default_priority VARCHAR(20)  NOT NULL DEFAULT 'medium',
+            updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+        )
+    """)
     op.execute(
         f"INSERT INTO ticket_settings (id, number_prefix, number_digits, default_status, default_priority, updated_at) "
         f"VALUES ('{uuid.uuid4()}', 'TKT', 4, 'open', 'medium', now()) "
         f"ON CONFLICT DO NOTHING"
     )
 
-    # 2. Add prefix / digit columns to the tickets table
-    #    nullable so existing rows are unaffected; app falls back to 'TKT'/4 for NULL rows.
-    op.add_column("tickets",
-        sa.Column("ticket_prefix",        sa.String(20), nullable=True, server_default="TKT"))
-    op.add_column("tickets",
-        sa.Column("ticket_number_digits", sa.Integer(),  nullable=True, server_default="4"))
-
-    # Backfill existing tickets so their ticket_id property stays TKT-XXXX
+    # 2. Add prefix / digit columns to the tickets table (idempotent)
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_prefix        VARCHAR(20) DEFAULT 'TKT'")
+    op.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_number_digits INTEGER     DEFAULT 4")
     op.execute("UPDATE tickets SET ticket_prefix = 'TKT', ticket_number_digits = 4 WHERE ticket_prefix IS NULL")
 
 

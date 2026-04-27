@@ -37,21 +37,17 @@ _DEFAULT_RECIPIENTS = {
 
 
 def upgrade() -> None:
-    op.create_table(
-        "alert_settings",
-        sa.Column("id",         sa.Integer(),    primary_key=True, default=1),
-        sa.Column("conditions", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("reports",    JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("recipients", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("now()"),
-        ),
-    )
+    # Create alert_settings table (idempotent)
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS alert_settings (
+            id         SERIAL PRIMARY KEY,
+            conditions JSONB NOT NULL DEFAULT '{}'::jsonb,
+            reports    JSONB NOT NULL DEFAULT '{}'::jsonb,
+            recipients JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
 
-    # Seed a single default row so GET /admin/alerts always returns data
     import json
     op.execute(
         f"""

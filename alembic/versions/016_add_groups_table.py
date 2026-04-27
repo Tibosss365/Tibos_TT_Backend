@@ -20,15 +20,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "groups",
-        sa.Column("id",          sa.String(80),              primary_key=True, nullable=False),
-        sa.Column("name",        sa.String(100),             nullable=False),
-        sa.Column("description", sa.Text(),                  nullable=True),
-        sa.Column("color",       sa.String(7),               nullable=False, server_default="#6B7280"),
-        sa.Column("is_builtin",  sa.Boolean(),               nullable=False, server_default="false"),
-        sa.Column("created_at",  sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
-    )
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id          VARCHAR(80)  PRIMARY KEY,
+            name        VARCHAR(100) NOT NULL,
+            description TEXT,
+            color       VARCHAR(7)   NOT NULL DEFAULT '#6B7280',
+            is_builtin  BOOLEAN      NOT NULL DEFAULT false,
+            created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+        )
+    """)
 
     # Seed the six default groups that match category group_ids already in the DB
     op.execute("""

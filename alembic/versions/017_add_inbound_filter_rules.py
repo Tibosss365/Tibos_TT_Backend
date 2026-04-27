@@ -21,15 +21,7 @@ def upgrade() -> None:
     # op.execute() with autocommit=False is fine; Alembic handles this.
     op.execute("ALTER TYPE emaillogstatus ADD VALUE IF NOT EXISTS 'filtered'")
 
-    op.add_column(
-        "inbound_email_config",
-        sa.Column(
-            "filter_rules",
-            JSONB,
-            nullable=False,
-            server_default="[]",
-        ),
-    )
+    op.execute("ALTER TABLE inbound_email_config ADD COLUMN IF NOT EXISTS filter_rules JSONB NOT NULL DEFAULT '[]'::jsonb")
 
 
 def downgrade() -> None:
