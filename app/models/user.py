@@ -30,6 +30,9 @@ class User(Base):
         SAEnum(UserRole, name="userrole"), nullable=False, default=UserRole.technician
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # SSO / OIDC fields — null for local (username+password) accounts
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True, index=True)
+    auth_provider: Mapped[str] = mapped_column(String(50), nullable=False, default="local")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

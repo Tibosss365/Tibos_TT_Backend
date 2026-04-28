@@ -13,6 +13,7 @@ from app.database import engine
 from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
 from app.routers import inbound_email, categories, sla, groups
+from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
@@ -195,6 +196,8 @@ app.include_router(sla.router)
 app.include_router(groups.router)
 app.include_router(events.router)
 app.include_router(ws.router)
+app.include_router(sso_auth_router)
+app.include_router(sso_admin_router)
 
 
 @app.get("/health", tags=["health"])

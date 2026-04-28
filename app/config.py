@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
+    # SSO / OIDC — frontend URL used to build the post-login redirect
+    FRONTEND_URL: str = "http://localhost:5173"
+
     @property
     def origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]

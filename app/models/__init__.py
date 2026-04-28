@@ -5,6 +5,7 @@ from app.models.admin import SLAConfig, EmailConfig
 from app.models.inbound_email import InboundEmailConfig, EmailTicketLog, InboundAuthType, EmailLogStatus
 from app.models.category import Category
 from app.models.group import Group
+from app.models.sso import SSOConfig
 
 __all__ = [
     "User",
@@ -24,4 +25,5 @@ __all__ = [
     "EmailLogStatus",
     "Category",
     "Group",
+    "SSOConfig",
 ]
