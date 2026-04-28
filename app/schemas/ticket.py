@@ -129,6 +129,9 @@ class TicketListOut(BaseModel):
     status: TicketStatus
     submitter_name: str
     company: str
+    contact_name: str = ""
+    email: str = ""
+    description: str = ""
     resolution: str | None = None
     # group + assignee — required by normalizeTicket() and dashboard group/agent filter
     group_id: str | None = None
