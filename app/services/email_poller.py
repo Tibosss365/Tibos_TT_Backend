@@ -54,6 +54,7 @@ from app.models.inbound_email import (
     InboundEmailConfig,
 )
 from app.models.ticket import Ticket, TicketTimeline, TimelineType
+from app.models.ticket_attachment import TicketAttachment
 from app.services.email_parser import parse_raw_email
 from app.services.notification_service import broadcast_ticket_event
 from app.services.cache_service import invalidate_tickets
@@ -266,6 +267,46 @@ async def _graph_get_unread(
     return resp.json().get("value", [])
 
 
+async def _graph_get_attachments(mailbox: str, token: str, msg_id: str) -> list[dict]:
+    """Fetch file attachments for a single Graph message. Returns list of dicts."""
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{mailbox}"
+        f"/messages/{msg_id}/attachments"
+        "?$select=name,contentType,size,contentBytes,@odata.type"
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=20
+            )
+        if resp.status_code != 200:
+            return []
+        items = resp.json().get("value", [])
+        result = []
+        for item in items:
+            # Only file attachments (not item attachments / reference attachments)
+            if "#microsoft.graph.fileAttachment" not in item.get("@odata.type", ""):
+                continue
+            raw = item.get("contentBytes") or ""
+            if not raw:
+                continue
+            try:
+                content = base64.b64decode(raw)
+            except Exception:
+                continue
+            if len(content) > _MAX_ATTACHMENT_BYTES:
+                continue
+            result.append({
+                "filename":     item.get("name", "attachment"),
+                "content_type": item.get("contentType", "application/octet-stream"),
+                "content":      content,
+            })
+        return result
+    except Exception as e:
+        logger.warning(f"Graph attachment fetch failed for msg {msg_id}: {e}")
+        return []
+
+
 async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/messages/{msg_id}"
     async with httpx.AsyncClient() as client:
@@ -282,6 +323,9 @@ async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
 
 # ── Ticket creation helper ────────────────────────────────────────────────────
 
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per attachment
+
+
 async def _process_inbound_email(
     db: AsyncSession,
     inbound: InboundEmailConfig,
@@ -293,6 +337,7 @@ async def _process_inbound_email(
     received_at: Optional[datetime],
     in_reply_to: str = "",
     references: str = "",
+    attachments: list[dict] | None = None,
 ) -> tuple[Ticket, EmailTicketLog, bool]:
     """
     Process one inbound email.
@@ -432,6 +477,19 @@ async def _process_inbound_email(
         status=EmailLogStatus.processed,
         ticket_id=ticket.id,
     )
+    # ── Save attachments ──────────────────────────────────────────────────
+    for att in (attachments or []):
+        content = att.get("content", b"")
+        if not content or len(content) > _MAX_ATTACHMENT_BYTES:
+            continue
+        db.add(TicketAttachment(
+            ticket_id=ticket.id,
+            filename=att.get("filename", "attachment"),
+            content_type=att.get("content_type", "application/octet-stream"),
+            size=len(content),
+            content=content,
+        ))
+
     db.add(log)
     await db.flush()
     return ticket, log, False
@@ -520,6 +578,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                             received_at=parsed["received_at"],
                             in_reply_to=parsed.get("in_reply_to", ""),
                             references=parsed.get("references", ""),
+                            attachments=parsed.get("attachments", []),
                         )
                         await db.commit()
                         processed += 1
@@ -668,8 +727,11 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
             body_raw   = msg.get("body", {})
             body_text  = body_raw.get("content", "")
             if body_raw.get("contentType", "").lower() == "html":
-                from app.services.email_parser import _strip_html
-                body_text = _strip_html(body_text)
+                from app.services.email_parser import _strip_html, _strip_html_disclaimers, _strip_disclaimers
+                body_text = _strip_disclaimers(_strip_html(_strip_html_disclaimers(body_text)))
+            else:
+                from app.services.email_parser import _strip_disclaimers
+                body_text = _strip_disclaimers(body_text)
 
             received_str = msg.get("receivedDateTime")
             received_at  = None
@@ -693,6 +755,8 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                 elif name == "references":
                     references  = (hdr.get("value") or "").strip()
 
+            graph_attachments = await _graph_get_attachments(mailbox, access_token, msg["id"])
+
             async with AsyncSessionLocal() as db:
                 try:
                     ticket, log, is_reply = await _process_inbound_email(
@@ -705,6 +769,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                         received_at=received_at,
                         in_reply_to=in_reply_to,
                         references=references,
+                        attachments=graph_attachments,
                     )
                     await db.commit()
                     processed += 1

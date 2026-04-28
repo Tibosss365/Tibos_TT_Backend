@@ -20,6 +20,12 @@ from typing import TypedDict
 
 # ── Types ──────────────────────────────────────────────────────────────────────
 
+class ParsedAttachment(TypedDict):
+    filename: str
+    content_type: str
+    content: bytes      # raw file bytes
+
+
 class ParsedEmail(TypedDict):
     message_id: str
     from_email: str
@@ -29,6 +35,7 @@ class ParsedEmail(TypedDict):
     received_at: datetime | None
     in_reply_to: str   # value of In-Reply-To header (for thread matching)
     references: str    # value of References header (for thread matching)
+    attachments: list[ParsedAttachment]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -69,6 +76,83 @@ def _decode_header_value(raw: str) -> str:
     return "".join(parts).strip()
 
 
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per attachment
+
+
+def _safe_filename(raw: str) -> str:
+    """Decode RFC 2047-encoded filename and sanitise path components."""
+    name = _decode_header_value(raw) if raw else "attachment"
+    return name.replace("/", "_").replace("\\", "_").strip() or "attachment"
+
+
+def _get_attachments(msg: email.message.Message) -> list[dict]:
+    """Return a list of non-inline file attachments found in the MIME tree."""
+    attachments: list[dict] = []
+    for part in msg.walk():
+        disp = str(part.get("Content-Disposition") or "")
+        ctype = part.get_content_type()
+        # Collect only explicit attachments (not inline body parts or text/html)
+        if "attachment" not in disp:
+            continue
+        raw_name = part.get_filename() or ""
+        filename = _safe_filename(raw_name)
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes) or not payload:
+            continue
+        if len(payload) > _MAX_ATTACHMENT_BYTES:
+            continue  # skip files over 10 MB
+        attachments.append({
+            "filename": filename,
+            "content_type": ctype or "application/octet-stream",
+            "content": payload,
+        })
+    return attachments
+
+
+# ── Disclaimer stripping ───────────────────────────────────────────────────────
+# Outlook/Exchange injects a "Caution: This is an external email…" block into
+# the HTML body. We strip it at two levels:
+#   1. From the raw HTML (before converting to plain text) — catches the block
+#      when it is wrapped in its own <div>/<table> element.
+#   2. From the resulting plain text — catches any residual text when the HTML
+#      block runs directly into the user's message without a tag boundary.
+
+# HTML-level: match a block element whose text content starts with "Caution:"
+_HTML_DISCLAIMER_RE = re.compile(
+    r"<(?:div|table|td|p|blockquote)[^>]*>"
+    r"(?:<[^>]+>)*\s*(?:<b>|<strong>)?\s*Caution\s*:.*?</(?:div|table|td|p|blockquote)>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Plain-text level: from "Caution:" to the end of the known disclaimer sentence.
+# The known ending phrase is "contact your IT Department" (with optional trailing text).
+_TEXT_DISCLAIMER_PATTERNS = [
+    # Matches full Outlook disclaimer including the sentence that ends at "IT Department"
+    re.compile(
+        r"Caution\s*:?\s*This is an external email.*?(?:contact your IT Department[^.]*\.?|"
+        r"in doubt[^\n]*)\s*",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # Generic gateway banners
+    re.compile(
+        r"This (message|email|sender) (is from outside|came from outside)[^\n]*\n?",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _strip_html_disclaimers(html: str) -> str:
+    """Remove Outlook caution blocks from raw HTML before plain-text conversion."""
+    return _HTML_DISCLAIMER_RE.sub("", html)
+
+
+def _strip_disclaimers(text: str) -> str:
+    """Remove mail-gateway disclaimer text from an already-stripped plain-text body."""
+    for pattern in _TEXT_DISCLAIMER_PATTERNS:
+        text = pattern.sub("", text)
+    return text.strip()
+
+
 def _get_body(msg: email.message.Message) -> str:
     """
     Walk the MIME tree and return the best available plain-text body.
@@ -97,7 +181,8 @@ def _get_body(msg: email.message.Message) -> str:
     if plain_parts:
         return "\n\n".join(plain_parts).strip()
     if html_parts:
-        return _strip_html("\n\n".join(html_parts))
+        cleaned_html = _strip_html_disclaimers("\n\n".join(html_parts))
+        return _strip_html(cleaned_html)
     return ""
 
 
@@ -144,7 +229,10 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
     references  = (msg.get("References")  or "").strip()
 
     # Body
-    body = _get_body(msg)
+    body = _strip_disclaimers(_get_body(msg))
+
+    # Attachments
+    attachments = _get_attachments(msg)
 
     return ParsedEmail(
         message_id=message_id,
@@ -155,4 +243,5 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
         received_at=received_at,
         in_reply_to=in_reply_to,
         references=references,
+        attachments=attachments,
     )

@@ -4,7 +4,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_, update, delete, String
 from sqlalchemy.dialects.postgresql import array as pg_array
@@ -50,6 +50,7 @@ router = APIRouter(prefix="/tickets", tags=["tickets"])
 # ---------------------------------------------------------------------------
 
 def _ticket_query(db: AsyncSession):
+    """Base query — no attachments (safe before migration 025)."""
     return (
         select(Ticket)
         .options(
@@ -59,9 +60,38 @@ def _ticket_query(db: AsyncSession):
     )
 
 
+def _ticket_detail_query(db: AsyncSession):
+    """Full query including attachments — only used by the single-ticket GET endpoint."""
+    return (
+        select(Ticket)
+        .options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.timeline).selectinload(TicketTimeline.author),
+            selectinload(Ticket.attachments),
+        )
+    )
+
+
+def _inject_empty_attachments(ticket: Ticket) -> None:
+    """Inject [] so Pydantic model_validate doesn't trigger an async lazy-load."""
+    if "attachments" not in ticket.__dict__:
+        ticket.__dict__["attachments"] = []
+
+
 async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
     result = await db.execute(
         _ticket_query(db).where(Ticket.id == ticket_id)
+    )
+    ticket = result.scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return ticket
+
+
+async def _get_ticket_detail_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
+    """Like _get_ticket_or_404 but also eagerly loads attachments."""
+    result = await db.execute(
+        _ticket_detail_query(db).where(Ticket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
     if not ticket:
@@ -425,6 +455,7 @@ async def create_ticket(
         actor_user_id=str(current_user.id),
     )
 
+    _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
 
 
@@ -434,7 +465,32 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    return TicketOut.model_validate(await _get_ticket_or_404(ticket_id, db))
+    return TicketOut.model_validate(await _get_ticket_detail_or_404(ticket_id, db))
+
+
+@router.get("/{ticket_id}/attachments/{attachment_id}")
+async def download_attachment(
+    ticket_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    from app.models.ticket_attachment import TicketAttachment
+    result = await db.execute(
+        select(TicketAttachment).where(
+            TicketAttachment.id == attachment_id,
+            TicketAttachment.ticket_id == ticket_id,
+        )
+    )
+    att = result.scalar_one_or_none()
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    safe_name = att.filename.encode("ascii", errors="replace").decode()
+    return Response(
+        content=att.content,
+        media_type=att.content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
 
 
 @router.patch("/{ticket_id}", response_model=TicketOut)
@@ -638,6 +694,7 @@ async def update_ticket(
         actor_user_id=str(current_user.id),
     )
 
+    _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
 
 
@@ -699,6 +756,7 @@ async def add_comment(
         actor_user_id=str(current_user.id),
     )
 
+    _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
 
 

@@ -21,6 +21,15 @@ def _utc_iso(dt: datetime | None) -> str | None:
     return dt.isoformat()
 
 
+class AttachmentOut(BaseModel):
+    id: uuid.UUID
+    filename: str
+    content_type: str
+    size: int
+
+    model_config = {"from_attributes": True}
+
+
 class TimelineEntryOut(BaseModel):
     id: uuid.UUID
     type: TimelineType
@@ -88,6 +97,7 @@ class TicketOut(TicketBase):
     # Legacy (kept for backward compat)
     sla_due_at: datetime | None = None
     timeline: list[TimelineEntryOut] = []
+    attachments: list[AttachmentOut] = []
     created_at: datetime
     updated_at: datetime
 

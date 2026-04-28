@@ -175,6 +175,10 @@ class Ticket(Base):
     notifications: Mapped[list["Notification"]] = relationship(  # type: ignore[name-defined]
         "Notification", back_populates="ticket", cascade="all, delete-orphan"
     )
+    attachments: Mapped[list["TicketAttachment"]] = relationship(  # type: ignore[name-defined]
+        "TicketAttachment", back_populates="ticket", cascade="all, delete-orphan",
+        order_by="TicketAttachment.created_at",
+    )
 
     @property
     def ticket_id(self) -> str:
