@@ -11,7 +11,7 @@ from sqlalchemy import (
     Integer,
     Sequence,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -111,6 +111,13 @@ class Ticket(Base):
     asset: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── JSONB sub-document fields (persisted per-ticket, no separate tables) ──
+    tasks:     Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
+    work_log:  Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
+    reminders: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
+    approvals: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
+
     email_thread_id: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
     # Ticket group slug — matches Category.group_id / DEFAULT_GROUPS ids
     # e.g. "microsoft-365", "security-compliance", "end-user-support"
@@ -173,11 +180,13 @@ class Ticket(Base):
         order_by="TicketTimeline.created_at",
     )
     notifications: Mapped[list["Notification"]] = relationship(  # type: ignore[name-defined]
-        "Notification", back_populates="ticket", cascade="all, delete-orphan"
+        "Notification", back_populates="ticket", cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     attachments: Mapped[list["TicketAttachment"]] = relationship(  # type: ignore[name-defined]
         "TicketAttachment", back_populates="ticket", cascade="all, delete-orphan",
         order_by="TicketAttachment.created_at",
+        passive_deletes=True,
     )
 
     @property

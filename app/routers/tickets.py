@@ -30,6 +30,7 @@ from app.schemas.ticket import (
     BulkTicketAction,
     PaginatedTickets,
     TicketCreate,
+    TicketDataUpdate,
     TicketListOut,
     TicketOut,
     TicketUpdate,
@@ -448,12 +449,16 @@ async def create_ticket(
             ))
             await db.flush()
 
-    # Broadcast
-    await broadcast_ticket_event(
-        "ticket_created",
-        {"ticket_id": str(ticket.id), "ticket_number": full.ticket_id},
-        actor_user_id=str(current_user.id),
-    )
+    # Commit before broadcasting so any SSE-triggered fetchTickets sees the new ticket
+    await db.commit()
+    try:
+        await broadcast_ticket_event(
+            "ticket_created",
+            {"ticket_id": str(ticket.id), "ticket_number": full.ticket_id},
+            actor_user_id=str(current_user.id),
+        )
+    except Exception:
+        pass  # broadcast failure must not undo the committed create
 
     _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
@@ -688,11 +693,16 @@ async def update_ticket(
             ))
             await db.flush()
 
-    await broadcast_ticket_event(
-        "ticket_updated",
-        {"ticket_id": str(ticket_id), "ticket_number": full.ticket_id},
-        actor_user_id=str(current_user.id),
-    )
+    # Commit before broadcasting so any SSE-triggered fetchTickets sees the update
+    await db.commit()
+    try:
+        await broadcast_ticket_event(
+            "ticket_updated",
+            {"ticket_id": str(ticket_id), "ticket_number": full.ticket_id},
+            actor_user_id=str(current_user.id),
+        )
+    except Exception:
+        pass  # broadcast failure must not undo the committed update
 
     _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
@@ -750,12 +760,80 @@ async def add_comment(
 
     full = await _get_ticket_or_404(ticket_id, db)
 
-    await broadcast_ticket_event(
-        "ticket_comment",
-        {"ticket_id": str(ticket_id), "author": current_user.name},
-        actor_user_id=str(current_user.id),
-    )
+    await db.commit()
+    try:
+        await broadcast_ticket_event(
+            "ticket_comment",
+            {"ticket_id": str(ticket_id), "author": current_user.name},
+            actor_user_id=str(current_user.id),
+        )
+    except Exception:
+        pass
 
+    _inject_empty_attachments(full)
+    return TicketOut.model_validate(full)
+
+
+@router.put("/{ticket_id}/tasks", response_model=TicketOut)
+async def update_tasks(
+    ticket_id: uuid.UUID,
+    body: TicketDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    ticket.tasks = body.items
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    full = await _get_ticket_or_404(ticket_id, db)
+    _inject_empty_attachments(full)
+    return TicketOut.model_validate(full)
+
+
+@router.put("/{ticket_id}/work-log", response_model=TicketOut)
+async def update_work_log(
+    ticket_id: uuid.UUID,
+    body: TicketDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    ticket.work_log = body.items
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    full = await _get_ticket_or_404(ticket_id, db)
+    _inject_empty_attachments(full)
+    return TicketOut.model_validate(full)
+
+
+@router.put("/{ticket_id}/reminders", response_model=TicketOut)
+async def update_reminders(
+    ticket_id: uuid.UUID,
+    body: TicketDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    ticket.reminders = body.items
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    full = await _get_ticket_or_404(ticket_id, db)
+    _inject_empty_attachments(full)
+    return TicketOut.model_validate(full)
+
+
+@router.put("/{ticket_id}/approvals", response_model=TicketOut)
+async def update_approvals(
+    ticket_id: uuid.UUID,
+    body: TicketDataUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    ticket.approvals = body.items
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    full = await _get_ticket_or_404(ticket_id, db)
     _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
 
@@ -768,7 +846,12 @@ async def delete_ticket(
 ):
     ticket = await _get_ticket_or_404(ticket_id, db)
     await db.delete(ticket)
-    await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
+    # Commit before broadcasting so any SSE-triggered fetchTickets sees the deletion
+    await db.commit()
+    try:
+        await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
+    except Exception:
+        pass  # broadcast failure must not undo the committed delete
 
 
 @router.post("/bulk", status_code=status.HTTP_200_OK)
@@ -787,9 +870,13 @@ async def bulk_action(
             .values(status=new_status, updated_at=datetime.now(timezone.utc))
         )
 
-    await broadcast_ticket_event(
-        "tickets_bulk_updated",
-        {"action": body.action, "count": len(body.ticket_ids)},
-        actor_user_id=str(current_user.id),
-    )
+    await db.commit()
+    try:
+        await broadcast_ticket_event(
+            "tickets_bulk_updated",
+            {"action": body.action, "count": len(body.ticket_ids)},
+            actor_user_id=str(current_user.id),
+        )
+    except Exception:
+        pass
     return {"affected": len(body.ticket_ids)}

@@ -88,6 +88,11 @@ class TicketOut(TicketBase):
     assignee: UserPublic | None = None
     requester_id: uuid.UUID | None = None
     resolution: str | None = None
+    # ── JSONB sub-documents ──────────────────────────────────────────────
+    tasks:     list[dict] = []
+    work_log:  list[dict] = []
+    reminders: list[dict] = []
+    approvals: list[dict] = []
     # ── SLA fields ──────────────────────────────────────────────────────
     sla_status: SLAStatus = SLAStatus.not_started
     sla_start_time: datetime | None = None
@@ -200,6 +205,11 @@ class BulkTicketAction(BaseModel):
 class AddCommentRequest(BaseModel):
     text: str = Field(..., min_length=1)
     send_to_customer: bool = False
+
+
+class TicketDataUpdate(BaseModel):
+    """Generic payload for replacing one of the JSONB sub-document lists."""
+    items: list[dict]
 
 
 class PaginatedTickets(BaseModel):
