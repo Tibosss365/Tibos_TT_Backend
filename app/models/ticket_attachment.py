@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -25,7 +26,16 @@ class TicketAttachment(Base):
         String(200), nullable=False, default="application/octet-stream"
     )
     size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    # Object storage metadata (preferred path — new attachments always use this)
+    storage_key: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+    storage_url: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
+    is_inline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Legacy binary column — kept nullable for rows created before migration 027.
+    # New code must NOT write to this column.
+    content: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

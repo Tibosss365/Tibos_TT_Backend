@@ -1,0 +1,1 @@
+DefaultEndpointsProtocol=https;AccountName=ttstorages;AccountKey=zDNRK++yCyRanu/V6KEC0GQfRG0Mw0Jt1H5tU8l8jh+1hRo6v8fi/JPA/i3wjM91YhnXoVu8gHap+AStDJ7tvQ==;EndpointSuffix=core.windows.net

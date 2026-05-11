@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -24,6 +25,25 @@ class Settings(BaseSettings):
 
     # SSO / OIDC — frontend URL used to build the post-login redirect
     FRONTEND_URL: str = "http://localhost:5173"
+
+    # Attachment object storage
+    # backend: "azure" | "s3" | "local"
+    ATTACHMENT_STORAGE_BACKEND: str = "local"
+
+    # Azure Blob Storage
+    AZURE_STORAGE_ACCOUNT_NAME: Optional[str] = None
+    AZURE_STORAGE_ACCOUNT_KEY: Optional[str] = None
+    AZURE_STORAGE_CONTAINER: str = "attachments"
+
+    # AWS S3 / S3-compatible
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    AWS_REGION: str = "us-east-1"
+    S3_BUCKET_NAME: Optional[str] = None
+    S3_ENDPOINT_URL: Optional[str] = None
+
+    # Local dev
+    LOCAL_ATTACHMENT_DIR: str = "/tmp/attachments"
 
     @property
     def origins_list(self) -> list[str]:

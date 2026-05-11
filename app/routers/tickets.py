@@ -470,6 +470,7 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
+    print("jhibhiuhiuhiuhih")
     return TicketOut.model_validate(await _get_ticket_detail_or_404(ticket_id, db))
 
 
@@ -481,6 +482,9 @@ async def download_attachment(
     _: User = Depends(get_current_user),
 ):
     from app.models.ticket_attachment import TicketAttachment
+    from app.services.attachment_storage import get_storage_backend, LocalFileBackend
+    from fastapi.responses import RedirectResponse
+
     result = await db.execute(
         select(TicketAttachment).where(
             TicketAttachment.id == attachment_id,
@@ -490,12 +494,37 @@ async def download_attachment(
     att = result.scalar_one_or_none()
     if not att:
         raise HTTPException(status_code=404, detail="Attachment not found")
+
     safe_name = att.filename.encode("ascii", errors="replace").decode()
-    return Response(
-        content=att.content,
-        media_type=att.content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
-    )
+    media_type = att.content_type or "application/octet-stream"
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name}"'}
+
+    # ── Legacy rows: binary stored directly in the DB ─────────────────────
+    if att.content is not None:
+        return Response(content=att.content, media_type=media_type, headers=headers)
+
+    # ── New rows: file is in object storage ───────────────────────────────
+    if not att.storage_key:
+        raise HTTPException(status_code=404, detail="Attachment content not available")
+
+    storage = get_storage_backend()
+
+    if isinstance(storage, LocalFileBackend):
+        # Local dev: read from disk and stream back through the API
+        try:
+            content = await storage.read(att.storage_key)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Attachment file not found on disk")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read attachment: {exc}")
+        return Response(content=content, media_type=media_type, headers=headers)
+    else:
+        # Cloud backend (Azure / S3): redirect to a short-lived presigned URL
+        try:
+            url = await storage.presigned_url(att.storage_key, expires_seconds=300)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to generate download URL: {exc}")
+        return RedirectResponse(url=url, status_code=302)
 
 
 @router.patch("/{ticket_id}", response_model=TicketOut)
@@ -844,9 +873,11 @@ async def delete_ticket(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    ticket = await _get_ticket_or_404(ticket_id, db)
-    await db.delete(ticket)
-    # Commit before broadcasting so any SSE-triggered fetchTickets sees the deletion
+    # Verify ticket exists (raises 404 if not found)
+    await _get_ticket_or_404(ticket_id, db)
+    # Use raw SQL DELETE to bypass ORM cascade lazy-loading (MissingGreenlet in async)
+    # DB-level ON DELETE CASCADE handles child rows (timeline, notifications, attachments)
+    await db.execute(delete(Ticket).where(Ticket.id == ticket_id))
     await db.commit()
     try:
         await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})

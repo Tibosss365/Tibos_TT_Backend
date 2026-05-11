@@ -26,6 +26,11 @@ class AttachmentOut(BaseModel):
     filename: str
     content_type: str
     size: int
+    # storage_url is populated for cloud backends (Azure/S3).
+    # For local dev it will be empty — use the API download endpoint instead:
+    #   GET /tickets/{ticket_id}/attachments/{id}
+    storage_url: str | None = None
+    is_inline: bool = False
 
     model_config = {"from_attributes": True}
 

@@ -59,6 +59,8 @@ from app.services.email_parser import parse_raw_email
 from app.services.notification_service import broadcast_ticket_event
 from app.services.cache_service import invalidate_tickets
 from app.services.sla_service import SLAService
+from app.services.graph_attachment_client import fetch_message_attachments, RawAttachment
+from app.services.attachment_service import process_all_attachments
 from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
@@ -227,7 +229,7 @@ async def _graph_get_unread(
         f"https://graph.microsoft.com/v1.0/users/{mailbox}"
         "/mailFolders/inbox/messages"
         "?$filter=isRead eq false"
-        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders"
+        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments"
         "&$top=50"
     )
     async with httpx.AsyncClient() as client:
@@ -267,44 +269,13 @@ async def _graph_get_unread(
     return resp.json().get("value", [])
 
 
-async def _graph_get_attachments(mailbox: str, token: str, msg_id: str) -> list[dict]:
-    """Fetch file attachments for a single Graph message. Returns list of dicts."""
-    url = (
-        f"https://graph.microsoft.com/v1.0/users/{mailbox}"
-        f"/messages/{msg_id}/attachments"
-        "?$select=name,contentType,size,contentBytes,@odata.type"
+async def _graph_get_attachments(
+    mailbox: str, token: str, msg_id: str
+) -> list[RawAttachment]:
+    """Fetch file attachments for a single Graph message via graph_attachment_client."""
+    return await fetch_message_attachments(
+        mailbox, token, msg_id, skip_inline=False
     )
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url, headers={"Authorization": f"Bearer {token}"}, timeout=20
-            )
-        if resp.status_code != 200:
-            return []
-        items = resp.json().get("value", [])
-        result = []
-        for item in items:
-            # Only file attachments (not item attachments / reference attachments)
-            if "#microsoft.graph.fileAttachment" not in item.get("@odata.type", ""):
-                continue
-            raw = item.get("contentBytes") or ""
-            if not raw:
-                continue
-            try:
-                content = base64.b64decode(raw)
-            except Exception:
-                continue
-            if len(content) > _MAX_ATTACHMENT_BYTES:
-                continue
-            result.append({
-                "filename":     item.get("name", "attachment"),
-                "content_type": item.get("contentType", "application/octet-stream"),
-                "content":      content,
-            })
-        return result
-    except Exception as e:
-        logger.warning(f"Graph attachment fetch failed for msg {msg_id}: {e}")
-        return []
 
 
 async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
@@ -323,7 +294,27 @@ async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
 
 # ── Ticket creation helper ────────────────────────────────────────────────────
 
-_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per attachment
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per attachment (kept for reference)
+
+
+def _to_raw_attachment_list(attachments: list) -> list[RawAttachment]:
+    """Normalise a mixed list of RawAttachment / plain dicts to RawAttachment."""
+    result = []
+    for att in attachments:
+        if isinstance(att, RawAttachment):
+            result.append(att)
+        else:
+            content = att.get("content", b"") or b""
+            if not content:
+                continue
+            result.append(RawAttachment(
+                filename=att.get("filename", "attachment"),
+                content_type=att.get("content_type", "application/octet-stream"),
+                size=len(content),
+                content=content,
+                is_inline=att.get("is_inline", False),
+            ))
+    return result
 
 
 async def _process_inbound_email(
@@ -406,6 +397,10 @@ async def _process_inbound_email(
             ticket_id=existing_ticket.id,
         )
         db.add(log)
+        # ── Save attachments on replies too ───────────────────────────────
+        if attachments:
+            raw_list = _to_raw_attachment_list(attachments)
+            await process_all_attachments(db, existing_ticket.id, raw_list, skip_inline=True)
         await db.flush()
         return existing_ticket, log, True
 
@@ -477,18 +472,11 @@ async def _process_inbound_email(
         status=EmailLogStatus.processed,
         ticket_id=ticket.id,
     )
-    # ── Save attachments ──────────────────────────────────────────────────
-    for att in (attachments or []):
-        content = att.get("content", b"")
-        if not content or len(content) > _MAX_ATTACHMENT_BYTES:
-            continue
-        db.add(TicketAttachment(
-            ticket_id=ticket.id,
-            filename=att.get("filename", "attachment"),
-            content_type=att.get("content_type", "application/octet-stream"),
-            size=len(content),
-            content=content,
-        ))
+    # ── Save attachments via object storage ──────────────────────────────
+    if attachments:
+        await process_all_attachments(
+            db, ticket.id, _to_raw_attachment_list(attachments), skip_inline=True
+        )
 
     db.add(log)
     await db.flush()
@@ -755,7 +743,11 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                 elif name == "references":
                     references  = (hdr.get("value") or "").strip()
 
-            graph_attachments = await _graph_get_attachments(mailbox, access_token, msg["id"])
+            graph_attachments = (
+                await _graph_get_attachments(mailbox, access_token, msg["id"])
+                if msg.get("hasAttachments")
+                else []
+            )
 
             async with AsyncSessionLocal() as db:
                 try:
