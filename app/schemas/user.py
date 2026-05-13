@@ -56,3 +56,4 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+    client_ip: str | None = None   # returned so the frontend can display it in login history

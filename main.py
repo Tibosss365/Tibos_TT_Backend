@@ -17,6 +17,7 @@ from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
+from app.services.audit_cleanup import audit_cleanup
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -143,12 +144,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Report scheduler could not start: {e}")
 
+    # 6. Start audit log cleanup (runs every 24 h, retains last 30 days)
+    try:
+        audit_cleanup.start()
+        _log("[OK] Audit cleanup started (30-day retention)")
+    except Exception as e:
+        _log(f"  [WARN] Audit cleanup could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
     email_poller.stop()
     sla_breach_detector.stop()
     report_scheduler.stop()
+    audit_cleanup.stop()
     await close_redis()
     await engine.dispose()
     _log("[OK] Shutdown complete")
