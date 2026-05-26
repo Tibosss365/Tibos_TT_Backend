@@ -110,10 +110,12 @@ class TicketOut(TicketBase):
     attachments: list[AttachmentOut] = []
     created_at: datetime
     updated_at: datetime
+    is_deleted: bool = False
+    deleted_at: datetime | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
-        "created_at", "updated_at",
+        "created_at", "updated_at", "deleted_at",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:
@@ -167,10 +169,12 @@ class TicketListOut(BaseModel):
     sla_due_at: Union[datetime, None] | None = None  # legacy
     created_at: datetime
     updated_at: datetime
+    is_deleted: bool = False
+    deleted_at: Union[datetime, None] | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
-        "created_at", "updated_at",
+        "created_at", "updated_at", "deleted_at",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:

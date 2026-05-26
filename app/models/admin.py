@@ -177,3 +177,37 @@ class EmailConfig(Base):
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+
+class DomainCompany(Base):
+    """Maps an email domain to a company and its IT contact person."""
+    __tablename__ = "domain_companies"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    domain: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True,
+        comment="Email domain, e.g. tibos.in",
+    )
+    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    contact_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(512), nullable=True,
+        comment="Company logo URL from Clearbit or manually set")
+    auto_discovered: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True when data was seeded by the Clearbit lookup"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )

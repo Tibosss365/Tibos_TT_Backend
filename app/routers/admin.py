@@ -4,6 +4,7 @@ import secrets
 import smtplib
 import ssl
 import urllib.parse
+import uuid
 import zoneinfo
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 from app.core.deps import get_current_user, require_admin
 from app.database import get_db
-from app.models.admin import AlertSettings, EmailConfig, OAuthProvider, SLAConfig, TicketSettings
+from app.models.admin import AlertSettings, DomainCompany, EmailConfig, OAuthProvider, SLAConfig, TicketSettings
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from sqlalchemy import update as sa_update
 from app.models.user import User
@@ -28,6 +29,10 @@ from app.schemas.admin import (
     AdminStats,
     AlertSettingsOut,
     AlertSettingsUpdate,
+    DomainCompanyCreate,
+    DomainCompanyOut,
+    DomainCompanyUpdate,
+    DomainLookupResult,
     EmailConfigOut,
     EmailConfigUpdate,
     EmailTestRequest,
@@ -897,3 +902,111 @@ async def _dispatch_alert_email(
         )
     else:
         raise RuntimeError(f"Unsupported send method: {method}")
+
+
+# ── Domain Company endpoints ───────────────────────────────────────────────────
+
+@router.get("/domain-companies", response_model=list[DomainCompanyOut])
+async def list_domain_companies(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    result = await db.execute(select(DomainCompany).order_by(DomainCompany.domain))
+    return result.scalars().all()
+
+
+@router.post("/domain-companies", response_model=DomainCompanyOut, status_code=201)
+async def create_domain_company(
+    body: DomainCompanyCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    domain = body.domain.lower().strip().lstrip("@")
+    existing = await db.execute(select(DomainCompany).where(DomainCompany.domain == domain))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Domain '{domain}' already exists.")
+    record = DomainCompany(
+        domain=domain,
+        company_name=body.company_name,
+        contact_name=body.contact_name,
+        contact_email=body.contact_email,
+        contact_phone=body.contact_phone,
+        logo_url=body.logo_url,
+        auto_discovered=body.auto_discovered,
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+@router.patch("/domain-companies/{domain_id}", response_model=DomainCompanyOut)
+async def update_domain_company(
+    domain_id: uuid.UUID,
+    body: DomainCompanyUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    result = await db.execute(select(DomainCompany).where(DomainCompany.id == domain_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Domain company not found.")
+    if body.company_name is not None:
+        record.company_name = body.company_name
+    if body.contact_name is not None:
+        record.contact_name = body.contact_name
+    if body.contact_email is not None:
+        record.contact_email = body.contact_email
+    if body.contact_phone is not None:
+        record.contact_phone = body.contact_phone
+    if body.logo_url is not None:
+        record.logo_url = body.logo_url
+    record.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+@router.delete("/domain-companies/{domain_id}", status_code=204)
+async def delete_domain_company(
+    domain_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    result = await db.execute(select(DomainCompany).where(DomainCompany.id == domain_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Domain company not found.")
+    await db.delete(record)
+    await db.commit()
+
+
+@router.get("/domain-companies/lookup", response_model=DomainLookupResult)
+async def lookup_domain(
+    domain: str,
+    _: User = Depends(require_admin),
+):
+    """
+    Auto-discover company info for a given email domain using Clearbit's
+    free company autocomplete API.  No API key required.
+    Falls back gracefully if the lookup fails or returns no results.
+    """
+    clean = domain.lower().strip().lstrip("@")
+    url = f"https://autocomplete.clearbit.com/v1/companies/suggest?query={clean}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "TibosTT/1.0"})
+            if resp.status_code == 200:
+                results = resp.json()
+                if results:
+                    best = results[0]
+                    return DomainLookupResult(
+                        domain=clean,
+                        company_name=best.get("name"),
+                        logo_url=best.get("logo"),
+                        found=True,
+                    )
+    except Exception as exc:
+        logger.warning(f"[domain-lookup] Clearbit request failed for {clean}: {exc}")
+
+    return DomainLookupResult(domain=clean, found=False)

@@ -1,9 +1,11 @@
 import csv
 import io
+import logging
 import math
 import uuid
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_, update, delete, String
@@ -23,7 +25,7 @@ from app.models.ticket import (
     TimelineType,
 )
 from app.models.user import User, UserRole
-from app.models.admin import TicketSettings
+from app.models.admin import DomainCompany, TicketSettings
 from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
@@ -44,6 +46,45 @@ from app.services.notification_service import (
 from app.services.email_sender import send_ticket_email
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
+logger = logging.getLogger("uvicorn.error")
+
+
+async def _auto_discover_domain(domain: str, db: AsyncSession) -> str | None:
+    """
+    Look up a company name for *domain* using Clearbit's free autocomplete API.
+    If a name is found, the mapping is saved to domain_companies so future tickets
+    from the same domain are resolved instantly (no extra HTTP call needed).
+    Returns the company name, or None if nothing was found.
+    """
+    url = f"https://autocomplete.clearbit.com/v1/companies/suggest?query={domain}"
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "TibosTT/1.0"})
+            if resp.status_code == 200:
+                results = resp.json()
+                if results:
+                    best = results[0]
+                    company_name = best.get("name") or ""
+                    logo_url = best.get("logo") or None
+                    if company_name:
+                        # Persist so the next ticket from this domain needs no lookup
+                        record = DomainCompany(
+                            domain=domain,
+                            company_name=company_name,
+                            logo_url=logo_url,
+                            auto_discovered=True,
+                        )
+                        db.add(record)
+                        # Use flush (not commit) — the outer create_ticket transaction
+                        # will commit everything together
+                        await db.flush()
+                        logger.info(
+                            f"[domain-discovery] Auto-saved '{company_name}' for domain '{domain}'"
+                        )
+                        return company_name
+    except Exception as exc:
+        logger.warning(f"[domain-discovery] Clearbit lookup failed for '{domain}': {exc}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +92,19 @@ router = APIRouter(prefix="/tickets", tags=["tickets"])
 # ---------------------------------------------------------------------------
 
 def _ticket_query(db: AsyncSession):
-    """Base query — no attachments (safe before migration 025)."""
+    """Base query — no attachments (safe before migration 025). Excludes soft-deleted tickets."""
+    return (
+        select(Ticket)
+        .where(Ticket.is_deleted == False)  # noqa: E712
+        .options(
+            selectinload(Ticket.assignee),
+            selectinload(Ticket.timeline).selectinload(TicketTimeline.author),
+        )
+    )
+
+
+def _any_ticket_query(db: AsyncSession):
+    """Like _ticket_query but includes soft-deleted tickets (for restore / permanent delete)."""
     return (
         select(Ticket)
         .options(
@@ -82,6 +135,17 @@ def _inject_empty_attachments(ticket: Ticket) -> None:
 async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
     result = await db.execute(
         _ticket_query(db).where(Ticket.id == ticket_id)
+    )
+    ticket = result.scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return ticket
+
+
+async def _get_any_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
+    """Fetch ticket regardless of is_deleted — used by restore and permanent-delete endpoints."""
+    result = await db.execute(
+        _any_ticket_query(db).where(Ticket.id == ticket_id)
     )
     ticket = result.scalar_one_or_none()
     if not ticket:
@@ -185,13 +249,14 @@ async def list_tickets(
 ):
     effective_page_size = limit if limit is not None else page_size
 
-    count_stmt = select(func.count()).select_from(Ticket)
+    count_stmt = select(func.count()).select_from(Ticket).where(Ticket.is_deleted == False)  # noqa: E712
     count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
     total_res = await db.execute(count_stmt)
     total = total_res.scalar_one()
 
     stmt = (
         select(Ticket)
+        .where(Ticket.is_deleted == False)  # noqa: E712
         .options(selectinload(Ticket.assignee))
         .offset((page - 1) * effective_page_size)
         .limit(effective_page_size)
@@ -219,14 +284,14 @@ async def my_tickets(
     current_user: User = Depends(get_current_user),
 ):
     count_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(Ticket.assignee_id == current_user.id)
+        select(func.count()).select_from(Ticket).where(Ticket.assignee_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
     )
     total = count_res.scalar_one()
 
     result = await db.execute(
         select(Ticket)
         .options(selectinload(Ticket.assignee))
-        .where(Ticket.assignee_id == current_user.id)
+        .where(Ticket.assignee_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
         .order_by(Ticket.updated_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
@@ -250,14 +315,14 @@ async def my_requests(
 ):
     """Tickets submitted by the current end-user (requester_id = current user)."""
     count_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(Ticket.requester_id == current_user.id)
+        select(func.count()).select_from(Ticket).where(Ticket.requester_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
     )
     total = count_res.scalar_one()
 
     result = await db.execute(
         select(Ticket)
         .options(selectinload(Ticket.assignee))
-        .where(Ticket.requester_id == current_user.id)
+        .where(Ticket.requester_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
         .order_by(Ticket.updated_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
@@ -283,7 +348,7 @@ async def export_csv(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    stmt = select(Ticket).options(selectinload(Ticket.assignee))
+    stmt = select(Ticket).where(Ticket.is_deleted == False).options(selectinload(Ticket.assignee))  # noqa: E712
     stmt = _apply_filters(stmt, search, status, priority, category, None, None, date_from, date_to)
     stmt = stmt.order_by(Ticket.created_at.desc())
     result = await db.execute(stmt)
@@ -345,6 +410,25 @@ async def create_ticket(
     # End-users cannot self-assign tickets
     assignee_id    = None if is_end_user else body.assignee_id
 
+    # ── Auto-fill company from domain company registry ────────────────────
+    # Priority: 1) value provided by caller  2) DB lookup  3) live Clearbit discovery
+    company = body.company
+    if not company and email and "@" in email:
+        email_domain = email.split("@")[-1].lower().strip()
+
+        # 1. Check the local registry first (fastest path)
+        dc_res = await db.execute(
+            select(DomainCompany).where(DomainCompany.domain == email_domain)
+        )
+        dc = dc_res.scalar_one_or_none()
+        if dc:
+            company = dc.company_name
+        else:
+            # 2. Not in registry — try live Clearbit lookup and auto-save result
+            discovered = await _auto_discover_domain(email_domain, db)
+            if discovered:
+                company = discovered
+
     ticket = Ticket(
         subject=body.subject,
         category=body.category,
@@ -353,7 +437,7 @@ async def create_ticket(
         ticket_prefix=number_prefix,
         ticket_number_digits=number_digits,
         submitter_name=submitter_name,
-        company=body.company,
+        company=company,
         contact_name=contact_name,
         email=email,
         phone=body.phone,
@@ -464,13 +548,44 @@ async def create_ticket(
     return TicketOut.model_validate(full)
 
 
+@router.get("/deleted", response_model=PaginatedTickets)
+async def list_deleted_tickets(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    count_res = await db.execute(
+        select(func.count()).select_from(Ticket).where(Ticket.is_deleted == True)  # noqa: E712
+    )
+    total = count_res.scalar_one()
+
+    result = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.assignee))
+        .where(Ticket.is_deleted == True)  # noqa: E712
+        .order_by(Ticket.deleted_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    tickets = result.scalars().all()
+    for t in tickets:
+        _inject_empty_attachments(t)
+    return PaginatedTickets(
+        items=[TicketListOut.model_validate(t) for t in tickets],
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=math.ceil(total / page_size) if total else 1,
+    )
+
+
 @router.get("/{ticket_id}", response_model=TicketOut)
 async def get_ticket(
     ticket_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    print("jhibhiuhiuhiuhih")
     return TicketOut.model_validate(await _get_ticket_detail_or_404(ticket_id, db))
 
 
@@ -873,16 +988,50 @@ async def delete_ticket(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    # Verify ticket exists (raises 404 if not found)
-    await _get_ticket_or_404(ticket_id, db)
-    # Use raw SQL DELETE to bypass ORM cascade lazy-loading (MissingGreenlet in async)
-    # DB-level ON DELETE CASCADE handles child rows (timeline, notifications, attachments)
+    """Soft-delete: marks ticket as deleted (is_deleted=True). Recoverable via /restore."""
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    ticket.is_deleted = True
+    ticket.deleted_at = datetime.now(timezone.utc)
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    try:
+        await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
+    except Exception:
+        pass
+
+
+@router.post("/{ticket_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
+async def restore_ticket(
+    ticket_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Restore a soft-deleted ticket back to active."""
+    ticket = await _get_any_ticket_or_404(ticket_id, db)
+    ticket.is_deleted = False
+    ticket.deleted_at = None
+    ticket.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    try:
+        await broadcast_ticket_event("ticket_restored", {"ticket_id": str(ticket_id)})
+    except Exception:
+        pass
+
+
+@router.delete("/{ticket_id}/permanent", status_code=status.HTTP_204_NO_CONTENT)
+async def permanent_delete_ticket(
+    ticket_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Hard-delete: permanently removes the ticket and all related data from the database."""
+    await _get_any_ticket_or_404(ticket_id, db)
     await db.execute(delete(Ticket).where(Ticket.id == ticket_id))
     await db.commit()
     try:
         await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
     except Exception:
-        pass  # broadcast failure must not undo the committed delete
+        pass
 
 
 @router.post("/bulk", status_code=status.HTTP_200_OK)
@@ -892,7 +1041,11 @@ async def bulk_action(
     current_user: User = Depends(get_current_user),
 ):
     if body.action == "delete":
-        await db.execute(delete(Ticket).where(Ticket.id.in_(body.ticket_ids)))
+        await db.execute(
+            update(Ticket)
+            .where(Ticket.id.in_(body.ticket_ids))
+            .values(is_deleted=True, deleted_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
+        )
     else:
         new_status = TicketStatus.resolved if body.action == "resolve" else TicketStatus.closed
         await db.execute(

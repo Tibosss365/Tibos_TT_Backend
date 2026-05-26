@@ -198,3 +198,47 @@ class AlertSettingsUpdate(BaseModel):
     reports: dict
     recipients: dict
     alert_email_config: dict | None = Field(default=None, alias="alertEmailConfig")
+
+
+# ── Domain Company schemas ─────────────────────────────────────────────────────
+
+class DomainCompanyOut(BaseModel):
+    id: uuid.UUID
+    domain: str
+    company_name: str
+    contact_name: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    logo_url: str | None = None
+    auto_discovered: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DomainCompanyCreate(BaseModel):
+    domain: str = Field(..., min_length=1, max_length=255,
+                        description="Email domain, e.g. tibos.in")
+    company_name: str = Field(..., min_length=1, max_length=255)
+    contact_name: str | None = Field(default=None, max_length=150)
+    contact_email: str | None = Field(default=None, max_length=255)
+    contact_phone: str | None = Field(default=None, max_length=50)
+    logo_url: str | None = Field(default=None, max_length=512)
+    auto_discovered: bool = False
+
+
+class DomainCompanyUpdate(BaseModel):
+    company_name: str | None = Field(default=None, max_length=255)
+    contact_name: str | None = Field(default=None, max_length=150)
+    contact_email: str | None = Field(default=None, max_length=255)
+    contact_phone: str | None = Field(default=None, max_length=50)
+    logo_url: str | None = Field(default=None, max_length=512)
+
+
+class DomainLookupResult(BaseModel):
+    """Result from the Clearbit-based auto-discovery lookup."""
+    domain: str
+    company_name: str | None = None
+    logo_url: str | None = None
+    found: bool = False

@@ -18,6 +18,7 @@ from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
 from app.services.audit_cleanup import audit_cleanup
+from app.services.trash_cleanup import trash_cleanup
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -151,6 +152,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Audit cleanup could not start: {e}")
 
+    # 7. Start trash cleanup (runs every 24 h, permanently removes tickets soft-deleted > 30 days)
+    try:
+        trash_cleanup.start()
+        _log("[OK] Trash cleanup started (30-day soft-delete retention)")
+    except Exception as e:
+        _log(f"  [WARN] Trash cleanup could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
@@ -158,6 +166,7 @@ async def lifespan(app: FastAPI):
     sla_breach_detector.stop()
     report_scheduler.stop()
     audit_cleanup.stop()
+    trash_cleanup.stop()
     await close_redis()
     await engine.dispose()
     _log("[OK] Shutdown complete")
