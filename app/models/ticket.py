@@ -10,12 +10,23 @@ from sqlalchemy import (
     Enum as SAEnum,
     ForeignKey,
     Integer,
+    SmallInteger,
+    Date,
     Sequence,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+
+class TicketSource(str, enum.Enum):
+    email    = "email"
+    portal   = "portal"
+    phone    = "phone"
+    api      = "api"
+    walk_in  = "walk_in"
+    chat     = "chat"
 
 
 class SLAStatus(str, enum.Enum):
@@ -170,6 +181,34 @@ class Ticket(Base):
         Boolean, nullable=False, default=False, server_default="false", index=True
     )
     deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # ── Extended fields (migration 030) ─────────────────────────────────────
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="portal", server_default="portal"
+    )
+    tags: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="'[]'::jsonb"
+    )
+    first_responded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reopen_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    csat_rating: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    csat_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    csat_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    csat_token: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
+    custom_field_data: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="'{}'::jsonb"
+    )
+    due_date: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

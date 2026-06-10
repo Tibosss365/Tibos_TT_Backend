@@ -37,6 +37,7 @@ from app.schemas.ticket import (
     TicketOut,
     TicketUpdate,
 )
+from app.schemas.feature_schemas import DuplicateCheckRequest, DuplicateTicketOut
 from app.services.notification_service import (
     broadcast_ticket_event,
     notify_ticket_assigned,
@@ -446,6 +447,10 @@ async def create_ticket(
         assignee_id=assignee_id,
         group_id=body.group_id,
         requester_id=requester_id,
+        source=body.source or "portal",
+        tags=body.tags or [],
+        custom_field_data=body.custom_field_data or {},
+        due_date=body.due_date,
     )
     db.add(ticket)
     await db.flush()
@@ -478,6 +483,13 @@ async def create_ticket(
         is_assignment=bool(assignee_id),
         start_time=ticket.created_at,
     )
+
+    # ── Automation engine ────────────────────────────────────────────────────
+    try:
+        from app.services.automation_engine import run_automation
+        await run_automation("ticket_created", ticket, db)
+    except Exception as _ae:
+        logger.warning(f"[automation] ticket_created hook failed: {_ae}")
 
     await db.flush()
     await db.refresh(ticket)
@@ -546,6 +558,117 @@ async def create_ticket(
 
     _inject_empty_attachments(full)
     return TicketOut.model_validate(full)
+
+
+@router.post("/check-duplicate", response_model=list[DuplicateTicketOut])
+async def check_duplicate(
+    body: DuplicateCheckRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Return open tickets with subjects similar to the given subject (duplicate detection)."""
+    from app.services.duplicate_detector import find_duplicates
+    dupes = await find_duplicates(body.subject, db)
+    return [DuplicateTicketOut.model_validate(t) for t in dupes]
+
+
+@router.get("/export-pdf")
+async def export_pdf_bulk(
+    search: str | None = Query(None),
+    status: TicketStatus | None = Query(None),
+    priority: TicketPriority | None = Query(None),
+    category: str | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Export filtered tickets as a PDF report."""
+    stmt = select(Ticket).where(Ticket.is_deleted == False).options(selectinload(Ticket.assignee))  # noqa: E712
+    stmt = _apply_filters(stmt, search, status, priority, category, None, None, date_from, date_to)
+    stmt = stmt.order_by(Ticket.created_at.desc()).limit(500)
+    result = await db.execute(stmt)
+    tickets = result.scalars().all()
+
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=40, bottomMargin=30)
+        styles = getSampleStyleSheet()
+        elements = []
+
+        elements.append(Paragraph("Ticket Report", styles["Title"]))
+        elements.append(Spacer(1, 12))
+
+        headers = ["Ticket ID", "Subject", "Category", "Priority", "Status", "Assignee", "Created"]
+        data = [headers]
+        for t in tickets:
+            data.append([
+                t.ticket_id,
+                (t.subject[:40] + "…") if len(t.subject) > 40 else t.subject,
+                t.category,
+                t.priority.value if hasattr(t.priority, "value") else str(t.priority),
+                t.status.value if hasattr(t.status, "value") else str(t.status),
+                t.assignee.name if t.assignee else "Unassigned",
+                t.created_at.strftime("%Y-%m-%d") if t.created_at else "",
+            ])
+
+        table = Table(data, colWidths=[70, 150, 70, 55, 65, 80, 65])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6366f1")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f3ff")]),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e5e7eb")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(table)
+        doc.build(elements)
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=tickets.pdf"},
+        )
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="reportlab is not installed. Run: pip install reportlab",
+        )
+
+
+@router.post("/import", status_code=200)
+async def import_csv(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Import tickets from a CSV file.
+    Expects multipart/form-data with a 'file' field containing a CSV.
+    CSV columns: subject, category, priority, description, submitter_name, company, email
+    """
+    from fastapi import UploadFile, File
+    raise HTTPException(
+        status_code=400,
+        detail="Use multipart upload: POST /tickets/import with file field",
+    )
+
+
+@router.post("/import-upload", status_code=200)
+async def import_csv_upload(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Placeholder — see import_csv_file endpoint below."""
+    raise HTTPException(status_code=400, detail="Use POST /tickets/import-file")
 
 
 @router.get("/deleted", response_model=PaginatedTickets)
@@ -750,13 +873,38 @@ async def update_ticket(
             if assignee:
                 await notify_ticket_assigned(db, ticket, assignee, current_user.name)
 
+    # ── Reopen count ─────────────────────────────────────────────────────────
+    if "status" in update_data:
+        new_st = update_data["status"]
+        if (
+            new_st == TicketStatus.open
+            and old_status in (TicketStatus.resolved, TicketStatus.closed)
+        ):
+            ticket.reopen_count = (ticket.reopen_count or 0) + 1
+
+    # ── Automation engine ────────────────────────────────────────────────────
+    try:
+        from app.services.automation_engine import run_automation
+        await run_automation("ticket_updated", ticket, db)
+        if "status" in update_data:
+            await run_automation("status_changed", ticket, db)
+    except Exception as _ae:
+        logger.warning(f"[automation] ticket_updated hook failed: {_ae}")
+
     await db.flush()
     full = await _get_ticket_or_404(ticket_id, db)
 
-    # Notify on resolve
+    # Notify on resolve + send CSAT survey
     if "status" in update_data and update_data["status"] == TicketStatus.resolved:
         admins = await _get_admins(db)
         await notify_ticket_resolved(db, full, current_user.name, None, admins)
+        try:
+            from app.services.csat_service import send_csat_survey
+            from app.config import get_settings as _gs
+            _base = str(_gs().FRONTEND_URL).rstrip("/") if hasattr(_gs(), "FRONTEND_URL") else "https://support.tibos.in"
+            await send_csat_survey(full, db, _base)
+        except Exception as _ce:
+            logger.warning(f"[CSAT] Survey dispatch failed: {_ce}")
 
     # ── Email: status-change notifications to submitter ──────────────────
     if "status" in update_data and full.email:
@@ -869,6 +1017,21 @@ async def add_comment(
     )
     db.add(entry)
     ticket.updated_at = datetime.now(timezone.utc)
+
+    # ── First Response Time stamp ─────────────────────────────────────────────
+    try:
+        from app.services.frt_service import maybe_stamp_first_response
+        await maybe_stamp_first_response(ticket, current_user.id, db)
+    except Exception as _fe:
+        logger.warning(f"[FRT] stamp failed: {_fe}")
+
+    # ── Automation: comment_added trigger ─────────────────────────────────────
+    try:
+        from app.services.automation_engine import run_automation
+        await run_automation("comment_added", ticket, db)
+    except Exception as _ae:
+        logger.warning(f"[automation] comment_added hook failed: {_ae}")
+
     await db.flush()
 
     # ── Optionally email the comment to the submitter ─────────────────────

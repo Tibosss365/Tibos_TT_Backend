@@ -107,6 +107,44 @@ async def get_analytics(
     avg_hours_raw = avg_res.scalar_one()
     avg_resolution_hours = round(float(avg_hours_raw), 1) if avg_hours_raw else 0.0
 
+    # Source distribution
+    src_rows = await db.execute(
+        select(Ticket.source, func.count()).group_by(Ticket.source)
+    )
+    source_dist: dict[str, int] = {row[0]: row[1] for row in src_rows.all()}
+
+    # CSAT metrics (only tickets that have a rating)
+    csat_rows = await db.execute(
+        select(Ticket.csat_rating, func.count())
+        .where(Ticket.csat_rating.isnot(None))
+        .group_by(Ticket.csat_rating)
+    )
+    csat_dist_raw: dict[int, int] = {row[0]: row[1] for row in csat_rows.all()}
+    csat_count = sum(csat_dist_raw.values())
+    csat_avg: float | None = None
+    if csat_count:
+        csat_avg = round(sum(k * v for k, v in csat_dist_raw.items()) / csat_count, 2)
+    csat_distribution = {str(k): v for k, v in csat_dist_raw.items()}
+
+    # Average first-response time (hours)
+    avg_frt_res = await db.execute(
+        select(
+            func.avg(
+                func.extract("epoch", Ticket.first_responded_at - Ticket.created_at) / 3600
+            )
+        )
+        .where(Ticket.first_responded_at.isnot(None))
+    )
+    avg_frt_raw = avg_frt_res.scalar_one()
+    avg_first_response_hours = round(float(avg_frt_raw), 2) if avg_frt_raw else None
+
+    # Reopen rate
+    reopened_res = await db.execute(
+        select(func.count()).select_from(Ticket).where(Ticket.reopen_count > 0)
+    )
+    reopened = reopened_res.scalar_one()
+    reopen_rate = round(reopened / total * 100, 1) if total else 0.0
+
     return AnalyticsOut(
         status_distribution=status_dist,
         category_distribution=cat_dist,
@@ -115,4 +153,10 @@ async def get_analytics(
         sla_compliance=sla_compliance,
         tickets_over_time=tickets_over_time,
         avg_resolution_hours=avg_resolution_hours,
+        source_distribution=source_dist,
+        csat_avg=csat_avg,
+        csat_count=csat_count,
+        csat_distribution=csat_distribution,
+        avg_first_response_hours=avg_first_response_hours,
+        reopen_rate=reopen_rate,
     )

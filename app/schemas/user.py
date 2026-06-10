@@ -26,14 +26,54 @@ class UserUpdate(BaseModel):
     role: UserRole | None = None
     is_active: bool | None = None
     password: str | None = None
+    preferred_timezone: str | None = None
 
 
 class UserOut(UserBase):
     id: uuid.UUID
     is_active: bool
     created_at: datetime
+    totp_enabled: bool = False
+    preferred_timezone: str = "UTC"
 
     model_config = {"from_attributes": True}
+
+
+# ── TOTP / 2FA schemas ────────────────────────────────────────────────────────
+
+class TOTPSetupOut(BaseModel):
+    """Returned when 2FA setup is initiated — contains the provisioning URI."""
+    provisioning_uri: str
+    secret: str  # shown once so user can manually enter into authenticator
+
+
+class TOTPVerifyRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class TOTPVerifyResponse(BaseModel):
+    backup_codes: list[str]  # returned only on first enable
+
+
+class TOTPDisableRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class TOTPLoginRequest(BaseModel):
+    """Second-step login when TOTP is enabled."""
+    username: str
+    password: str
+    totp_code: str | None = None  # omit if using backup code
+    backup_code: str | None = None
+
+
+class UserSettingsUpdate(BaseModel):
+    """Self-service profile updates (non-admin)."""
+    name: str | None = None
+    initials: str | None = None
+    preferred_timezone: str | None = None
+    current_password: str | None = None  # required when changing password
+    new_password: str | None = None
 
 
 class UserPublic(BaseModel):
@@ -56,4 +96,6 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
-    client_ip: str | None = None   # returned so the frontend can display it in login history
+    client_ip: str | None = None       # returned so the frontend can display it in login history
+    session_id: str | None = None      # DB login_session UUID — used by frontend to mark logout
+    must_change_password: bool = False  # set by admin force-reset; frontend redirects to change-password page

@@ -3,7 +3,7 @@ import enum
 from datetime import datetime, timezone
 
 from sqlalchemy import String, Boolean, DateTime, Enum as SAEnum
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -37,6 +37,23 @@ class User(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
+    )
+
+    # ── TOTP / 2FA (migration 032) ───────────────────────────────────────────
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    totp_backup_codes: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="'[]'::jsonb"
+    )
+    preferred_timezone: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="UTC", server_default="UTC"
+    )
+
+    # ── Admin security actions (migration 034) ───────────────────────────────
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
     )
 
     # Relationships

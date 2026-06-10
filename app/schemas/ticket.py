@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Union
 from pydantic import BaseModel, Field, computed_field, field_serializer
 
-from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType
+from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType, TicketSource
 from app.schemas.user import UserPublic
 
 
@@ -64,7 +64,11 @@ class TicketBase(BaseModel):
 
 class TicketCreate(TicketBase):
     assignee_id: uuid.UUID | None = None
-    group_id:str | None=None
+    group_id: str | None = None
+    source: str = "portal"
+    tags: list[str] = []
+    custom_field_data: dict = {}
+    due_date: datetime | None = None
 
 
 class TicketUpdate(BaseModel):
@@ -80,7 +84,11 @@ class TicketUpdate(BaseModel):
     asset: str | None = None
     description: str | None = None
     resolution: str | None = None
-    group_id:str | None=None
+    group_id: str | None = None
+    source: str | None = None
+    tags: list[str] | None = None
+    custom_field_data: dict | None = None
+    due_date: datetime | None = None
 
 
 class TicketOut(TicketBase):
@@ -112,10 +120,21 @@ class TicketOut(TicketBase):
     updated_at: datetime
     is_deleted: bool = False
     deleted_at: datetime | None = None
+    # ── Extended fields (migration 030) ──────────────────────────────────
+    source: str = "portal"
+    tags: list[str] = []
+    first_responded_at: datetime | None = None
+    reopen_count: int = 0
+    csat_rating: int | None = None
+    csat_comment: str | None = None
+    csat_sent_at: datetime | None = None
+    custom_field_data: dict = {}
+    due_date: datetime | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
         "created_at", "updated_at", "deleted_at",
+        "first_responded_at", "csat_sent_at", "due_date",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:
@@ -171,10 +190,19 @@ class TicketListOut(BaseModel):
     updated_at: datetime
     is_deleted: bool = False
     deleted_at: Union[datetime, None] | None = None
+    # ── Extended fields (migration 030) ──────────────────────────────────
+    source: str = "portal"
+    tags: list[str] = []
+    first_responded_at: Union[datetime, None] | None = None
+    reopen_count: int = 0
+    csat_rating: Union[int, None] | None = None
+    custom_field_data: dict = {}
+    due_date: Union[datetime, None] | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
         "created_at", "updated_at", "deleted_at",
+        "first_responded_at", "due_date",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:
@@ -208,7 +236,7 @@ class TicketFilter(BaseModel):
 
 class BulkTicketAction(BaseModel):
     ticket_ids: list[uuid.UUID] = Field(..., min_length=1)
-    action: str = Field(..., pattern="^(resolve|close|delete)$")
+    action: str = Field(..., pattern="^(resolve|close|delete|reopen)$")
 
 
 class AddCommentRequest(BaseModel):

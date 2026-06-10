@@ -13,12 +13,15 @@ from app.database import engine
 from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
 from app.routers import inbound_email, categories, sla, groups
+from app.routers import csat, admin_features, activity
 from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
 from app.services.audit_cleanup import audit_cleanup
 from app.services.trash_cleanup import trash_cleanup
+from app.services.escalation_service import escalation_service
+from app.services.recurring_ticket_service import recurring_ticket_service
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -159,6 +162,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Trash cleanup could not start: {e}")
 
+    # 8. Start escalation service (runs every 1 h)
+    try:
+        escalation_service.start()
+        _log("[OK] Escalation service started")
+    except Exception as e:
+        _log(f"  [WARN] Escalation service could not start: {e}")
+
+    # 9. Start recurring ticket service (runs every 60 s, respects cron schedules)
+    try:
+        recurring_ticket_service.start()
+        _log("[OK] Recurring ticket service started")
+    except Exception as e:
+        _log(f"  [WARN] Recurring ticket service could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
@@ -167,6 +184,8 @@ async def lifespan(app: FastAPI):
     report_scheduler.stop()
     audit_cleanup.stop()
     trash_cleanup.stop()
+    escalation_service.stop()
+    recurring_ticket_service.stop()
     await close_redis()
     await engine.dispose()
     _log("[OK] Shutdown complete")
@@ -216,6 +235,9 @@ app.include_router(events.router)
 app.include_router(ws.router)
 app.include_router(sso_auth_router)
 app.include_router(sso_admin_router)
+app.include_router(csat.router)
+app.include_router(admin_features.router)
+app.include_router(activity.router)
 
 
 @app.get("/health", tags=["health"])
@@ -238,4 +260,10 @@ async def health():
             sla_breach_detector._task and not sla_breach_detector._task.done()
         ) else "stopped",
         "report_scheduler": "running" if report_scheduler.is_running else "stopped",
+        "escalation_service": "running" if (
+            escalation_service._task and not escalation_service._task.done()
+        ) else "stopped",
+        "recurring_ticket_service": "running" if (
+            recurring_ticket_service._task and not recurring_ticket_service._task.done()
+        ) else "stopped",
     }
