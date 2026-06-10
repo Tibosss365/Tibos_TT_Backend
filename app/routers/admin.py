@@ -987,26 +987,81 @@ async def lookup_domain(
     _: User = Depends(require_admin),
 ):
     """
-    Auto-discover company info for a given email domain using Clearbit's
-    free company autocomplete API.  No API key required.
-    Falls back gracefully if the lookup fails or returns no results.
+    Auto-discover company info for a given email domain.
+    Strategy 1: Clearbit autocomplete (search by name part of domain).
+    Strategy 2: Fetch the domain's website and extract company name from
+                og:site_name → og:title → <title> tag.
     """
-    clean = domain.lower().strip().lstrip("@")
-    url = f"https://autocomplete.clearbit.com/v1/companies/suggest?query={clean}"
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, headers={"User-Agent": "TibosTT/1.0"})
+    from bs4 import BeautifulSoup
+
+    clean = domain.lower().strip().lstrip("@").split("/")[0]
+    # Extract just the first label (e.g. "eshs" from "eshs.in")
+    name_part = clean.split(".")[0]
+
+    # ── Strategy 1: Clearbit autocomplete ─────────────────────────────────
+    for query in ([name_part] if name_part != clean else [clean]):
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                resp = await client.get(
+                    f"https://autocomplete.clearbit.com/v1/companies/suggest?query={query}",
+                    headers={"User-Agent": "TibosTT/1.0"},
+                )
+                if resp.status_code == 200:
+                    results = resp.json()
+                    if results:
+                        # Prefer an exact domain match
+                        for r in results:
+                            if (r.get("domain") or "").lower() == clean:
+                                return DomainLookupResult(
+                                    domain=clean,
+                                    company_name=r.get("name"),
+                                    logo_url=r.get("logo"),
+                                    found=True,
+                                )
+                        # Otherwise take the first result (name-based match)
+                        best = results[0]
+                        return DomainLookupResult(
+                            domain=clean,
+                            company_name=best.get("name"),
+                            logo_url=best.get("logo"),
+                            found=True,
+                        )
+        except Exception as exc:
+            logger.warning(f"[domain-lookup] Clearbit failed for '{query}': {exc}")
+
+    # ── Strategy 2: Scrape the website for meta tags ───────────────────────
+    for scheme in ("https", "http"):
+        try:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                resp = await client.get(
+                    f"{scheme}://{clean}",
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; TibosTT/1.0)"},
+                )
             if resp.status_code == 200:
-                results = resp.json()
-                if results:
-                    best = results[0]
-                    return DomainLookupResult(
-                        domain=clean,
-                        company_name=best.get("name"),
-                        logo_url=best.get("logo"),
-                        found=True,
-                    )
-    except Exception as exc:
-        logger.warning(f"[domain-lookup] Clearbit request failed for {clean}: {exc}")
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # og:site_name is the most reliable tag
+                tag = soup.find("meta", property="og:site_name")
+                if tag and tag.get("content", "").strip():
+                    return DomainLookupResult(domain=clean, company_name=tag["content"].strip(), found=True)
+
+                # og:title (trim after | or -)
+                tag = soup.find("meta", property="og:title")
+                if tag and tag.get("content", "").strip():
+                    name = tag["content"].split("|")[0].split(" - ")[0].strip()
+                    if name:
+                        return DomainLookupResult(domain=clean, company_name=name, found=True)
+
+                # <title> tag
+                if soup.title and soup.title.string:
+                    name = soup.title.string.split("|")[0].split(" - ")[0].split("–")[0].strip()
+                    if name and len(name) < 100:
+                        return DomainLookupResult(domain=clean, company_name=name, found=True)
+
+                break  # https succeeded — don't retry with http
+        except Exception as exc:
+            logger.warning(f"[domain-lookup] Web scrape failed for {scheme}://{clean}: {exc}")
+            if scheme == "https":
+                continue  # try http as fallback
 
     return DomainLookupResult(domain=clean, found=False)
