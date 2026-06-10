@@ -992,7 +992,11 @@ async def lookup_domain(
     Strategy 2: Fetch the domain's website and extract company name from
                 og:site_name → og:title → <title> tag.
     """
-    from bs4 import BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        BeautifulSoup = None
+        logger.warning("[domain-lookup] beautifulsoup4 not installed — web-scrape strategy disabled")
 
     clean = domain.lower().strip().lstrip("@").split("/")[0]
     # Extract just the first label (e.g. "eshs" from "eshs.in")
@@ -1030,7 +1034,7 @@ async def lookup_domain(
             logger.warning(f"[domain-lookup] Clearbit failed for '{query}': {exc}")
 
     # ── Strategy 2: Scrape the website for meta tags ───────────────────────
-    for scheme in ("https", "http"):
+    for scheme in ("https", "http") if BeautifulSoup else ():
         try:
             async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
                 resp = await client.get(

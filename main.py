@@ -213,9 +213,17 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     """Log every unhandled exception with a full traceback so 500s are visible."""
     tb = traceback.format_exc()
     logger.error(f"Unhandled exception on {request.method} {request.url}\n{tb}")
+    # This handler runs outside CORSMiddleware, so CORS headers must be added
+    # manually — otherwise browsers hide the 500 behind "Failed to fetch".
+    origin = request.headers.get("origin")
+    cors_headers = (
+        {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true"}
+        if origin else {}
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+        headers=cors_headers,
     )
 
 
