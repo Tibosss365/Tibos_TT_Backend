@@ -21,7 +21,7 @@ from app.core.deps import get_current_user, require_admin
 from app.database import get_db
 from app.models.feature_models import (
     CustomField, TicketTemplate, AutomationRule, WebhookConfig,
-    NotificationChannel, Asset, EscalationRule, RecurringTicketTemplate,
+    NotificationChannel, Asset, AssetHistory, EscalationRule, RecurringTicketTemplate,
     PortalBranding,
 )
 from app.models.user import User
@@ -31,7 +31,7 @@ from app.schemas.feature_schemas import (
     AutomationRuleCreate, AutomationRuleUpdate, AutomationRuleOut,
     WebhookConfigCreate, WebhookConfigUpdate, WebhookConfigOut,
     NotificationChannelCreate, NotificationChannelUpdate, NotificationChannelOut,
-    AssetCreate, AssetUpdate, AssetOut,
+    AssetCreate, AssetUpdate, AssetOut, AssetHistoryOut,
     EscalationRuleCreate, EscalationRuleUpdate, EscalationRuleOut,
     RecurringTicketTemplateCreate, RecurringTicketTemplateUpdate, RecurringTicketTemplateOut,
     PortalBrandingUpdate, PortalBrandingOut,
@@ -304,6 +304,39 @@ async def delete_notification_channel(
 
 # ── Assets ────────────────────────────────────────────────────────────────────
 
+def _record_assignment_history(
+    db: AsyncSession,
+    asset: Asset,
+    *,
+    prev_name: str | None,
+    prev_email: str | None,
+    changed_by: User,
+) -> None:
+    """Append an asset_history row when the assignee changed."""
+    new_name = asset.assigned_to_name or None
+    new_email = asset.assigned_to_email or None
+    if (new_name, new_email) == (prev_name, prev_email):
+        return
+    if new_name or new_email:
+        action = "reassigned" if (prev_name or prev_email) else "assigned"
+    else:
+        action = "unassigned"
+    note = None
+    if action in ("reassigned", "unassigned") and (prev_name or prev_email):
+        note = f"Previously assigned to {prev_name or ''}".strip()
+        if prev_email:
+            note += f" ({prev_email})"
+    db.add(AssetHistory(
+        asset_id=asset.id,
+        action=action,
+        assigned_to_name=new_name,
+        assigned_to_email=new_email,
+        employee_code=asset.employee_code or None,
+        note=note,
+        changed_by_name=changed_by.name,
+    ))
+
+
 @router.get("/admin/assets", response_model=list[AssetOut])
 async def list_assets(
     db: AsyncSession = Depends(get_db),
@@ -317,10 +350,14 @@ async def list_assets(
 async def create_asset(
     body: AssetCreate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     obj = Asset(**body.model_dump())
     db.add(obj)
+    await db.flush()
+    _record_assignment_history(
+        db, obj, prev_name=None, prev_email=None, changed_by=current_user
+    )
     await db.commit()
     await db.refresh(obj)
     return obj
@@ -331,13 +368,39 @@ async def update_asset(
     id: uuid.UUID,
     body: AssetUpdate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     obj = await _get_or_404(Asset, id, db)
-    _apply_updates(obj, body.model_dump(exclude_none=True))
+    prev_name = obj.assigned_to_name or None
+    prev_email = obj.assigned_to_email or None
+    changes = body.model_dump(exclude_none=True)
+    # Empty strings mean "clear this field" (unassign)
+    for field in ("assigned_to_name", "assigned_to_email", "employee_code"):
+        if changes.get(field) == "":
+            changes[field] = None
+            setattr(obj, field, None)
+    _apply_updates(obj, changes)
+    _record_assignment_history(
+        db, obj, prev_name=prev_name, prev_email=prev_email, changed_by=current_user
+    )
     await db.commit()
     await db.refresh(obj)
     return obj
+
+
+@router.get("/admin/assets/{id}/history", response_model=list[AssetHistoryOut])
+async def asset_history(
+    id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    await _get_or_404(Asset, id, db)
+    result = await db.execute(
+        select(AssetHistory)
+        .where(AssetHistory.asset_id == id)
+        .order_by(AssetHistory.created_at.desc())
+    )
+    return result.scalars().all()
 
 
 @router.delete("/admin/assets/{id}", status_code=204)

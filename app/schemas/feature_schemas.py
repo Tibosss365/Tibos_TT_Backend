@@ -218,6 +218,9 @@ class AssetCreate(BaseModel):
     model: str | None = Field(default=None, max_length=100)
     status: str = "active"
     assigned_to: uuid.UUID | None = None
+    assigned_to_name: str | None = Field(default=None, max_length=150)
+    assigned_to_email: str | None = Field(default=None, max_length=255)
+    employee_code: str | None = Field(default=None, max_length=50)
     location: str | None = Field(default=None, max_length=150)
     purchase_date: str | None = None   # ISO date string YYYY-MM-DD
     warranty_expiry: str | None = None  # ISO date string YYYY-MM-DD
@@ -233,6 +236,10 @@ class AssetUpdate(BaseModel):
     model: str | None = None
     status: str | None = None
     assigned_to: uuid.UUID | None = None
+    # Empty string clears the field (unassign)
+    assigned_to_name: str | None = Field(default=None, max_length=150)
+    assigned_to_email: str | None = Field(default=None, max_length=255)
+    employee_code: str | None = Field(default=None, max_length=50)
     location: str | None = None
     purchase_date: str | None = None
     warranty_expiry: str | None = None
@@ -249,10 +256,31 @@ class AssetOut(BaseModel):
     model: str | None
     status: str
     assigned_to: uuid.UUID | None
+    assigned_to_name: str | None
+    assigned_to_email: str | None
+    employee_code: str | None
     location: str | None
     purchase_date: Any | None  # date or None
     warranty_expiry: Any | None
     notes: str | None
+    created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def _ser(self, v: datetime | None) -> str | None:
+        return _utc_iso(v)
+
+    model_config = {"from_attributes": True}
+
+
+class AssetHistoryOut(BaseModel):
+    id: uuid.UUID
+    asset_id: uuid.UUID
+    action: str
+    assigned_to_name: str | None
+    assigned_to_email: str | None
+    employee_code: str | None
+    note: str | None
+    changed_by_name: str | None
     created_at: datetime
 
     @field_serializer("created_at", when_used="json")

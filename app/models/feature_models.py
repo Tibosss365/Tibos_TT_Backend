@@ -197,6 +197,10 @@ class Asset(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Free-text assignee (employees are usually not system users)
+    assigned_to_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    assigned_to_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    employee_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     location: Mapped[str | None] = mapped_column(String(150), nullable=True)
     purchase_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     warranty_expiry: Mapped[datetime | None] = mapped_column(Date, nullable=True)
@@ -209,6 +213,34 @@ class Asset(Base):
 
     assigned_user: Mapped["User | None"] = relationship(  # type: ignore[name-defined]
         "User", foreign_keys=[assigned_to]
+    )
+
+
+class AssetHistory(Base):
+    """One row per assignment change on an asset (audit trail)."""
+    __tablename__ = "asset_history"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("assets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # assigned | reassigned | unassigned
+    action: Mapped[str] = mapped_column(String(20), nullable=False)
+    assigned_to_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    assigned_to_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    employee_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # e.g. "Previously assigned to Ravi Kumar (ravi@tibos.in)"
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
 
