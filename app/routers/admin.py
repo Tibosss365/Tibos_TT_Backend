@@ -988,9 +988,13 @@ async def lookup_domain(
 ):
     """
     Auto-discover company info for a given email domain.
-    Strategy 1: Clearbit autocomplete (search by name part of domain).
-    Strategy 2: Fetch the domain's website and extract company name from
+    Strategy 1: RDAP (WHOIS) registrant organization — the legal name the
+                domain is registered under (e.g. tibos.in →
+                "TIBOS Solutions and Services Private Limited").
+    Strategy 2: Clearbit autocomplete, exact domain match only.
+    Strategy 3: Fetch the domain's website and extract company name from
                 og:site_name → og:title → <title> tag.
+    Strategy 4: Clearbit name-based match (least reliable, last resort).
     """
     try:
         from bs4 import BeautifulSoup
@@ -1002,7 +1006,38 @@ async def lookup_domain(
     # Extract just the first label (e.g. "eshs" from "eshs.in")
     name_part = clean.split(".")[0]
 
-    # ── Strategy 1: Clearbit autocomplete (exact domain match only) ────────
+    # ── Strategy 1: RDAP registrant organization ───────────────────────────
+    # rdap.org redirects to the right registry for any TLD. Many domains
+    # hide the registrant behind a privacy service — filter those out.
+    _PRIVACY_MARKERS = (
+        "redacted", "privacy", "whoisguard", "proxy", "protected",
+        "not disclosed", "identity protect", "withheld", "gdpr",
+        "data protected", "contact privacy", "statutory",
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(
+                f"https://rdap.org/domain/{clean}",
+                headers={"User-Agent": "TibosTT/1.0", "Accept": "application/rdap+json"},
+            )
+            if resp.status_code == 200:
+                for entity in resp.json().get("entities", []):
+                    if "registrant" not in (entity.get("roles") or []):
+                        continue
+                    vcard = entity.get("vcardArray") or []
+                    for item in (vcard[1] if len(vcard) > 1 else []):
+                        if len(item) > 3 and item[0] in ("org", "fn") and isinstance(item[3], str):
+                            candidate = item[3].strip()
+                            if candidate and not any(
+                                m in candidate.lower() for m in _PRIVACY_MARKERS
+                            ):
+                                return DomainLookupResult(
+                                    domain=clean, company_name=candidate, found=True
+                                )
+    except Exception as exc:
+        logger.warning(f"[domain-lookup] RDAP failed for {clean}: {exc}")
+
+    # ── Strategy 2: Clearbit autocomplete (exact domain match only) ────────
     # A name-based first result is often a different company entirely
     # (e.g. "tibos.in" → "Tibosch" from tibosch.nl), so it's kept only as a
     # last resort below, after trying the domain's own website.
@@ -1030,7 +1065,7 @@ async def lookup_domain(
         except Exception as exc:
             logger.warning(f"[domain-lookup] Clearbit failed for '{query}': {exc}")
 
-    # ── Strategy 2: Scrape the website for meta tags ───────────────────────
+    # ── Strategy 3: Scrape the website for meta tags ───────────────────────
     for scheme in ("https", "http") if BeautifulSoup else ():
         try:
             async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
@@ -1065,7 +1100,7 @@ async def lookup_domain(
             if scheme == "https":
                 continue  # try http as fallback
 
-    # ── Strategy 3: Clearbit name-based match (least reliable) ─────────────
+    # ── Strategy 4: Clearbit name-based match (least reliable) ─────────────
     if name_match:
         return DomainLookupResult(
             domain=clean,
