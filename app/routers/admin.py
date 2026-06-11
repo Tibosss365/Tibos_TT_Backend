@@ -1002,7 +1002,11 @@ async def lookup_domain(
     # Extract just the first label (e.g. "eshs" from "eshs.in")
     name_part = clean.split(".")[0]
 
-    # ── Strategy 1: Clearbit autocomplete ─────────────────────────────────
+    # ── Strategy 1: Clearbit autocomplete (exact domain match only) ────────
+    # A name-based first result is often a different company entirely
+    # (e.g. "tibos.in" → "Tibosch" from tibosch.nl), so it's kept only as a
+    # last resort below, after trying the domain's own website.
+    name_match = None
     for query in ([name_part] if name_part != clean else [clean]):
         try:
             async with httpx.AsyncClient(timeout=6.0) as client:
@@ -1013,7 +1017,6 @@ async def lookup_domain(
                 if resp.status_code == 200:
                     results = resp.json()
                     if results:
-                        # Prefer an exact domain match
                         for r in results:
                             if (r.get("domain") or "").lower() == clean:
                                 return DomainLookupResult(
@@ -1022,14 +1025,8 @@ async def lookup_domain(
                                     logo_url=r.get("logo"),
                                     found=True,
                                 )
-                        # Otherwise take the first result (name-based match)
-                        best = results[0]
-                        return DomainLookupResult(
-                            domain=clean,
-                            company_name=best.get("name"),
-                            logo_url=best.get("logo"),
-                            found=True,
-                        )
+                        if name_match is None:
+                            name_match = results[0]
         except Exception as exc:
             logger.warning(f"[domain-lookup] Clearbit failed for '{query}': {exc}")
 
@@ -1067,5 +1064,14 @@ async def lookup_domain(
             logger.warning(f"[domain-lookup] Web scrape failed for {scheme}://{clean}: {exc}")
             if scheme == "https":
                 continue  # try http as fallback
+
+    # ── Strategy 3: Clearbit name-based match (least reliable) ─────────────
+    if name_match:
+        return DomainLookupResult(
+            domain=clean,
+            company_name=name_match.get("name"),
+            logo_url=name_match.get("logo"),
+            found=True,
+        )
 
     return DomainLookupResult(domain=clean, found=False)

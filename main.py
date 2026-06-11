@@ -64,13 +64,22 @@ async def _auto_migrate() -> None:
 async def lifespan(app: FastAPI):
     # ── Startup ────────────────────────────────────────────────────────
 
-    # 0. Auto-migrate
-    try:
-        _log("  Running database migrations...")
-        await _auto_migrate()
-        _log("[OK] Database migrations up to date")
-    except Exception as e:
-        _log(f"  [WARN] Migration failed (will attempt to continue): {e}")
+    # 0. Auto-migrate — retry (DB may not be reachable in the first seconds),
+    # then refuse to boot: running with a stale schema turns every affected
+    # request into a 500 (e.g. the 2026-06-10 login outage on missing column).
+    MIGRATE_ATTEMPTS = 3
+    for attempt in range(1, MIGRATE_ATTEMPTS + 1):
+        try:
+            _log(f"  Running database migrations (attempt {attempt}/{MIGRATE_ATTEMPTS})...")
+            await _auto_migrate()
+            _log("[OK] Database migrations up to date")
+            break
+        except Exception as e:
+            _log(f"  [ERROR] Migration attempt {attempt} failed: {e}")
+            if attempt == MIGRATE_ATTEMPTS:
+                _log("  [FATAL] Could not migrate database — refusing to start with a stale schema.")
+                raise
+            await asyncio.sleep(5 * attempt)
 
     # 1. Redis (optional — caching removed, Redis not required)
     try:
