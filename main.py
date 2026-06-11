@@ -13,6 +13,7 @@ from app.database import engine
 from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
 from app.routers import inbound_email, categories, sla, groups
+from app.routers import email_inbox
 from app.routers import csat, admin_features, activity
 from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router
 from app.services.email_poller import email_poller
@@ -245,6 +246,7 @@ app.include_router(admin.router)
 app.include_router(analytics.router)
 app.include_router(dashboard.router)
 app.include_router(inbound_email.router)
+app.include_router(email_inbox.router)
 app.include_router(categories.router)
 app.include_router(sla.router)
 app.include_router(groups.router)

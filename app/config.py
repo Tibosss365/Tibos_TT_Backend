@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Local dev
     LOCAL_ATTACHMENT_DIR: str = "/tmp/attachments"
 
+    # AI features (email inbox suggest-reply / summarize). Optional — the
+    # /email/ai/* endpoints return 503 when unset.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    AI_MODEL: str = "claude-opus-4-8"
+
     @property
     def origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]

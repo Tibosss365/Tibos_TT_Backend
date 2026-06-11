@@ -19,6 +19,7 @@ pydantic[email]
 azure-storage-blob>=12.0.0
 aiohttp>=3.9.0
 # Feature additions
+anthropic>=0.69.0
 pyotp>=2.9.0
 croniter>=2.0.0
 reportlab>=4.0.0

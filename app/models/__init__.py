@@ -19,6 +19,14 @@ from app.models.feature_models import (
     RecurringTicketTemplate,
     PortalBranding,
 )
+from app.models.email_inbox import (
+    EmailAccount,
+    EmailThread,
+    EmailMessage,
+    InboxEmailTemplate,
+    EmailSignature,
+    EmailRoutingRule,
+)
 
 __all__ = [
     # Core
@@ -55,4 +63,11 @@ __all__ = [
     "EscalationRule",
     "RecurringTicketTemplate",
     "PortalBranding",
+    # Email inbox (migration 036)
+    "EmailAccount",
+    "EmailThread",
+    "EmailMessage",
+    "InboxEmailTemplate",
+    "EmailSignature",
+    "EmailRoutingRule",
 ]
