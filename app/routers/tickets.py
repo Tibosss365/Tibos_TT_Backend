@@ -777,6 +777,32 @@ async def update_ticket(
     old_status      = ticket.status
 
     update_data = body.model_dump(exclude_unset=True)
+
+    # ── Requester details are locked — they may not be changed via update ──────
+    # The frontend keeps name / email / company read-only; enforce it server-side
+    # too so a direct API call can't alter the requester.
+    LOCKED_REQUESTER_FIELDS = ("contact_name", "email", "company")
+    for f in LOCKED_REQUESTER_FIELDS:
+        if f in update_data and (update_data[f] or "") != (getattr(ticket, f) or ""):
+            raise HTTPException(
+                status_code=400,
+                detail="Requester details (name, email, company) are locked and cannot be changed.",
+            )
+        # Never write a requester field, even when the value is unchanged.
+        update_data.pop(f, None)
+
+    # ── Resolution notes are mandatory when resolving a ticket ─────────────────
+    if (
+        update_data.get("status") == TicketStatus.resolved
+        and old_status != TicketStatus.resolved
+    ):
+        resolution_note = update_data.get("resolution", ticket.resolution)
+        if not (resolution_note or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Resolution notes are required to resolve a ticket.",
+            )
+
     for key, val in update_data.items():
         setattr(ticket, key, val)
 
