@@ -19,6 +19,7 @@ from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
+from app.services.condition_alert_service import condition_alert_service
 from app.services.audit_cleanup import audit_cleanup
 from app.services.trash_cleanup import trash_cleanup
 from app.services.escalation_service import escalation_service
@@ -158,6 +159,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Report scheduler could not start: {e}")
 
+    # 5b. Start condition alert service (checks alert conditions every 60 s)
+    try:
+        condition_alert_service.start()
+        _log("[OK] Condition alert service started")
+    except Exception as e:
+        _log(f"  [WARN] Condition alert service could not start: {e}")
+
     # 6. Start audit log cleanup (runs every 24 h, retains last 30 days)
     try:
         audit_cleanup.start()
@@ -192,6 +200,7 @@ async def lifespan(app: FastAPI):
     email_poller.stop()
     sla_breach_detector.stop()
     report_scheduler.stop()
+    condition_alert_service.stop()
     audit_cleanup.stop()
     trash_cleanup.stop()
     escalation_service.stop()
@@ -279,6 +288,7 @@ async def health():
             sla_breach_detector._task and not sla_breach_detector._task.done()
         ) else "stopped",
         "report_scheduler": "running" if report_scheduler.is_running else "stopped",
+        "condition_alert_service": "running" if condition_alert_service.is_running else "stopped",
         "escalation_service": "running" if (
             escalation_service._task and not escalation_service._task.done()
         ) else "stopped",
