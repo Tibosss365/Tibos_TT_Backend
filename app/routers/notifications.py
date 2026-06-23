@@ -21,7 +21,8 @@ async def get_notifications(
     result = await db.execute(
         select(Notification)
         .where(Notification.user_id == current_user.id)
-        .order_by(Notification.created_at.desc())
+        # Approval requests are pinned to the top, then newest-first.
+        .order_by(Notification.is_approval.desc(), Notification.created_at.desc())
         .limit(50)
     )
     notifications = result.scalars().all()
@@ -78,6 +79,10 @@ async def clear_notifications(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Clear only regular notifications — approval requests are pinned and kept.
     await db.execute(
-        delete(Notification).where(Notification.user_id == current_user.id)
+        delete(Notification).where(
+            Notification.user_id == current_user.id,
+            Notification.is_approval == False,  # noqa: E712
+        )
     )

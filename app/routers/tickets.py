@@ -26,9 +26,11 @@ from app.models.ticket import (
 )
 from app.models.user import User, UserRole
 from app.models.admin import DomainCompany, TicketSettings
+from app.models.notification import Notification
 from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
+    ApprovalDecision,
     BulkTicketAction,
     PaginatedTickets,
     TicketCreate,
@@ -40,6 +42,7 @@ from app.schemas.ticket import (
 from app.schemas.feature_schemas import DuplicateCheckRequest, DuplicateTicketOut
 from app.services.notification_service import (
     broadcast_ticket_event,
+    notify_approval_requested,
     notify_ticket_assigned,
     notify_ticket_created,
     notify_ticket_resolved,
@@ -1160,12 +1163,118 @@ async def update_approvals(
     ticket_id: uuid.UUID,
     body: TicketDataUpdate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     ticket = await _get_ticket_or_404(ticket_id, db)
+
+    # Identify newly-raised approvals (ids present now but not before) so we can
+    # notify + email the approver exactly once.
+    old_ids = {a.get("id") for a in (ticket.approvals or []) if isinstance(a, dict)}
+    new_approvals = [
+        a for a in (body.items or [])
+        if isinstance(a, dict) and a.get("id") not in old_ids
+    ]
+
     ticket.approvals = body.items
     ticket.updated_at = datetime.now(timezone.utc)
     await db.flush()
+
+    # Notify each new approver (requestedFrom is the approver's user id).
+    for appr in new_approvals:
+        approver_id = appr.get("requestedFrom")
+        if not approver_id:
+            continue
+        try:
+            approver_uuid = uuid.UUID(str(approver_id))
+        except (ValueError, TypeError):
+            continue
+        res = await db.execute(select(User).where(User.id == approver_uuid))
+        approver = res.scalar_one_or_none()
+        if not approver:
+            continue
+        await notify_approval_requested(
+            db,
+            ticket,
+            approver,
+            requested_by=appr.get("requestedBy") or current_user.name,
+            note=appr.get("note"),
+        )
+
+    full = await _get_ticket_or_404(ticket_id, db)
+    _inject_empty_attachments(full)
+    return TicketOut.model_validate(full)
+
+
+@router.get("/approvals/pending")
+async def get_my_pending_approvals(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the current user's pending approval requests across all tickets.
+
+    Powers the "Approval Requests" tab in the notification bar.
+    """
+    res = await db.execute(select(Ticket).where(Ticket.is_deleted == False))  # noqa: E712
+    me = str(current_user.id)
+    out: list[dict] = []
+    for t in res.scalars().all():
+        for a in (t.approvals or []):
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("requestedFrom")) == me and a.get("status") == "pending":
+                out.append({
+                    "ticket_uuid": str(t.id),
+                    "ticket_id": t.ticket_id,
+                    "subject": t.subject,
+                    "approval_id": a.get("id"),
+                    "requested_by": a.get("requestedBy"),
+                    "note": a.get("note"),
+                    "ts": a.get("ts"),
+                })
+    out.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return out
+
+
+@router.post("/{ticket_id}/approvals/{approval_id}/decision", response_model=TicketOut)
+async def decide_approval(
+    ticket_id: uuid.UUID,
+    approval_id: str,
+    body: ApprovalDecision,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve or reject a single approval request (from the notification bar)."""
+    if body.status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be 'approved' or 'rejected'")
+
+    ticket = await _get_ticket_or_404(ticket_id, db)
+    found = False
+    new_list: list = []
+    for a in (ticket.approvals or []):
+        if isinstance(a, dict) and str(a.get("id")) == str(approval_id):
+            if str(a.get("requestedFrom")) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="You are not the requested approver.")
+            a = {**a, "status": body.status, "resolvedAt": datetime.now(timezone.utc).isoformat()}
+            found = True
+        new_list.append(a)
+    if not found:
+        raise HTTPException(status_code=404, detail="Approval not found")
+
+    ticket.approvals = new_list
+    ticket.updated_at = datetime.now(timezone.utc)
+
+    # The approval request is resolved — mark its pinned notification(s) read.
+    await db.execute(
+        update(Notification)
+        .where(
+            Notification.user_id == current_user.id,
+            Notification.ticket_id == ticket.id,
+            Notification.is_approval == True,  # noqa: E712
+        )
+        .values(read=True)
+    )
+    await db.flush()
+
     full = await _get_ticket_or_404(ticket_id, db)
     _inject_empty_attachments(full)
     return TicketOut.model_validate(full)

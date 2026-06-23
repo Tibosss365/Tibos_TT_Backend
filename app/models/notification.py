@@ -40,6 +40,11 @@ class Notification(Base):
         default=NotificationType.info,
     )
     read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Approval-request notifications are pinned/priority: they sort above other
+    # notifications and survive the "Clear" action (which only clears regular ones).
+    is_approval: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

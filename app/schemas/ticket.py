@@ -249,6 +249,11 @@ class TicketDataUpdate(BaseModel):
     items: list[dict]
 
 
+class ApprovalDecision(BaseModel):
+    """Approve / reject a single approval request from the notification bar."""
+    status: str  # 'approved' | 'rejected'
+
+
 class PaginatedTickets(BaseModel):
     items: list[TicketListOut]
     total: int

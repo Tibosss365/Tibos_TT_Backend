@@ -12,6 +12,7 @@ class NotificationOut(BaseModel):
     text: str
     type: NotificationType
     read: bool
+    is_approval: bool = False
     created_at: datetime
 
     model_config = {"from_attributes": True}
