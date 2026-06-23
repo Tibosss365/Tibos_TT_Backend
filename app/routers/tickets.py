@@ -923,8 +923,14 @@ async def update_ticket(
     await db.flush()
     full = await _get_ticket_or_404(ticket_id, db)
 
+    # A real status transition (not a redundant re-save of the same status).
+    # Side-effects below (emails, CSAT, resolve notification) must fire ONCE per
+    # actual change — guarding on this prevents duplicate emails when the client
+    # sends the same status more than once.
+    status_changed = "status" in update_data and update_data["status"] != old_status
+
     # Notify on resolve + send CSAT survey
-    if "status" in update_data and update_data["status"] == TicketStatus.resolved:
+    if status_changed and update_data["status"] == TicketStatus.resolved:
         admins = await _get_admins(db)
         await notify_ticket_resolved(db, full, current_user.name, None, admins)
         try:
@@ -936,7 +942,7 @@ async def update_ticket(
             logger.warning(f"[CSAT] Survey dispatch failed: {_ce}")
 
     # ── Email: status-change notifications to submitter ──────────────────
-    if "status" in update_data and full.email:
+    if status_changed and full.email:
         new_st = update_data["status"]
         email_cfg_data: dict | None = None
         _agent = full.assignee.name if full.assignee else None
