@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.deps import get_current_user, require_admin
 from app.core.security import hash_password
@@ -106,10 +106,45 @@ async def delete_agent(
     if not user:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Deactivate (soft delete) rather than hard-delete: a user with assigned
-    # tickets, timeline entries or notifications can't be removed without
-    # breaking those foreign-key references (the hard delete silently rolled
-    # back, so the agent kept reappearing). Deactivating hides them from the
-    # Current Agents list and all assignee pickers, and frees the login.
-    user.is_active = False
+    # ── Permanent (hard) delete ───────────────────────────────────────────────
+    # The agent may be referenced by tickets (assignee/requester), timeline
+    # authors, notifications, sessions, etc. The prod schema predates the
+    # migration chain, so its actual ON DELETE rules can't be trusted — a plain
+    # DELETE raises a foreign-key violation and rolls back (which is why the
+    # agent kept reappearing). So we introspect *every* FK that points at
+    # users.id and detach those rows first: nullable columns are set NULL
+    # (e.g. a ticket just becomes unassigned), non-nullable columns have their
+    # rows deleted (e.g. notifications, login sessions). Then the user row is
+    # removed for good.
+    refs = await db.execute(text("""
+        SELECT tc.table_name, kcu.column_name, col.is_nullable
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema   = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+          ON tc.constraint_name = ccu.constraint_name
+         AND tc.table_schema   = ccu.table_schema
+        JOIN information_schema.columns col
+          ON col.table_schema = tc.table_schema
+         AND col.table_name   = tc.table_name
+         AND col.column_name  = kcu.column_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND ccu.table_name  = 'users'
+          AND ccu.column_name = 'id'
+    """))
+
+    for table_name, column_name, is_nullable in refs.fetchall():
+        if is_nullable == 'YES':
+            await db.execute(
+                text(f'UPDATE "{table_name}" SET "{column_name}" = NULL WHERE "{column_name}" = :uid::uuid'),
+                {"uid": str(agent_id)},
+            )
+        else:
+            await db.execute(
+                text(f'DELETE FROM "{table_name}" WHERE "{column_name}" = :uid::uuid'),
+                {"uid": str(agent_id)},
+            )
+
+    await db.delete(user)
     await db.flush()
