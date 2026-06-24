@@ -137,12 +137,12 @@ async def delete_agent(
     for table_name, column_name, is_nullable in refs.fetchall():
         if is_nullable == 'YES':
             await db.execute(
-                text(f'UPDATE "{table_name}" SET "{column_name}" = NULL WHERE "{column_name}" = :uid::uuid'),
+                text(f'UPDATE "{table_name}" SET "{column_name}" = NULL WHERE "{column_name}" = CAST(:uid AS uuid)'),
                 {"uid": str(agent_id)},
             )
         else:
             await db.execute(
-                text(f'DELETE FROM "{table_name}" WHERE "{column_name}" = :uid::uuid'),
+                text(f'DELETE FROM "{table_name}" WHERE "{column_name}" = CAST(:uid AS uuid)'),
                 {"uid": str(agent_id)},
             )
 
