@@ -106,4 +106,10 @@ async def delete_agent(
     if not user:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    await db.delete(user)
+    # Deactivate (soft delete) rather than hard-delete: a user with assigned
+    # tickets, timeline entries or notifications can't be removed without
+    # breaking those foreign-key references (the hard delete silently rolled
+    # back, so the agent kept reappearing). Deactivating hides them from the
+    # Current Agents list and all assignee pickers, and frees the login.
+    user.is_active = False
+    await db.flush()
