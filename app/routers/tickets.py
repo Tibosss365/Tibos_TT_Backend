@@ -862,6 +862,18 @@ async def update_ticket(
             )
             db.add(resolve_entry)
 
+            # Surface the resolution note in the conversation so the whole
+            # thread shows what the resolution was (it's also included in the
+            # "resolved" email sent to the customer).
+            res_note = (update_data.get("resolution") or ticket.resolution or "").strip()
+            if res_note:
+                db.add(TicketTimeline(
+                    ticket_id=ticket.id,
+                    type=TimelineType.comment,
+                    text=f"<strong>Resolution:</strong> {res_note}",
+                    author_id=current_user.id,
+                ))
+
     if "assignee_id" in update_data and update_data["assignee_id"] != old_assignee_id:
         new_assignee_id = update_data["assignee_id"]
 
