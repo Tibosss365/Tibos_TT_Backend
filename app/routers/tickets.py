@@ -2,6 +2,7 @@ import csv
 import io
 import logging
 import math
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -48,6 +49,30 @@ from app.services.notification_service import (
     notify_ticket_resolved,
 )
 from app.services.email_sender import send_ticket_email
+
+
+def _plain_text_preview(raw: str, max_lines: int = 15, max_chars: int = 800):
+    """Turn a (possibly HTML / email-trail) description into a short plain-text
+    preview for customer-facing emails — strips tags, images and base64 noise,
+    keeps the first few meaningful lines. Returns (preview, truncated)."""
+    if not raw:
+        return "", False
+    s = re.sub(r"<!--.*?-->", " ", raw, flags=re.S)
+    s = re.sub(r"<(style|script)[\s\S]*?</\1>", " ", s, flags=re.I)
+    s = re.sub(r"<img[^>]*>", " ", s, flags=re.I)            # drop images / data URIs
+    s = re.sub(r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)                            # strip remaining tags
+    for ent, ch in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&#39;", "'"), ("&quot;", '"')):
+        s = s.replace(ent, ch)
+    lines = [ln.strip() for ln in s.splitlines()]
+    lines = [ln for ln in lines if ln]
+    truncated = len(lines) > max_lines
+    lines = lines[:max_lines]
+    preview = "\n".join(lines)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars].rstrip()
+        truncated = True
+    return preview, truncated
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 logger = logging.getLogger("uvicorn.error")
@@ -514,11 +539,14 @@ async def create_ticket(
     if full.email:
         description_block = ""
         if full.description:
-            safe_desc = full.description.replace("<", "&lt;").replace(">", "&gt;")
-            description_block = (
-                f"<p><strong>Description:</strong><br/>"
-                f"<span style='white-space:pre-wrap;color:#374151'>{safe_desc}</span></p>"
-            )
+            preview, truncated = _plain_text_preview(full.description, max_lines=15)
+            if preview:
+                safe_preview = preview.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                more = "<br/><em style='color:#6b7280'>… see the full details in your ticket.</em>" if truncated else ""
+                description_block = (
+                    f"<p><strong>Description:</strong><br/>"
+                    f"<span style='white-space:pre-wrap;color:#374151'>{safe_preview}</span>{more}</p>"
+                )
         email_body = (
             f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
             f"<p>Your support request has been received. Here are the details:</p>"
