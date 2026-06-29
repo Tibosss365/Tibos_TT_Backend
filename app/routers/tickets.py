@@ -51,10 +51,16 @@ from app.services.notification_service import (
 from app.services.email_sender import send_ticket_email
 
 
-def _plain_text_preview(raw: str, max_lines: int = 15, max_chars: int = 800):
+# Markers where a quoted reply trail begins — we keep only the first message.
+_TRAIL_RE = re.compile(
+    r"\n\s*(from:\s|sent:\s|-{3,}\s*original message|on .{0,80}\bwrote:)", re.I
+)
+
+def _plain_text_preview(raw: str, max_lines: int = 25, max_chars: int = 1500):
     """Turn a (possibly HTML / email-trail) description into a short plain-text
-    preview for customer-facing emails — strips tags, images and base64 noise,
-    keeps the first few meaningful lines. Returns (preview, truncated)."""
+    preview for customer-facing emails: strips tags/images/base64 noise, drops
+    the external-email caution banner, keeps only the FIRST message (before any
+    quoted reply trail) and caps it to a few lines. Returns (preview, truncated)."""
     if not raw:
         return "", False
     s = re.sub(r"<!--.*?-->", " ", raw, flags=re.S)
@@ -64,9 +70,21 @@ def _plain_text_preview(raw: str, max_lines: int = 15, max_chars: int = 800):
     s = re.sub(r"<[^>]+>", " ", s)                            # strip remaining tags
     for ent, ch in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&#39;", "'"), ("&quot;", '"')):
         s = s.replace(ent, ch)
+
+    # Remove the external-email caution banner.
+    s = re.sub(r"\bcaution\b[\s\S]{0,400}?\bit department\b\.?", " ", s, flags=re.I)
+
+    # Keep only the first conversation — cut at the start of any quoted trail.
+    cut = _TRAIL_RE.search("\n" + s)
+    if cut:
+        s = ("\n" + s)[: cut.start()]
+        trail_cut = True
+    else:
+        trail_cut = False
+
     lines = [ln.strip() for ln in s.splitlines()]
     lines = [ln for ln in lines if ln]
-    truncated = len(lines) > max_lines
+    truncated = trail_cut or len(lines) > max_lines
     lines = lines[:max_lines]
     preview = "\n".join(lines)
     if len(preview) > max_chars:
@@ -539,13 +557,16 @@ async def create_ticket(
     if full.email:
         description_block = ""
         if full.description:
-            preview, truncated = _plain_text_preview(full.description, max_lines=15)
+            preview, truncated = _plain_text_preview(full.description, max_lines=25)
             if preview:
-                safe_preview = preview.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                more = "<br/><em style='color:#6b7280'>… see the full details in your ticket.</em>" if truncated else ""
+                safe_preview = (
+                    preview.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    .replace("\n", "<br/>")
+                )
+                more = "<br/>……" if truncated else ""
                 description_block = (
                     f"<p><strong>Description:</strong><br/>"
-                    f"<span style='white-space:pre-wrap;color:#374151'>{safe_preview}</span>{more}</p>"
+                    f"<span style='color:#374151'>{safe_preview}</span>{more}</p>"
                 )
         email_body = (
             f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
