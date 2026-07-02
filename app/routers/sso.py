@@ -167,7 +167,11 @@ async def sso_login(db: AsyncSession = Depends(get_db)):
     if not cfg.enabled:
         raise HTTPException(status_code=400, detail="SSO is not enabled")
     if not cfg.client_id or not cfg.redirect_uri:
-        raise HTTPException(status_code=400, detail="SSO is not fully configured")
+        raise HTTPException(status_code=400, detail="SSO is not fully configured (Client ID / Redirect URI)")
+    if cfg.provider == "microsoft" and not cfg.tenant_id:
+        raise HTTPException(status_code=400, detail="SSO is not fully configured (Tenant ID)")
+    if cfg.provider == "custom" and not (cfg.authorization_endpoint and cfg.token_endpoint and cfg.jwks_uri and cfg.issuer):
+        raise HTTPException(status_code=400, detail="SSO is not fully configured (custom OIDC endpoints)")
 
     eps = (
         _microsoft_endpoints(cfg.tenant_id)
