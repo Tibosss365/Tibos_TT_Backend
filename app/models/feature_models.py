@@ -205,6 +205,9 @@ class Asset(Base):
     purchase_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     warranty_expiry: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

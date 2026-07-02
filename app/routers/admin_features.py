@@ -13,7 +13,7 @@ Admin feature endpoints — CRUD for:
 """
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -342,8 +342,41 @@ async def list_assets(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(Asset).order_by(Asset.created_at.desc()))
+    result = await db.execute(
+        select(Asset).where(Asset.is_deleted == False).order_by(Asset.created_at.desc())  # noqa: E712
+    )
     return result.scalars().all()
+
+
+@router.get("/admin/assets/history")
+async def all_asset_history(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Global history across all assets (including deleted ones) — created,
+    assigned, reassigned, unassigned and deleted events, newest first."""
+    rows = (await db.execute(
+        select(AssetHistory, Asset.name, Asset.asset_tag)
+        .join(Asset, Asset.id == AssetHistory.asset_id, isouter=True)
+        .order_by(AssetHistory.created_at.desc())
+        .limit(500)
+    )).all()
+    return [
+        {
+            "id": str(h.id),
+            "asset_id": str(h.asset_id) if h.asset_id else None,
+            "asset_name": aname,
+            "asset_tag": atag,
+            "action": h.action,
+            "assigned_to_name": h.assigned_to_name,
+            "assigned_to_email": h.assigned_to_email,
+            "employee_code": h.employee_code,
+            "note": h.note,
+            "changed_by_name": h.changed_by_name,
+            "created_at": h.created_at.isoformat(),
+        }
+        for h, aname, atag in rows
+    ]
 
 
 @router.post("/admin/assets", response_model=AssetOut, status_code=201)
@@ -355,9 +388,19 @@ async def create_asset(
     obj = Asset(**body.model_dump())
     db.add(obj)
     await db.flush()
-    _record_assignment_history(
-        db, obj, prev_name=None, prev_email=None, changed_by=current_user
-    )
+    # Always log the creation (with the initial assignee, if any).
+    note = "Asset created"
+    if obj.assigned_to_name or obj.assigned_to_email:
+        note += f" — assigned to {obj.assigned_to_name or obj.assigned_to_email}"
+    db.add(AssetHistory(
+        asset_id=obj.id,
+        action="created",
+        assigned_to_name=obj.assigned_to_name or None,
+        assigned_to_email=obj.assigned_to_email or None,
+        employee_code=obj.employee_code or None,
+        note=note,
+        changed_by_name=current_user.name,
+    ))
     await db.commit()
     await db.refresh(obj)
     return obj
@@ -406,11 +449,23 @@ async def asset_history(
 @router.delete("/admin/assets/{id}", status_code=204)
 async def delete_asset(
     id: uuid.UUID,
+    reason: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     obj = await _get_or_404(Asset, id, db)
-    await db.delete(obj)
+    # Soft delete so the assignment history survives (asset_history cascades on
+    # a hard delete). The reason is recorded in the history.
+    obj.is_deleted = True
+    db.add(AssetHistory(
+        asset_id=obj.id,
+        action="deleted",
+        assigned_to_name=obj.assigned_to_name or None,
+        assigned_to_email=obj.assigned_to_email or None,
+        employee_code=obj.employee_code or None,
+        note=(reason.strip() if reason and reason.strip() else "Asset deleted"),
+        changed_by_name=current_user.name,
+    ))
     await db.commit()
 
 
