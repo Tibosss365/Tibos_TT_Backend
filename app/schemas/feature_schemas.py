@@ -220,6 +220,9 @@ class AssetCreate(BaseModel):
     specification: str | None = None
     os_version: str | None = Field(default=None, max_length=100)
     asset_number: str | None = Field(default=None, max_length=50)
+    processor: str | None = Field(default=None, max_length=150)
+    ram: str | None = Field(default=None, max_length=50)
+    rom: str | None = Field(default=None, max_length=50)
     status: str = "active"
     assigned_to: uuid.UUID | None = None
     assigned_to_name: str | None = Field(default=None, max_length=150)
@@ -242,6 +245,9 @@ class AssetUpdate(BaseModel):
     specification: str | None = None
     os_version: str | None = None
     asset_number: str | None = None
+    processor: str | None = None
+    ram: str | None = None
+    rom: str | None = None
     status: str | None = None
     assigned_to: uuid.UUID | None = None
     # Empty string clears the field (unassign)
@@ -266,6 +272,9 @@ class AssetOut(BaseModel):
     specification: str | None
     os_version: str | None
     asset_number: str | None
+    processor: str | None
+    ram: str | None
+    rom: str | None
     status: str
     assigned_to: uuid.UUID | None
     assigned_to_name: str | None

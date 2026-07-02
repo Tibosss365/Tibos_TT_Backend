@@ -192,6 +192,9 @@ class Asset(Base):
     specification: Mapped[str | None] = mapped_column(Text, nullable=True)
     os_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
     asset_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    processor: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    ram: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    rom: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # active | retired | in_repair | lost
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default="active"
