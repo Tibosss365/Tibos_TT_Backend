@@ -216,6 +216,10 @@ class AssetCreate(BaseModel):
     serial_number: str | None = Field(default=None, max_length=100)
     manufacturer: str | None = Field(default=None, max_length=100)
     model: str | None = Field(default=None, max_length=100)
+    brand: str | None = Field(default=None, max_length=100)
+    specification: str | None = None
+    os_version: str | None = Field(default=None, max_length=100)
+    asset_number: str | None = Field(default=None, max_length=50)
     status: str = "active"
     assigned_to: uuid.UUID | None = None
     assigned_to_name: str | None = Field(default=None, max_length=150)
@@ -234,6 +238,10 @@ class AssetUpdate(BaseModel):
     serial_number: str | None = None
     manufacturer: str | None = None
     model: str | None = None
+    brand: str | None = None
+    specification: str | None = None
+    os_version: str | None = None
+    asset_number: str | None = None
     status: str | None = None
     assigned_to: uuid.UUID | None = None
     # Empty string clears the field (unassign)
@@ -254,6 +262,10 @@ class AssetOut(BaseModel):
     serial_number: str | None
     manufacturer: str | None
     model: str | None
+    brand: str | None
+    specification: str | None
+    os_version: str | None
+    asset_number: str | None
     status: str
     assigned_to: uuid.UUID | None
     assigned_to_name: str | None

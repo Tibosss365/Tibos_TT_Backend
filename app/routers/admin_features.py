@@ -356,7 +356,17 @@ async def all_asset_history(
     """Global history across all assets (including deleted ones) — created,
     assigned, reassigned, unassigned and deleted events, newest first."""
     rows = (await db.execute(
-        select(AssetHistory, Asset.name, Asset.asset_tag)
+        select(
+            AssetHistory,
+            Asset.name,
+            Asset.asset_tag,
+            Asset.model,
+            Asset.brand,
+            Asset.manufacturer,
+            Asset.specification,
+            Asset.os_version,
+            Asset.asset_number,
+        )
         .join(Asset, Asset.id == AssetHistory.asset_id, isouter=True)
         .order_by(AssetHistory.created_at.desc())
         .limit(500)
@@ -367,6 +377,11 @@ async def all_asset_history(
             "asset_id": str(h.asset_id) if h.asset_id else None,
             "asset_name": aname,
             "asset_tag": atag,
+            "asset_number": anumber,
+            "model": amodel,
+            "brand": abrand or amanufacturer,   # fallback to manufacturer if brand empty
+            "specification": aspec,
+            "os_version": aos_version,
             "action": h.action,
             "assigned_to_name": h.assigned_to_name,
             "assigned_to_email": h.assigned_to_email,
@@ -375,7 +390,7 @@ async def all_asset_history(
             "changed_by_name": h.changed_by_name,
             "created_at": h.created_at.isoformat(),
         }
-        for h, aname, atag in rows
+        for h, aname, atag, amodel, abrand, amanufacturer, aspec, aos_version, anumber in rows
     ]
 
 

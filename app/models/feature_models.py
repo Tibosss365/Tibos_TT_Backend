@@ -188,6 +188,10 @@ class Asset(Base):
     serial_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     manufacturer: Mapped[str | None] = mapped_column(String(100), nullable=True)
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    brand: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    specification: Mapped[str | None] = mapped_column(Text, nullable=True)
+    os_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    asset_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # active | retired | in_repair | lost
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default="active"
