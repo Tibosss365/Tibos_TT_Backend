@@ -36,6 +36,7 @@ and step 5g calls PATCH /messages/{id} {"isRead": true}.
 import asyncio
 import base64
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -295,6 +296,44 @@ async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
 # ── Ticket creation helper ────────────────────────────────────────────────────
 
 _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per attachment (kept for reference)
+
+
+# Max bytes we'll embed inline as a data URI (keeps signature logos, skips huge
+# images so the stored description doesn't balloon).
+_MAX_INLINE_EMBED_BYTES = 2 * 1024 * 1024  # 2 MB per inline image
+
+
+def _inline_cid_images(html: str, attachments: list) -> str:
+    """
+    Replace ``cid:`` image references in an HTML email body with self-contained
+    ``data:`` URIs built from the inline attachments, so the signature logos and
+    embedded images render exactly like the original email — no broken images.
+    """
+    if not html or "cid:" not in html.lower() or not attachments:
+        return html
+
+    for att in attachments:
+        content = getattr(att, "content", b"") or b""
+        cid     = (getattr(att, "content_id", "") or "").strip().strip("<>")
+        if not content or len(content) > _MAX_INLINE_EMBED_BYTES:
+            continue
+
+        ctype    = getattr(att, "content_type", "") or "image/png"
+        data_uri = f"data:{ctype};base64,{base64.b64encode(content).decode('ascii')}"
+
+        # Primary match: cid:<Content-ID>. Fallback: cid:<filename> (some clients
+        # reference inline images by their file name instead of the Content-ID).
+        keys = [k for k in (cid, getattr(att, "filename", "")) if k]
+        for key in keys:
+            # Use a replacement function so '+', '/', '=' in the base64 data URI
+            # are never interpreted as regex back-references.
+            html = re.sub(
+                r"cid:" + re.escape(key),
+                lambda _m: data_uri,
+                html,
+                flags=re.IGNORECASE,
+            )
+    return html
 
 
 def _to_raw_attachment_list(attachments: list) -> list[RawAttachment]:
@@ -755,6 +794,12 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                 if msg.get("hasAttachments")
                 else []
             )
+
+            # Embed inline images (signature logos, etc.) as data: URIs so the
+            # ticket description renders exactly like the original email instead
+            # of showing broken cid: references.
+            if body_raw.get("contentType", "").lower() == "html":
+                body_text = _inline_cid_images(body_text, graph_attachments)
 
             async with AsyncSessionLocal() as db:
                 try:

@@ -48,6 +48,7 @@ class RawAttachment:
     content: bytes
     is_inline: bool = False
     graph_attachment_id: str = ""
+    content_id: str = ""          # Content-ID for inline images (cid: references)
 
 
 # ── Low-level helpers ──────────────────────────────────────────────────────────
@@ -147,7 +148,7 @@ async def fetch_message_attachments(
     url = (
         f"{GRAPH_BASE}/users/{mailbox}"
         f"/messages/{msg_id}/attachments"
-        "?$select=id,name,contentType,size,contentBytes,isInline,@odata.type"
+        "?$select=id,name,contentType,size,contentBytes,isInline,contentId,@odata.type"
     )
 
     try:
@@ -185,6 +186,7 @@ async def fetch_message_attachments(
         filename     = item.get("name") or "attachment"
         content_type = item.get("contentType") or "application/octet-stream"
         size         = int(item.get("size") or 0)
+        content_id   = (item.get("contentId") or "").strip().strip("<>")
 
         if size > MAX_ATTACHMENT_BYTES:
             logger.info(
@@ -227,6 +229,7 @@ async def fetch_message_attachments(
                 content=content,
                 is_inline=is_inline,
                 graph_attachment_id=att_id,
+                content_id=content_id,
             )
         )
 
