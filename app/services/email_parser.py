@@ -141,9 +141,38 @@ _TEXT_DISCLAIMER_PATTERNS = [
 ]
 
 
+# Document-scaffold junk that Word/Outlook injects into the HTML body: a <head>
+# full of @font-face/mso <style> rules, XML/conditional comments, meta/title tags
+# and the outer <html>/<body> wrappers. We drop all of it but keep the visible
+# content (text, signature, inline images, tables).
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_HEAD_RE    = re.compile(r"<head\b[^>]*>.*?</head>", re.IGNORECASE | re.DOTALL)
+_HTML_STYLE_RE   = re.compile(r"<style\b[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
+_HTML_TITLE_RE   = re.compile(r"<title\b[^>]*>.*?</title>", re.IGNORECASE | re.DOTALL)
+_HTML_META_RE    = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_HTML_XML_RE     = re.compile(r"<\?xml[^>]*>", re.IGNORECASE)
+# Unwrap the outer document shells — keep whatever is inside them.
+_HTML_WRAP_RE    = re.compile(r"</?(?:html|body|head)\b[^>]*>", re.IGNORECASE)
+
+
 def _strip_html_disclaimers(html: str) -> str:
-    """Remove Outlook caution blocks from raw HTML before plain-text conversion."""
-    return _HTML_DISCLAIMER_RE.sub("", html)
+    """
+    Clean a raw Outlook/Word HTML email body for storage and display.
+
+    Removes the external-email caution banner AND the document scaffolding Word
+    injects — the whole <head> (with its @font-face/mso <style> rules), XML and
+    conditional comments, meta/title tags and the <html>/<body> wrappers — while
+    preserving the visible content: text, signature, inline images and tables.
+    """
+    html = _HTML_HEAD_RE.sub("", html)        # drop the entire <head> block
+    html = _HTML_COMMENT_RE.sub("", html)     # any stray <!-- … --> in the body
+    html = _HTML_STYLE_RE.sub("", html)       # stray <style> outside <head>
+    html = _HTML_TITLE_RE.sub("", html)
+    html = _HTML_META_RE.sub("", html)
+    html = _HTML_XML_RE.sub("", html)
+    html = _HTML_DISCLAIMER_RE.sub("", html)  # external-email caution banner
+    html = _HTML_WRAP_RE.sub("", html)        # unwrap <html>/<body> shells
+    return html.strip()
 
 
 def _strip_disclaimers(text: str) -> str:
