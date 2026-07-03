@@ -131,8 +131,13 @@ class ReportScheduler:
             try:
                 tz = zoneinfo.ZoneInfo(tz_name)
             except Exception:
-                logger.warning("Report scheduler: invalid timezone %r — falling back to Asia/Kolkata", tz_name)
-                tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+                # tzdata may be missing on the host — try IST, then fall back to
+                # UTC so a missing timezone database can never stall reports.
+                try:
+                    tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+                except Exception:
+                    logger.warning("Report scheduler: timezone data unavailable (%r) — using UTC", tz_name)
+                    tz = timezone.utc
 
             now_tz = now_utc.astimezone(tz)
             today = now_tz.date()

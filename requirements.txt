@@ -24,3 +24,5 @@ pyotp>=2.9.0
 croniter>=2.0.0
 reportlab>=4.0.0
 qrcode[pil]>=7.4.0
+
+tzdata
