@@ -373,8 +373,12 @@ async def _process_inbound_email(
                 break
 
     if existing_ticket:
-        # Append reply as email_in timeline entry on the existing ticket
-        safe_body = body[:2000].replace("<", "&lt;").replace(">", "&gt;")
+        # Append reply as email_in timeline entry on the existing ticket.
+        # `body` may be HTML now — flatten to text for the timeline (which
+        # injects text as HTML) so we don't leak raw email markup/styles.
+        from app.services.email_parser import _strip_html
+        reply_text = _strip_html(body) if ("<" in body and ">" in body) else body
+        safe_body = reply_text[:2000].replace("<", "&lt;").replace(">", "&gt;")
         db.add(TicketTimeline(
             ticket_id=existing_ticket.id,
             type=TimelineType.email_in,
@@ -715,8 +719,11 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
             body_raw   = msg.get("body", {})
             body_text  = body_raw.get("content", "")
             if body_raw.get("contentType", "").lower() == "html":
-                from app.services.email_parser import _strip_html, _strip_html_disclaimers, _strip_disclaimers
-                body_text = _strip_disclaimers(_strip_html(_strip_html_disclaimers(body_text)))
+                # Keep the HTML so the ticket preserves the email's structure,
+                # formatting and signature (only strip the caution/disclaimer
+                # banner). The frontend sanitises + renders it on display.
+                from app.services.email_parser import _strip_html_disclaimers
+                body_text = _strip_html_disclaimers(body_text)
             else:
                 from app.services.email_parser import _strip_disclaimers
                 body_text = _strip_disclaimers(body_text)
