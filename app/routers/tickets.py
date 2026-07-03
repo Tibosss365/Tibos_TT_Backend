@@ -855,6 +855,20 @@ async def update_ticket(
                 detail="Resolution notes are required to resolve a ticket.",
             )
 
+    # ── An agent must be assigned before a ticket can be resolved or closed ────
+    if (
+        update_data.get("status") in (TicketStatus.resolved, TicketStatus.closed)
+        and old_status not in (TicketStatus.resolved, TicketStatus.closed)
+    ):
+        effective_assignee = (
+            update_data["assignee_id"] if "assignee_id" in update_data else ticket.assignee_id
+        )
+        if not effective_assignee:
+            raise HTTPException(
+                status_code=400,
+                detail="Assign an agent before resolving or closing the ticket.",
+            )
+
     for key, val in update_data.items():
         setattr(ticket, key, val)
 
