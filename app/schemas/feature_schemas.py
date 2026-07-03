@@ -232,6 +232,7 @@ class AssetCreate(BaseModel):
     purchase_date: str | None = None   # ISO date string YYYY-MM-DD
     warranty_expiry: str | None = None  # ISO date string YYYY-MM-DD
     notes: str | None = None
+    adaptor_status: str = "not_provided"  # not_provided | provided | replaced
 
 
 class AssetUpdate(BaseModel):
@@ -258,6 +259,7 @@ class AssetUpdate(BaseModel):
     purchase_date: str | None = None
     warranty_expiry: str | None = None
     notes: str | None = None
+    adaptor_status: str | None = None
 
 
 class AssetOut(BaseModel):
@@ -284,6 +286,7 @@ class AssetOut(BaseModel):
     purchase_date: Any | None  # date or None
     warranty_expiry: Any | None
     notes: str | None
+    adaptor_status: str = "not_provided"
     created_at: datetime
 
     @field_serializer("created_at", when_used="json")

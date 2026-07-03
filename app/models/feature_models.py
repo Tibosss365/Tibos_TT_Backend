@@ -212,6 +212,10 @@ class Asset(Base):
     purchase_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     warranty_expiry: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Laptop adaptor: not_provided | provided | replaced
+    adaptor_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="not_provided", server_default="not_provided"
+    )
     is_deleted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
