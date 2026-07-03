@@ -7,6 +7,7 @@ Handles:
   - Prefers text/plain; falls back to HTML-stripped text/html
   - Safe filename sanitisation on attachments (metadata only, not stored)
 """
+import base64
 import email
 import email.policy
 import quopri
@@ -215,6 +216,72 @@ def _get_body(msg: email.message.Message) -> str:
     return ""
 
 
+# ── HTML body extraction (keeps structure, signature & inline images) ───────────
+
+_MAX_INLINE_EMBED_BYTES = 2 * 1024 * 1024  # 2 MB per inline image
+
+
+def _collect_inline_images(msg: email.message.Message) -> dict[str, tuple[str, bytes]]:
+    """
+    Map an inline image's Content-ID (and filename) → (content_type, raw_bytes),
+    so cid: references in the HTML body can be rewritten to data: URIs.
+    """
+    images: dict[str, tuple[str, bytes]] = {}
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if not ctype.startswith("image/"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes) or not payload:
+            continue
+        if len(payload) > _MAX_INLINE_EMBED_BYTES:
+            continue
+        cid  = (part.get("Content-ID") or "").strip().strip("<>")
+        name = part.get_filename() or ""
+        if cid:
+            images[cid.lower()] = (ctype, payload)
+        if name:
+            images[name.lower()] = (ctype, payload)
+    return images
+
+
+def _get_html_body(msg: email.message.Message) -> str:
+    """
+    Return the email's HTML body — cleaned of Word/Outlook scaffolding and with
+    inline cid: images embedded as data: URIs — so the ticket preserves the
+    original structure, formatting and signature. Returns "" when there is no
+    HTML part (caller then falls back to the plain-text body).
+    """
+    html_parts: list[str] = []
+    for part in msg.walk():
+        if part.get_content_type() != "text/html":
+            continue
+        if "attachment" in str(part.get("Content-Disposition") or ""):
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        payload = part.get_payload(decode=True)
+        if isinstance(payload, bytes):
+            html_parts.append(payload.decode(charset, errors="replace"))
+
+    if not html_parts:
+        return ""
+
+    html = _strip_html_disclaimers("\n".join(html_parts))
+
+    if "cid:" in html.lower():
+        for key, (ctype, raw) in _collect_inline_images(msg).items():
+            data_uri = f"data:{ctype};base64,{base64.b64encode(raw).decode('ascii')}"
+            # Replacement function → base64's '+', '/', '=' are never treated as
+            # regex back-references.
+            html = re.sub(
+                r"cid:" + re.escape(key),
+                lambda _m: data_uri,
+                html,
+                flags=re.IGNORECASE,
+            )
+    return html.strip()
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def parse_raw_email(raw: bytes) -> ParsedEmail:
@@ -257,8 +324,9 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
     in_reply_to = (msg.get("In-Reply-To") or "").strip()
     references  = (msg.get("References")  or "").strip()
 
-    # Body
-    body = _strip_disclaimers(_get_body(msg))
+    # Body — prefer the HTML body (keeps structure, signature and inline images);
+    # fall back to the plain-text body only when the email has no HTML part.
+    body = _get_html_body(msg) or _strip_disclaimers(_get_body(msg))
 
     # Attachments
     attachments = _get_attachments(msg)
