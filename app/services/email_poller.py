@@ -857,8 +857,10 @@ class EmailPoller:
             except Exception as e:
                 logger.error(f"EmailPoller loop error: {e}")
 
+            # interval == 0 → near real-time mode (poll every 30 seconds)
+            sleep_secs = 30 if interval == 0 else interval * 60
             try:
-                await asyncio.sleep(interval * 60)
+                await asyncio.sleep(sleep_secs)
             except asyncio.CancelledError:
                 break
 

@@ -58,7 +58,7 @@ class InboundEmailConfigUpdate(BaseModel):
     default_assignee_id: Union[uuid.UUID, str, None] = None
 
     # ── Polling ──────────────────────────────────────────────────────────────
-    poll_interval_minutes: int | None = Field(None, ge=1, le=1440)
+    poll_interval_minutes: int | None = Field(None, ge=0, le=1440)  # 0 = near real-time (~30s)
     mark_seen: bool | None = None
     move_to_folder: str | None = None
 
