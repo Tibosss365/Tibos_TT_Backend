@@ -26,6 +26,7 @@ Public API
 
 import asyncio
 import logging
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, String
@@ -67,6 +68,24 @@ def _pause_statuses(cfg: SLAConfig | None) -> set[str]:
     if cfg and cfg.pause_on:
         return set(cfg.pause_on)
     return DEFAULT_PAUSE_STATUSES
+
+
+# Business-hours are configured as naive "HH:MM" and must be interpreted in a
+# real timezone (all SLA timestamps are stored in UTC). Defaults to IST; if a
+# `timezone` column is added to SLAConfig later it is picked up automatically.
+_DEFAULT_BIZ_TZ = "Asia/Kolkata"
+
+
+def _biz_tz(cfg: SLAConfig | None) -> zoneinfo.ZoneInfo | timezone:
+    name = getattr(cfg, "timezone", None) or _DEFAULT_BIZ_TZ
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except Exception:
+        try:
+            return zoneinfo.ZoneInfo(_DEFAULT_BIZ_TZ)
+        except Exception:
+            logger.warning("SLA: timezone data unavailable (%r) — business hours will use UTC", name)
+            return timezone.utc
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -148,8 +167,11 @@ def _add_business_hours(start: datetime, hours: float, cfg: SLAConfig) -> dateti
     if work_secs_per_day <= 0 or not work_days_set:
         return _ensure_utc(start) + timedelta(hours=hours)
 
+    # Work day/hour logic runs in the business timezone (work_start/work_end are
+    # local wall-clock), then the result is converted back to UTC for storage.
+    tz = _biz_tz(cfg)
     remaining = int(hours * 3600)
-    current   = _ensure_utc(start)
+    current   = _ensure_utc(start).astimezone(tz)
     current   = _advance_to_business(current, work_days_set, open_td, close_td, ws_h, ws_m)
 
     while remaining > 0:
@@ -176,7 +198,7 @@ def _add_business_hours(start: datetime, hours: float, cfg: SLAConfig) -> dateti
             )
             current = _advance_to_business(next_open, work_days_set, open_td, close_td, ws_h, ws_m)
 
-    return current
+    return current.astimezone(timezone.utc)
 
 
 def _business_hours_elapsed(start: datetime, end: datetime, cfg: SLAConfig) -> float:
@@ -192,9 +214,11 @@ def _business_hours_elapsed(start: datetime, end: datetime, cfg: SLAConfig) -> f
     if work_secs_per_day <= 0 or not work_days_set:
         return (end - start).total_seconds() / 3600.0
 
+    # Count within the business timezone (see _add_business_hours).
+    tz = _biz_tz(cfg)
     total_secs = 0
-    current    = _ensure_utc(start)
-    end_utc    = _ensure_utc(end)
+    current    = _ensure_utc(start).astimezone(tz)
+    end_utc    = _ensure_utc(end).astimezone(tz)
 
     while current < end_utc:
         tod = _time_of_day_td(current)
