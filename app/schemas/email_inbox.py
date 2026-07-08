@@ -111,6 +111,7 @@ class EmailThreadOut(_OutBase):
     is_starred: bool
     is_archived: bool
     is_spam: bool
+    is_trashed: bool = False
     message_count: int
     unread_count: int
     has_attachments: bool
@@ -128,6 +129,7 @@ class EmailThreadUpdate(BaseModel):
     is_starred: bool | None = None
     is_archived: bool | None = None
     is_spam: bool | None = None
+    is_trashed: bool | None = None
     ticket_id: uuid.UUID | None = None
 
 

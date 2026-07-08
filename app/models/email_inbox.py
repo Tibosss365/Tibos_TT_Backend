@@ -87,6 +87,7 @@ class EmailThread(Base):
     is_starred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     is_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_trashed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     unread_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     has_attachments: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

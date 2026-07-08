@@ -180,6 +180,8 @@ async def list_threads(
     is_starred: bool | None = None,
     is_archived: bool | None = None,
     is_spam: bool | None = None,
+    is_trashed: bool | None = None,
+    has_outbound: bool | None = None,   # "Sent" folder: threads the team has replied in
     ticket_id: uuid.UUID | None = None,
     search: str | None = None,
     db: AsyncSession = Depends(get_db),
@@ -199,6 +201,18 @@ async def list_threads(
         query = query.where(EmailThread.is_archived.is_(is_archived))
     if is_spam is not None:
         query = query.where(EmailThread.is_spam.is_(is_spam))
+    if is_trashed is not None:
+        query = query.where(EmailThread.is_trashed.is_(is_trashed))
+    if has_outbound is not None:
+        outbound_exists = (
+            select(EmailMessage.id)
+            .where(
+                EmailMessage.thread_id == EmailThread.id,
+                EmailMessage.direction == "outbound",
+            )
+            .exists()
+        )
+        query = query.where(outbound_exists if has_outbound else ~outbound_exists)
     if ticket_id is not None:
         query = query.where(EmailThread.ticket_id == ticket_id)
     if search:

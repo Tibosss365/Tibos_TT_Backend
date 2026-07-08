@@ -84,6 +84,7 @@ class TicketUpdate(BaseModel):
     asset: str | None = None
     description: str | None = None
     resolution: str | None = None
+    hold_reason: str | None = None
     group_id: str | None = None
     source: str | None = None
     tags: list[str] | None = None
@@ -101,6 +102,7 @@ class TicketOut(TicketBase):
     assignee: UserPublic | None = None
     requester_id: uuid.UUID | None = None
     resolution: str | None = None
+    hold_reason: str | None = None
     # ── JSONB sub-documents ──────────────────────────────────────────────
     tasks:     list[dict] = []
     work_log:  list[dict] = []
@@ -174,6 +176,7 @@ class TicketListOut(BaseModel):
     email: str = ""
     description: str = ""
     resolution: str | None = None
+    hold_reason: str | None = None
     # group + assignee — required by normalizeTicket() and dashboard group/agent filter
     group_id: str | None = None
     assignee_id: uuid.UUID | None = None
