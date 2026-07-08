@@ -29,8 +29,9 @@ Flow (IMAP)
 Flow (Graph)
 ────────────
 Same as above but steps 2-4 use httpx to call
-  GET /users/{mailbox}/mailFolders/inbox/messages?$filter=isRead eq false
-and step 5g calls PATCH /messages/{id} {"isRead": true}.
+  GET /users/{mailbox}/mailFolders/inbox/messages?$filter=receivedDateTime ge {cutoff}
+(read-state-independent, so human-opened emails still convert; deduped by
+Message-ID) and step 5g calls PATCH /messages/{id} {"isRead": true}.
 """
 
 import asyncio
@@ -65,6 +66,14 @@ from app.services.attachment_service import process_all_attachments
 from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
+
+# ── Graph fetch window (read-state-independent) ────────────────────────────────
+# The Graph poller fetches messages by receivedDateTime instead of "unread only",
+# so emails a human opens in Outlook (marking them read) still become tickets.
+# Duplicates are prevented by the Message-ID dedup in EmailTicketLog.
+_POLL_OVERLAP_MIN = 5          # re-scan a small overlap so nothing slips between polls
+_POLL_MAX_LOOKBACK_HOURS = 24  # safety cap: a long outage can never backfill the whole mailbox
+_POLL_FIRST_RUN_HOURS = 1      # if never polled before, only look back this far
 
 
 # ── Filter rules ──────────────────────────────────────────────────────────────
@@ -223,14 +232,24 @@ async def _get_m365_graph_token(cfg: EmailConfig, db: AsyncSession) -> str:
 
 # ── Graph API helpers ─────────────────────────────────────────────────────────
 
-async def _graph_get_unread(
-    mailbox: str, token: str
+async def _graph_get_recent(
+    mailbox: str, token: str, since_iso: str
 ) -> list[dict]:
+    """
+    Fetch inbox messages received at/after ``since_iso`` (ISO-8601 UTC, e.g.
+    '2026-07-08T10:00:00Z'), regardless of read/unread state, oldest first.
+
+    Deliberately NOT filtered on isRead: staff who open the shared mailbox in
+    Outlook mark messages read, and an unread-only filter would then skip them
+    forever. The Message-ID dedup in _process_inbound_email prevents duplicates
+    when the overlap window re-returns an already-processed message.
+    """
     url = (
         f"https://graph.microsoft.com/v1.0/users/{mailbox}"
         "/mailFolders/inbox/messages"
-        "?$filter=isRead eq false"
-        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments"
+        f"?$filter=receivedDateTime ge {since_iso}"
+        "&$orderby=receivedDateTime asc"
+        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
         "&$top=50"
     )
     async with httpx.AsyncClient() as client:
@@ -746,8 +765,24 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
     if not mailbox:
         raise RuntimeError("Shared mailbox address not configured — fill it in and save.")
 
-    messages = await _graph_get_unread(mailbox, access_token)
-    logger.info(f"Graph poller: found {len(messages)} unread message(s)")
+    # Fetch by received-time window (read-state-independent) so human-opened
+    # emails still convert. Clamp the look-back so a long outage can never
+    # backfill the whole mailbox; Message-ID dedup handles overlap re-fetches.
+    now = datetime.now(timezone.utc)
+    last = inbound.last_polled_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if last is not None:
+        cutoff = max(
+            last - timedelta(minutes=_POLL_OVERLAP_MIN),
+            now - timedelta(hours=_POLL_MAX_LOOKBACK_HOURS),
+        )
+    else:
+        cutoff = now - timedelta(hours=_POLL_FIRST_RUN_HOURS)
+    since_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    messages = await _graph_get_recent(mailbox, access_token, since_iso)
+    logger.info(f"Graph poller: found {len(messages)} message(s) since {since_iso}")
 
     for msg in messages:
         try:
