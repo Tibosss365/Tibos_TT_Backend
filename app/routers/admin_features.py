@@ -22,7 +22,7 @@ from app.database import get_db
 from app.models.feature_models import (
     CustomField, TicketTemplate, AutomationRule, WebhookConfig,
     NotificationChannel, Asset, AssetHistory, EscalationRule, RecurringTicketTemplate,
-    PortalBranding,
+    PortalBranding, TicketConfigItem,
 )
 from app.models.user import User
 from app.schemas.feature_schemas import (
@@ -35,6 +35,7 @@ from app.schemas.feature_schemas import (
     EscalationRuleCreate, EscalationRuleUpdate, EscalationRuleOut,
     RecurringTicketTemplateCreate, RecurringTicketTemplateUpdate, RecurringTicketTemplateOut,
     PortalBrandingUpdate, PortalBrandingOut,
+    TicketConfigItemCreate, TicketConfigItemUpdate, TicketConfigItemOut,
 )
 from app.schemas.user import TOTPSetupOut, TOTPVerifyRequest, TOTPVerifyResponse, TOTPDisableRequest, UserSettingsUpdate, UserOut
 
@@ -55,6 +56,96 @@ def _apply_updates(obj, data: dict) -> None:
     for k, v in data.items():
         if v is not None:
             setattr(obj, k, v)
+
+
+# ── Ticket config items (hold reasons / resolution codes / canned responses) ───
+# Backend-backed, shared across all agents/browsers (replaces the old
+# localStorage-only lists). GET is open to any authenticated agent; writes
+# require admin.
+
+async def _list_config(kind: str, db: AsyncSession):
+    result = await db.execute(
+        select(TicketConfigItem)
+        .where(TicketConfigItem.kind == kind)
+        .order_by(TicketConfigItem.sort_order, TicketConfigItem.created_at)
+    )
+    return result.scalars().all()
+
+
+async def _create_config(kind: str, body: TicketConfigItemCreate, db: AsyncSession):
+    obj = TicketConfigItem(kind=kind, label=body.label, body=body.body, sort_order=body.sort_order)
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+async def _update_config(id_: uuid.UUID, body: TicketConfigItemUpdate, db: AsyncSession):
+    obj = await _get_or_404(TicketConfigItem, id_, db)
+    _apply_updates(obj, body.model_dump(exclude_none=True))
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+async def _delete_config(id_: uuid.UUID, db: AsyncSession):
+    obj = await _get_or_404(TicketConfigItem, id_, db)
+    await db.delete(obj)
+    await db.commit()
+
+
+# --- Hold reasons ---
+@router.get("/admin/hold-reasons", response_model=list[TicketConfigItemOut])
+async def list_hold_reasons(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    return await _list_config("hold_reason", db)
+
+@router.post("/admin/hold-reasons", response_model=TicketConfigItemOut, status_code=201)
+async def create_hold_reason(body: TicketConfigItemCreate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _create_config("hold_reason", body, db)
+
+@router.put("/admin/hold-reasons/{id}", response_model=TicketConfigItemOut)
+async def update_hold_reason(id: uuid.UUID, body: TicketConfigItemUpdate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _update_config(id, body, db)
+
+@router.delete("/admin/hold-reasons/{id}", status_code=204)
+async def delete_hold_reason(id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    await _delete_config(id, db)
+
+
+# --- Resolution codes ---
+@router.get("/admin/resolution-codes", response_model=list[TicketConfigItemOut])
+async def list_resolution_codes(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    return await _list_config("resolution_code", db)
+
+@router.post("/admin/resolution-codes", response_model=TicketConfigItemOut, status_code=201)
+async def create_resolution_code(body: TicketConfigItemCreate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _create_config("resolution_code", body, db)
+
+@router.put("/admin/resolution-codes/{id}", response_model=TicketConfigItemOut)
+async def update_resolution_code(id: uuid.UUID, body: TicketConfigItemUpdate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _update_config(id, body, db)
+
+@router.delete("/admin/resolution-codes/{id}", status_code=204)
+async def delete_resolution_code(id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    await _delete_config(id, db)
+
+
+# --- Canned responses ---
+@router.get("/admin/canned-responses", response_model=list[TicketConfigItemOut])
+async def list_canned_responses(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    return await _list_config("canned_response", db)
+
+@router.post("/admin/canned-responses", response_model=TicketConfigItemOut, status_code=201)
+async def create_canned_response(body: TicketConfigItemCreate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _create_config("canned_response", body, db)
+
+@router.put("/admin/canned-responses/{id}", response_model=TicketConfigItemOut)
+async def update_canned_response(id: uuid.UUID, body: TicketConfigItemUpdate, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    return await _update_config(id, body, db)
+
+@router.delete("/admin/canned-responses/{id}", status_code=204)
+async def delete_canned_response(id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
+    await _delete_config(id, db)
 
 
 # ── Custom Fields ─────────────────────────────────────────────────────────────

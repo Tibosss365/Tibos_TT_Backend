@@ -130,6 +130,46 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Group seeding failed: {e}")
 
+    # 2c. Seed default ticket config items (hold reasons / resolution codes /
+    #     canned responses) — shared, backend-stored. Seeds per-kind only when
+    #     that kind has no rows yet, so admin edits are never overwritten.
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.feature_models import TicketConfigItem
+        _CR_BODY = {
+            "Password Reset Instructions": 'Hi {contact_name},\n\nTo reset your password:\n1. Go to the login page\n2. Click "Forgot Password"\n3. Enter your email address\n4. Check your email for the reset link\n\nBest regards,\n{agent_name}',
+            "Ticket Acknowledged": 'Hi {contact_name},\n\nThank you for contacting us. We have received your request (#{ticket_id}) and our team is reviewing it. We will keep you updated on progress.\n\nBest regards,\n{agent_name}',
+            "Request for More Information": 'Hi {contact_name},\n\nThank you for reaching out. To assist you better, could you please provide the following additional information:\n\n- \n- \n\nBest regards,\n{agent_name}',
+        }
+        DEFAULT_CONFIG_ITEMS = (
+            [("hold_reason", lbl, None) for lbl in [
+                "Waiting for Customer Response", "Waiting for Third Party / Vendor",
+                "Waiting for Parts / Hardware", "Scheduled Maintenance Window",
+                "Pending Internal Approval", "Customer Requested Delay",
+            ]]
+            + [("resolution_code", lbl, None) for lbl in [
+                "Fixed — Software Issue", "Fixed — Hardware Issue",
+                "Fixed — Configuration Change", "Fixed — Network / Connectivity",
+                "Workaround Provided", "User Training / Guidance",
+                "Third Party / Vendor Action", "No Issue Found", "Duplicate Ticket",
+            ]]
+            + [("canned_response", lbl, _CR_BODY[lbl]) for lbl in _CR_BODY]
+        )
+        async with AsyncSessionLocal() as db:
+            present = await db.execute(select(TicketConfigItem.kind).distinct())
+            kinds_present = {row[0] for row in present.all()}
+            seeded = 0
+            for i, (kind, label, body) in enumerate(DEFAULT_CONFIG_ITEMS):
+                if kind in kinds_present:
+                    continue  # this kind already has items — don't overwrite admin edits
+                db.add(TicketConfigItem(kind=kind, label=label, body=body, sort_order=i))
+                seeded += 1
+            if seeded:
+                await db.commit()
+                _log(f"[OK] Seeded {seeded} default ticket config item(s)")
+    except Exception as e:
+        _log(f"  [WARN] Ticket config seeding failed: {e}")
+
     # 3. Start email poller only if inbound email is enabled in DB
     try:
         from app.database import AsyncSessionLocal

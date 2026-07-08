@@ -52,6 +52,36 @@ class CustomFieldOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Ticket Config Items (hold reasons / resolution codes / canned responses) ───
+
+class TicketConfigItemCreate(BaseModel):
+    # kind is taken from the route path, not the request body
+    label: str = Field(..., min_length=1, max_length=255)
+    body: str | None = None
+    sort_order: int = 0
+
+
+class TicketConfigItemUpdate(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+    body: str | None = None
+    sort_order: int | None = None
+
+
+class TicketConfigItemOut(BaseModel):
+    id: uuid.UUID
+    kind: str
+    label: str
+    body: str | None = None
+    sort_order: int
+    created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def _ser(self, v: datetime | None) -> str | None:
+        return _utc_iso(v)
+
+    model_config = {"from_attributes": True}
+
+
 # ── Ticket Templates ──────────────────────────────────────────────────────────
 
 class TicketTemplateCreate(BaseModel):

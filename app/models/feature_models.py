@@ -56,6 +56,32 @@ class CustomField(Base):
     )
 
 
+class TicketConfigItem(Base):
+    """
+    Shared, backend-stored config lists used across all agents/browsers:
+      - kind = 'hold_reason'      → label only
+      - kind = 'resolution_code'  → label only
+      - kind = 'canned_response'  → label (title) + body
+    Replaces the old client-only (localStorage) lists so they're shared.
+    """
+    __tablename__ = "ticket_config_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    kind: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
 class TicketTemplate(Base):
     __tablename__ = "ticket_templates"
 
