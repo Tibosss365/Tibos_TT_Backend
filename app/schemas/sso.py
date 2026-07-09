@@ -71,3 +71,16 @@ class SSOSamlMetadataOut(BaseModel):
     login_url: str
     metadata_url: str
     xml: str          # full SP metadata XML
+
+
+class SSOSamlMetadataUpload(BaseModel):
+    """Admin uploads/pastes the IdP (Azure AD) federation metadata XML."""
+    xml: str
+
+
+class SSOSamlMetadataUploadResult(BaseModel):
+    """What the app extracted from the uploaded IdP metadata."""
+    sso_url: Optional[str] = None       # IdP SingleSignOnService URL
+    cert_found: bool = False            # signing certificate extracted?
+    entity_id: Optional[str] = None     # IdP EntityID (issuer)
+    message: str

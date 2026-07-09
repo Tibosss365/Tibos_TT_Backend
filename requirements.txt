@@ -21,6 +21,9 @@ aiohttp>=3.9.0
 # Feature additions
 anthropic>=0.69.0
 pyotp>=2.9.0
+# SAML 2.0 assertion signature verification (XML-DSIG)
+signxml>=3.2.0
+lxml>=5.0.0
 croniter>=2.0.0
 reportlab>=4.0.0
 qrcode[pil]>=7.4.0

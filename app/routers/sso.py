@@ -55,7 +55,10 @@ from app.core.security import create_access_token, hash_password
 from app.database import get_db
 from app.models.sso import SSOConfig
 from app.models.user import User, UserRole
-from app.schemas.sso import SSOConfigOut, SSOConfigUpdate, SSOPublicConfig, SSOSamlMetadataOut
+from app.schemas.sso import (
+    SSOConfigOut, SSOConfigUpdate, SSOPublicConfig, SSOSamlMetadataOut,
+    SSOSamlMetadataUpload, SSOSamlMetadataUploadResult,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -237,51 +240,57 @@ def _build_saml_authn_request(idp_sso_url: str) -> str:
     return base64.b64encode(deflated).decode("utf-8")
 
 
+def _pem_from_b64(cert_b64_text: str) -> str:
+    """Wrap a base64 DER cert body into a PEM block."""
+    b = "".join(cert_b64_text.split())
+    return (
+        "-----BEGIN CERTIFICATE-----\n"
+        + "\n".join(b[i:i + 64] for i in range(0, len(b), 64))
+        + "\n-----END CERTIFICATE-----"
+    )
+
+
+def _extract_idp_cert_from_metadata_xml(xml_text: str) -> str | None:
+    """Extract the signing X.509 cert (PEM) from federation metadata XML text."""
+    try:
+        root = ET.fromstring(xml_text)
+        # Prefer KeyDescriptor use="signing"
+        for kd in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}KeyDescriptor"):
+            if kd.get("use", "") in ("signing", ""):
+                cert_el = kd.find(".//{http://www.w3.org/2000/09/xmldsig#}X509Certificate")
+                if cert_el is not None and cert_el.text:
+                    return _pem_from_b64(cert_el.text)
+        # Fallback: first X509Certificate anywhere
+        for el in root.iter("{http://www.w3.org/2000/09/xmldsig#}X509Certificate"):
+            if el.text:
+                return _pem_from_b64(el.text)
+    except Exception as e:
+        logger.warning("Could not parse IdP metadata XML: %s", e)
+    return None
+
+
+def _extract_idp_entity_id_from_metadata_xml(xml_text: str) -> str | None:
+    """Extract the IdP EntityID (issuer) from federation metadata XML text."""
+    try:
+        root = ET.fromstring(xml_text)
+        eid = root.get("entityID")
+        if eid:
+            return eid.strip()
+    except Exception:
+        pass
+    return None
+
+
 async def _fetch_idp_cert_from_metadata(metadata_url: str) -> str | None:
-    """
-    Fetch Azure AD federation metadata XML and extract the signing X.509 cert.
-    Returns the PEM certificate string, or None on failure.
-    """
+    """Fetch federation metadata from a URL and extract the signing cert (PEM)."""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(metadata_url)
             resp.raise_for_status()
-            xml_text = resp.text
+            return _extract_idp_cert_from_metadata_xml(resp.text)
     except Exception as e:
         logger.warning("Could not fetch IdP metadata from %s: %s", metadata_url, e)
         return None
-
-    try:
-        root = ET.fromstring(xml_text)
-        ns = {
-            "md":   "urn:oasis:names:tc:SAML:2.0:metadata",
-            "ds":   "http://www.w3.org/2000/09/xmldsig#",
-            "fed":  "http://docs.oasis-open.org/wsfed/federation/200706",
-        }
-        # Try standard SAML metadata KeyDescriptor use="signing"
-        for kd in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}KeyDescriptor"):
-            use = kd.get("use", "")
-            if use in ("signing", ""):
-                cert_el = kd.find(".//{http://www.w3.org/2000/09/xmldsig#}X509Certificate")
-                if cert_el is not None and cert_el.text:
-                    cert_b64 = "".join(cert_el.text.split())
-                    return (
-                        "-----BEGIN CERTIFICATE-----\n"
-                        + "\n".join(cert_b64[i:i+64] for i in range(0, len(cert_b64), 64))
-                        + "\n-----END CERTIFICATE-----"
-                    )
-        # Fallback: grab first X509Certificate anywhere in the doc
-        for el in root.iter("{http://www.w3.org/2000/09/xmldsig#}X509Certificate"):
-            if el.text:
-                cert_b64 = "".join(el.text.split())
-                return (
-                    "-----BEGIN CERTIFICATE-----\n"
-                    + "\n".join(cert_b64[i:i+64] for i in range(0, len(cert_b64), 64))
-                    + "\n-----END CERTIFICATE-----"
-                )
-    except Exception as e:
-        logger.warning("Could not parse IdP metadata XML: %s", e)
-    return None
 
 
 def _extract_idp_sso_url_from_metadata_xml(xml_text: str) -> str | None:
@@ -304,67 +313,77 @@ def _extract_idp_sso_url_from_metadata_xml(xml_text: str) -> str | None:
     return None
 
 
-def _parse_saml_response(saml_response_b64: str) -> dict:
-    """
-    Decode and parse a SAMLResponse (base64 → XML).
-    Returns a dict with email, name, external_id.
-    Does NOT verify the signature here (we rely on Azure AD's TLS + cert check).
-    For production-grade signature verification use python3-saml.
-    """
-    try:
-        xml_bytes = base64.b64decode(saml_response_b64)
-        root = ET.fromstring(xml_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid SAMLResponse encoding: {e}")
-
+def _extract_saml_user_from_xml(xml_bytes: bytes) -> dict:
+    """Extract email/name/external_id from a SAML assertion/response XML element."""
+    root = ET.fromstring(xml_bytes)
     ns = {
         "saml":  "urn:oasis:names:tc:SAML:2.0:assertion",
         "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
     }
 
-    # ── Check top-level status ────────────────────────────────────────────────
-    status_code = root.find(".//samlp:StatusCode", ns)
-    if status_code is not None:
-        value = status_code.get("Value", "")
-        if "Success" not in value:
-            raise HTTPException(status_code=401, detail=f"SAML authentication failed: {value}")
-
-    # ── Extract NameID (usually email or UPN) ─────────────────────────────────
     name_id_el = root.find(".//saml:NameID", ns)
     name_id = (name_id_el.text or "").strip() if name_id_el is not None else ""
 
-    # ── Extract Attribute values ──────────────────────────────────────────────
     attrs: dict[str, str] = {}
     for attr in root.findall(".//saml:Attribute", ns):
         attr_name  = attr.get("Name", "")
         attr_value = attr.find("saml:AttributeValue", ns)
         if attr_value is not None and attr_value.text:
-            # Normalise attribute name to a short key
             key = attr_name.split("/")[-1].lower()  # e.g. "emailaddress", "givenname"
             attrs[key] = attr_value.text.strip()
 
-    # Resolve email
     email = (
-        attrs.get("emailaddress")
-        or attrs.get("email")
-        or attrs.get("mail")
+        attrs.get("emailaddress") or attrs.get("email") or attrs.get("mail")
         or (name_id if "@" in name_id else "")
     ).lower().strip()
-
-    # Resolve display name
     given  = attrs.get("givenname", "")
     family = attrs.get("surname", attrs.get("familyname", ""))
     name   = (f"{given} {family}".strip() or attrs.get("name") or email.split("@")[0] or "SSO User")
-
-    # External ID — prefer the assertion Subject NameID OID, fallback to email
-    external_id = (
-        attrs.get("objectidentifier")
-        or attrs.get("oid")
-        or name_id
-        or email
-    )
+    external_id = attrs.get("objectidentifier") or attrs.get("oid") or name_id or email
 
     return {"email": email, "name": name, "external_id": external_id}
+
+
+def _check_saml_status(xml_bytes: bytes) -> None:
+    """Raise if the SAML Response StatusCode is not Success."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid SAMLResponse encoding: {e}")
+    ns = {"samlp": "urn:oasis:names:tc:SAML:2.0:protocol"}
+    status_code = root.find(".//samlp:StatusCode", ns)
+    if status_code is not None and "Success" not in status_code.get("Value", ""):
+        raise HTTPException(status_code=401, detail=f"SAML authentication failed: {status_code.get('Value')}")
+
+
+def _verify_and_extract_saml(raw_xml: bytes, idp_cert_pem: str) -> dict:
+    """
+    Verify the SAMLResponse XML-DSIG signature against the IdP signing cert, then
+    extract the user identity ONLY from the signature-verified element (resists
+    signature-wrapping — we never trust unsigned parts of the document).
+    Raises HTTPException(401) if the signature is missing or invalid.
+    """
+    from signxml import XMLVerifier
+    from lxml import etree as _lxml
+
+    try:
+        result = XMLVerifier().verify(raw_xml, x509_cert=idp_cert_pem)
+    except Exception as e:
+        logger.warning("SAML signature verification failed: %s", e)
+        raise HTTPException(status_code=401, detail="SAML assertion signature is invalid or missing")
+
+    verified_bytes = _lxml.tostring(result.signed_xml)
+    return _extract_saml_user_from_xml(verified_bytes)
+
+
+def _parse_saml_response(saml_response_b64: str) -> dict:
+    """Decode + status-check + extract (UNVERIFIED — kept for non-SAML-mode paths)."""
+    try:
+        xml_bytes = base64.b64decode(saml_response_b64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid SAMLResponse encoding: {e}")
+    _check_saml_status(xml_bytes)
+    return _extract_saml_user_from_xml(xml_bytes)
 
 
 async def _provision_saml_user(user_info: dict, cfg: SSOConfig, db: AsyncSession) -> User:
@@ -520,14 +539,25 @@ async def saml_acs(
     if not cfg.enabled:
         return RedirectResponse(f"{settings.FRONTEND_URL}/login?sso_error=sso_disabled")
 
-    # Parse the SAML response
+    # ── Verify the assertion signature against the IdP cert (security-critical) ──
+    # Refuse to trust an unsigned/forged SAMLResponse. The IdP cert comes from the
+    # uploaded federation metadata; identity is read ONLY from the verified element.
+    if not cfg.idp_cert:
+        logger.warning("SAML ACS rejected — no IdP certificate configured; cannot verify signature")
+        return RedirectResponse(f"{settings.FRONTEND_URL}/login?sso_error=saml_no_idp_cert")
     try:
-        user_info = _parse_saml_response(SAMLResponse)
+        raw_xml = base64.b64decode(SAMLResponse)
+    except Exception:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/login?sso_error=invalid_saml_response")
+    try:
+        _check_saml_status(raw_xml)  # surface a clear error if the IdP reported failure
+        user_info = _verify_and_extract_saml(raw_xml, cfg.idp_cert)
     except HTTPException as e:
-        logger.warning("SAML ACS parse error: %s", e.detail)
-        return RedirectResponse(
-            f"{settings.FRONTEND_URL}/login?sso_error=invalid_saml_response"
-        )
+        logger.warning("SAML ACS rejected: %s", e.detail)
+        key = ("saml_auth_failed"
+               if e.status_code == 401 and "authentication failed" in (e.detail or "").lower()
+               else "invalid_saml_signature")
+        return RedirectResponse(f"{settings.FRONTEND_URL}/login?sso_error={key}")
 
     if not user_info.get("email") and not user_info.get("external_id"):
         return RedirectResponse(
@@ -906,4 +936,56 @@ async def get_saml_sp_metadata(
         login_url    = urls["login_url"],
         metadata_url = urls["metadata_url"],
         xml          = xml,
+    )
+
+
+@admin_router.post(
+    "/upload-saml-metadata",
+    response_model=SSOSamlMetadataUploadResult,
+    summary="Upload IdP (Azure AD) federation metadata XML — auto-fills IdP SSO URL + signing cert",
+)
+async def upload_saml_metadata(
+    body: SSOSamlMetadataUpload,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Admin pastes/uploads the identity provider's federation metadata XML
+    (Azure AD → SAML Certificates → 'Federation Metadata XML'). The backend
+    extracts the IdP SingleSignOnService URL + signing certificate and saves
+    them, so SAML login works and assertion signatures can be verified.
+    """
+    xml_text = (body.xml or "").strip()
+    if not xml_text:
+        raise HTTPException(status_code=400, detail="No metadata XML provided")
+
+    sso_url   = _extract_idp_sso_url_from_metadata_xml(xml_text)
+    cert_pem  = _extract_idp_cert_from_metadata_xml(xml_text)
+    entity_id = _extract_idp_entity_id_from_metadata_xml(xml_text)
+
+    if not cert_pem and not sso_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read a sign-on URL or signing certificate from this XML — "
+                   "make sure it is the IdP 'Federation Metadata XML' from Azure AD.",
+        )
+
+    cfg = await _get_or_create_sso_config(db)
+    if cert_pem:
+        cfg.idp_cert = cert_pem
+    if sso_url:
+        cfg.authorization_endpoint = sso_url   # reused as the IdP SSO URL in SAML mode
+    if entity_id:
+        cfg.issuer = entity_id
+    await db.commit()
+
+    found = ", ".join(p for p in (
+        "sign-on URL" if sso_url else None,
+        "signing certificate" if cert_pem else None,
+    ) if p) or "nothing usable"
+    return SSOSamlMetadataUploadResult(
+        sso_url=sso_url,
+        cert_found=bool(cert_pem),
+        entity_id=entity_id,
+        message=f"Imported {found} from the IdP metadata.",
     )
