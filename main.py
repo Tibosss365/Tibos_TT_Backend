@@ -15,7 +15,7 @@ from app.routers import admin, agents, analytics, auth, dashboard, events, notif
 from app.routers import inbound_email, categories, sla, groups
 from app.routers import email_inbox
 from app.routers import csat, admin_features, activity
-from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router
+from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router, saml_router as sso_saml_router
 from app.services.email_poller import email_poller
 from app.services.sla_service import sla_breach_detector
 from app.services.report_scheduler import report_scheduler
@@ -302,6 +302,7 @@ app.include_router(groups.router)
 app.include_router(events.router)
 app.include_router(ws.router)
 app.include_router(sso_auth_router)
+app.include_router(sso_saml_router)   # SAML 2.0: /auth/saml/*
 app.include_router(sso_admin_router)
 app.include_router(csat.router)
 app.include_router(admin_features.router)

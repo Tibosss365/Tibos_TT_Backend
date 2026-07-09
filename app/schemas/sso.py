@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 
 class SSOConfigUpdate(BaseModel):
@@ -21,6 +21,12 @@ class SSOConfigUpdate(BaseModel):
     agent_group_ids: Optional[list[str]] = None
     auto_create_users: bool = True
     sync_on_login: bool = True
+    # ── SAML 2.0 fields ───────────────────────────────────────────────────────
+    saml_mode: bool = False
+    # Azure AD federation metadata URL — backend auto-fetches the IdP certificate
+    idp_metadata_url: Optional[str] = None
+    # PEM certificate (auto-filled from idp_metadata_url, or paste manually)
+    idp_cert: Optional[str] = None
 
 
 class SSOConfigOut(BaseModel):
@@ -41,6 +47,10 @@ class SSOConfigOut(BaseModel):
     auto_create_users: bool
     sync_on_login: bool
     updated_at: datetime
+    # ── SAML 2.0 fields ───────────────────────────────────────────────────────
+    saml_mode: bool = False
+    idp_metadata_url: Optional[str] = None
+    idp_cert: Optional[str] = None            # PEM cert (safe to return; it is public)
 
     model_config = {"from_attributes": True}
 
@@ -50,3 +60,14 @@ class SSOPublicConfig(BaseModel):
     enabled: bool
     provider: str
     label: str   # e.g. "Sign in with Microsoft"
+    saml_mode: bool = False
+
+
+class SSOSamlMetadataOut(BaseModel):
+    """SP metadata info returned by the admin helper endpoint."""
+    entity_id: str
+    acs_url: str
+    slo_url: str
+    login_url: str
+    metadata_url: str
+    xml: str          # full SP metadata XML

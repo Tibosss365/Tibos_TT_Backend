@@ -25,6 +25,9 @@ class Settings(BaseSettings):
 
     # SSO / OIDC — frontend URL used to build the post-login redirect
     FRONTEND_URL: str = "http://localhost:5173"
+    # Backend public URL — used to build SAML SP metadata URLs (Entity ID, ACS URL, etc.)
+    # Set this to your deployed API URL, e.g. https://tibos-tt-api.azurewebsites.net
+    BACKEND_URL: str = "https://tibos-tt-api.azurewebsites.net"
 
     # Attachment object storage
     # backend: "azure" | "s3" | "local"

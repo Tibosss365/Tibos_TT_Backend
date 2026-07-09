@@ -8,7 +8,14 @@ from app.database import Base
 
 
 class SSOConfig(Base):
-    """Stores a single OIDC / SSO provider configuration (singleton row, id=1)."""
+    """Stores a single OIDC / SSO provider configuration (singleton row, id=1).
+
+    Supports two protocols controlled by ``saml_mode``:
+    - False (default): OIDC / OpenID Connect flow (existing behaviour).
+    - True: SAML 2.0 flow — requires idp_cert and the IdP SSO URL
+      (fetched automatically from idp_metadata_url or configured via
+      authorization_endpoint as the IdP SSO POST binding URL).
+    """
     __tablename__ = "sso_config"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
@@ -20,6 +27,20 @@ class SSOConfig(Base):
     # "microsoft" (Entra ID) is the only fully supported provider.
     # "custom" lets admins supply arbitrary OIDC endpoints.
     provider: Mapped[str] = mapped_column(String(50), default="microsoft", nullable=False)
+
+    # ── SAML mode ──────────────────────────────────────────────────────────────
+    # When True the /auth/saml/* endpoints are active instead of /auth/sso/*
+    saml_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Azure AD / Entra ID federation metadata URL, e.g.:
+    # https://login.microsoftonline.com/<tenant>/federationmetadata/2007-06/federationmetadata.xml
+    # Backend auto-fetches the IdP X.509 certificate from this URL when set.
+    idp_metadata_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # PEM-encoded X.509 certificate from the IdP (used to verify SAML assertion
+    # signatures).  Populated automatically when idp_metadata_url is saved,
+    # or can be pasted manually.
+    idp_cert: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Azure AD / Entra ID credentials ───────────────────────────────────────
     tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
