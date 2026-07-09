@@ -854,6 +854,21 @@ async def update_ticket(
                 status_code=400,
                 detail="Resolution notes are required to resolve a ticket.",
             )
+        # A resolution code is required too, when the org has configured any
+        resolution_code_val = update_data.get("resolution_code", ticket.resolution_code)
+        from app.models.feature_models import TicketConfigItem
+        has_codes = (
+            await db.execute(
+                select(TicketConfigItem.id)
+                .where(TicketConfigItem.kind == "resolution_code")
+                .limit(1)
+            )
+        ).first() is not None
+        if has_codes and not (resolution_code_val or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="A resolution code is required to resolve a ticket.",
+            )
 
     # ── An agent must be assigned before a ticket can be resolved or closed ────
     if (
