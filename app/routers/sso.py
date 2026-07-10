@@ -989,3 +989,88 @@ async def upload_saml_metadata(
         entity_id=entity_id,
         message=f"Imported {found} from the IdP metadata.",
     )
+
+
+async def _sso_graph_token(cfg: SSOConfig) -> str:
+    """Client-credentials Graph token using the SSO app registration creds."""
+    if not (cfg.tenant_id and cfg.client_id and cfg.client_secret):
+        raise HTTPException(status_code=400, detail="Configure Tenant ID, Client ID and Client Secret first.")
+    url = f"https://login.microsoftonline.com/{cfg.tenant_id}/oauth2/v2.0/token"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, data={
+            "grant_type": "client_credentials",
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        })
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not get a Graph token: {r.text[:200]}")
+    return r.json()["access_token"]
+
+
+@admin_router.post("/sync-users", summary="Import all Microsoft 365 tenant users into the tool")
+async def sync_m365_users(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Pull every user from the tenant via Microsoft Graph and provision them in the
+    tool (create if new, refresh name/active if existing). New users get the SSO
+    default role. Requires the app to have Graph 'User.Read.All' APPLICATION
+    permission with admin consent.
+    """
+    cfg = await _get_or_create_sso_config(db)
+    token = await _sso_graph_token(cfg)
+    try:
+        default_role = UserRole(cfg.default_role)
+    except ValueError:
+        default_role = UserRole.user
+
+    created = updated = skipped = 0
+    url = ("https://graph.microsoft.com/v1.0/users"
+           "?$select=id,displayName,mail,userPrincipalName,accountEnabled&$top=999")
+    async with httpx.AsyncClient(timeout=30, headers={"Authorization": f"Bearer {token}"}) as client:
+        while url:
+            r = await client.get(url)
+            if r.status_code == 403:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Microsoft Graph denied listing users. Add the 'User.Read.All' "
+                           "APPLICATION permission to your Azure app registration and grant admin consent.",
+                )
+            r.raise_for_status()
+            data = r.json()
+            for u in data.get("value", []):
+                oid = u.get("id")
+                email = (u.get("mail") or u.get("userPrincipalName") or "").lower().strip()
+                name = u.get("displayName") or (email.split("@")[0] if email else "") or "User"
+                if not oid or not email:
+                    skipped += 1
+                    continue
+                existing = (await db.execute(select(User).where(User.external_id == oid))).scalar_one_or_none()
+                if existing is None:
+                    existing = (await db.execute(select(User).where(User.username == email))).scalar_one_or_none()
+                active = bool(u.get("accountEnabled", True))
+                if existing:
+                    existing.name = name
+                    existing.external_id = oid
+                    existing.auth_provider = cfg.provider
+                    existing.is_active = active
+                    updated += 1
+                else:
+                    initials = "".join(w[0].upper() for w in name.split()[:2]) or "?"
+                    db.add(User(
+                        name=name, initials=initials, username=email,
+                        hashed_password=hash_password(str(uuid.uuid4())),
+                        role=default_role, external_id=oid,
+                        auth_provider=cfg.provider, is_active=active,
+                    ))
+                    created += 1
+            await db.commit()
+            url = data.get("@odata.nextLink")
+
+    return {
+        "created": created, "updated": updated, "skipped": skipped,
+        "message": f"Synced M365 users — {created} added, {updated} updated"
+                   + (f", {skipped} skipped" if skipped else "") + ".",
+    }
