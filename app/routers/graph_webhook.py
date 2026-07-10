@@ -52,6 +52,11 @@ async def graph_notifications(request: Request):
             await email_poller.poll_once()  # fetch the new mail immediately → create ticket
         except Exception as e:
             logger.error("Graph webhook: poll_once failed: %s", e)
+        # Keep the subscription alive automatically (throttled to ~once/day)
+        try:
+            await gs.maybe_renew()
+        except Exception as e:
+            logger.warning("Graph webhook: auto-renew failed: %s", e)
     else:
         logger.warning("Graph webhook: notification with bad/missing clientState — ignored")
 

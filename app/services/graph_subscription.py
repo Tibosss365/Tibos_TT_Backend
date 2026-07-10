@@ -20,11 +20,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.database import AsyncSessionLocal
 from app.models.admin import EmailConfig
 from app.models.inbound_email import InboundEmailConfig
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# When we last ensured/renewed (in-memory throttle so we hit Graph at most ~daily)
+_last_ensured: datetime | None = None
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 # Outlook message subscriptions max out around 4230 minutes (~2.9 days);
@@ -117,3 +121,27 @@ async def disable(db: AsyncSession) -> dict:
     async with httpx.AsyncClient(timeout=20, headers={"Authorization": f"Bearer {token}"}) as c:
         await c.delete(f"{GRAPH}/subscriptions/{s['id']}")
     return {"status": "deleted"}
+
+
+async def maybe_renew() -> None:
+    """
+    Opportunistic auto-renew: called from the webhook handler and the poller loop.
+    Ensures/renews the Graph subscription, but hits Graph at most once every ~24h
+    (in-memory throttle) so it's cheap. This keeps the subscription alive forever
+    as long as the mailbox sees activity, without needing a background scheduler.
+    """
+    global _last_ensured
+    now = datetime.now(timezone.utc)
+    if _last_ensured is not None and (now - _last_ensured) < timedelta(hours=24):
+        return
+    try:
+        async with AsyncSessionLocal() as db:
+            # Only bother if inbound email is actually configured for Graph
+            ic = (await db.execute(select(InboundEmailConfig))).scalar_one_or_none()
+            if not ic or not ic.enabled or not getattr(ic, "graph_mailbox", None):
+                return
+            await ensure(db)
+        _last_ensured = now
+        logger.info("Graph subscription auto-renewed")
+    except Exception as e:
+        logger.warning("Graph subscription auto-renew failed: %s", e)

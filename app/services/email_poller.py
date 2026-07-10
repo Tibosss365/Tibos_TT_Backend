@@ -939,6 +939,12 @@ class EmailPoller:
                     interval = inbound.poll_interval_minutes
                     if inbound.enabled:
                         await self.poll_once()
+                        # Keep the Graph instant-delivery subscription renewed (throttled ~daily)
+                        try:
+                            from app.services import graph_subscription as _gs
+                            await _gs.maybe_renew()
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
