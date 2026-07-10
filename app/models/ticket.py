@@ -127,6 +127,8 @@ class Ticket(Base):
     hold_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Resolution code chosen when the ticket was resolved (admin-configured list)
     resolution_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # How many times this ticket was reopened after being resolved/closed
+    reopen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     # ── JSONB sub-document fields (persisted per-ticket, no separate tables) ──
     tasks:     Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")

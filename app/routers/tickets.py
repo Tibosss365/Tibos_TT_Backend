@@ -887,6 +887,14 @@ async def update_ticket(
     for key, val in update_data.items():
         setattr(ticket, key, val)
 
+    # Track reopens: a resolved/closed ticket moving back to open/in-progress
+    if (
+        "status" in update_data
+        and old_status in (TicketStatus.resolved, TicketStatus.closed)
+        and update_data["status"] in (TicketStatus.open, TicketStatus.in_progress)
+    ):
+        ticket.reopen_count = (ticket.reopen_count or 0) + 1
+
     ticket.updated_at = datetime.now(timezone.utc)
 
     # ── SLA: handle status transitions ────────────────────────────────────
