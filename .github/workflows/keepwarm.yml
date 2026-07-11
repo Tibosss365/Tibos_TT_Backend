@@ -1,0 +1,31 @@
+name: Keep-warm (prevent cold starts)
+
+# Pings the API's public /health endpoint so Azure App Service never hits its
+# ~20-minute idle timeout and puts the app to sleep. A sleeping app means the
+# Graph instant-delivery webhook lands on a cold instance (15-30s cold start)
+# and the 30s poller isn't running — both of which slow down email -> ticket.
+# Keeping it warm makes auto-conversion effectively instant even without
+# Azure "Always On". (Always On is still the more reliable one-click fix.)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub's minimum)
+  workflow_dispatch: {}       # allow manual run
+
+concurrency:
+  group: keepwarm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Ping /health every ~50s for ~4.5 min
+        run: |
+          URL="https://tibos-tt-api.azurewebsites.net/health"
+          for i in $(seq 1 6); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
+            echo "ping $i -> HTTP $code"
+            if [ "$i" -lt 6 ]; then sleep 50; fi
+          done
