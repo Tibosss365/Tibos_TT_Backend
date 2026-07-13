@@ -360,6 +360,37 @@ class SLAService:
         )
 
     @staticmethod
+    async def restart_from_now(ticket: Ticket, db: AsyncSession) -> None:
+        """
+        Re-anchor the SLA to a fresh full window starting *now*.
+
+        Used when a ticket leaves on-hold and returns to active work: the whole
+        on-hold period (and any time elapsed before it) is discarded so the
+        ticket is never breached just for having sat on hold. The countdown
+        restarts from the moment it goes back to in-progress/open.
+        """
+        cfg   = (await db.execute(select(SLAConfig).limit(1))).scalar_one_or_none()
+        hours = _hours_for(ticket.priority, cfg)
+        now   = datetime.now(timezone.utc)
+        due   = _calculate_due_time(now, hours, cfg)
+
+        ticket.sla_start_time     = now
+        ticket.sla_due_time       = due
+        ticket.sla_due_at         = due  # keep legacy field in sync
+        ticket.sla_status         = SLAStatus.active
+        ticket.sla_paused_at      = None
+        ticket.sla_paused_seconds = 0
+
+        if due < now:
+            ticket.sla_status = SLAStatus.overdue
+
+        logger.info(
+            f"SLA restarted from now for {ticket.ticket_id} | "
+            f"priority={ticket.priority.value} | hours={hours} | "
+            f"start={now.isoformat()} | due={due.isoformat()}"
+        )
+
+    @staticmethod
     async def stop(ticket: Ticket, db: AsyncSession) -> None:
         """Stop the SLA — ticket resolved or closed."""
         if ticket.sla_status in (SLAStatus.completed, SLAStatus.not_started):
@@ -486,7 +517,10 @@ class SLAService:
         elif entering_pause:
             await SLAService.pause(ticket, db)
         elif leaving_pause:
-            await SLAService.resume(ticket, db)
+            # Leaving on-hold → restart the SLA with a fresh full window from now
+            # (business rule: the on-hold period must never count toward SLA, so
+            # the countdown begins again the moment the ticket resumes work).
+            await SLAService.restart_from_now(ticket, db)
 
 
 # ── SLA Breach Detector (background job) ─────────────────────────────────────
