@@ -87,6 +87,20 @@ class UserPublic(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AccountOwner(BaseModel):
+    """An internal staff member who owns a customer account.
+
+    ``user_id`` is set when the owner is an existing helpdesk user; it stays
+    None for owners entered as a plain name + email. Either way ``email`` is
+    what the ticket emails are CC'd to.
+    """
+    user_id: uuid.UUID | None = None
+    name: str = Field(default="", max_length=150)
+    email: str = Field(..., min_length=3, max_length=255)
+
+    model_config = {"from_attributes": True}
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str

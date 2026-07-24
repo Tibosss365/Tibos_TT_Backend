@@ -5,6 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
 from app.models.admin import EmailType, OAuthProvider, SMTPSecurity
+from app.schemas.user import AccountOwner
 
 
 class EmailTestRequest(BaseModel):
@@ -210,6 +211,7 @@ class DomainCompanyOut(BaseModel):
     contact_email: str | None = None
     contact_phone: str | None = None
     logo_url: str | None = None
+    owners: list[AccountOwner] = []
     auto_discovered: bool = False
     created_at: datetime
     updated_at: datetime
@@ -225,6 +227,7 @@ class DomainCompanyCreate(BaseModel):
     contact_email: str | None = Field(default=None, max_length=255)
     contact_phone: str | None = Field(default=None, max_length=50)
     logo_url: str | None = Field(default=None, max_length=512)
+    owners: list[AccountOwner] = []
     auto_discovered: bool = False
 
 
@@ -234,6 +237,7 @@ class DomainCompanyUpdate(BaseModel):
     contact_email: str | None = Field(default=None, max_length=255)
     contact_phone: str | None = Field(default=None, max_length=50)
     logo_url: str | None = Field(default=None, max_length=512)
+    owners: list[AccountOwner] | None = None
 
 
 class DomainLookupResult(BaseModel):

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 from sqlalchemy import select
@@ -267,7 +267,14 @@ async def _get_graph_token(tenant_id: str, client_id: str, client_secret: str) -
     return resp.json()["access_token"]
 
 
-async def _send_via_graph(token: str, from_email: str, to_email: str, subject: str, html_body: str) -> None:
+async def _send_via_graph(
+    token: str,
+    from_email: str,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    cc: Optional[List[str]] = None,
+) -> None:
     """Send an email via Microsoft Graph API /sendMail."""
     url = f"https://graph.microsoft.com/v1.0/users/{from_email}/sendMail"
     payload = {
@@ -278,6 +285,10 @@ async def _send_via_graph(token: str, from_email: str, to_email: str, subject: s
         },
         "saveToSentItems": True,
     }
+    if cc:
+        payload["message"]["ccRecipients"] = [
+            {"emailAddress": {"address": addr}} for addr in cc
+        ]
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(url, json=payload, headers={
             "Authorization": f"Bearer {token}",
@@ -614,6 +625,7 @@ async def send_ticket_email(
     references: str | None = None,
     assignee_name: str | None = None,
     include_reopen: bool = False,
+    cc: List[str] | None = None,
 ) -> str | None:
     """
     Send an HTML email for a ticket event.
@@ -622,6 +634,8 @@ async def send_ticket_email(
 
     assignee_name  — when set, renders an "Assigned Agent" card in the email.
     include_reopen — when True (resolved emails only), renders a "Reopen Ticket" mailto button.
+    cc             — extra addresses copied on the mail (account owners); the
+                     recipient in ``to_email`` is dropped from it automatically.
     """
     result = await db.execute(select(EmailConfig))
     cfg: EmailConfig | None = result.scalar_one_or_none()
@@ -631,6 +645,13 @@ async def send_ticket_email(
         return None
 
     email_type = cfg.type.value if cfg.type else "smtp"
+
+    # Never copy the primary recipient, and keep the order stable for logging
+    _to_lower = (to_email or "").strip().lower()
+    cc_list = list(dict.fromkeys(
+        addr.strip().lower() for addr in (cc or [])
+        if addr and addr.strip().lower() != _to_lower
+    ))
 
     # Build reopen mailto URL from the helpdesk's from-address
     reopen_url: str | None = None
@@ -651,17 +672,17 @@ async def send_ticket_email(
         if email_type == "smtp":
             return await _send_ticket_via_smtp(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                in_reply_to, references, assignee_name, reopen_url,
+                in_reply_to, references, assignee_name, reopen_url, cc_list,
             )
         elif email_type == "m365":
             return await _send_ticket_via_m365(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                assignee_name, reopen_url,
+                assignee_name, reopen_url, cc_list,
             )
         elif email_type == "oauth":
             return await _send_ticket_via_oauth(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                assignee_name, reopen_url,
+                assignee_name, reopen_url, cc_list,
             )
         else:
             logger.warning(f"Unknown email type '{email_type}' — skipping ticket email")
@@ -683,6 +704,7 @@ async def _send_ticket_via_smtp(
     references: Optional[str],
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
+    cc: Optional[List[str]] = None,
 ) -> Optional[str]:
     from_addr = cfg.smtp_from or cfg.smtp_user or ""
     if not from_addr or not cfg.smtp_host:
@@ -697,6 +719,8 @@ async def _send_ticket_via_smtp(
     msg["Subject"]    = subject
     msg["From"]       = from_addr
     msg["To"]         = to_email
+    if cc:
+        msg["Cc"] = ", ".join(cc)
     msg["Date"]       = formatdate(localtime=False)
     msg["Message-ID"] = msg_id
     if in_reply_to:
@@ -706,12 +730,13 @@ async def _send_ticket_via_smtp(
 
     port = int(cfg.smtp_port or 587)
     host = cfg.smtp_host or ""
+    envelope_to = [to_email] + list(cc or [])
 
     if cfg.smtp_security == SMTPSecurity.ssl:
         ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as server:
             server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-            server.sendmail(from_addr, [to_email], msg.as_bytes())
+            server.sendmail(from_addr, envelope_to, msg.as_bytes())
     else:
         with smtplib.SMTP(host, port, timeout=15) as server:
             server.ehlo()
@@ -719,9 +744,10 @@ async def _send_ticket_via_smtp(
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
             server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-            server.sendmail(from_addr, [to_email], msg.as_bytes())
+            server.sendmail(from_addr, envelope_to, msg.as_bytes())
 
-    logger.info(f"Email sent to {to_email} for {ticket.ticket_id} [{action_label}] via SMTP")
+    _cc_note = f" (cc: {', '.join(cc)})" if cc else ""
+    logger.info(f"Email sent to {to_email}{_cc_note} for {ticket.ticket_id} [{action_label}] via SMTP")
     return msg_id
 
 
@@ -735,6 +761,7 @@ async def _send_ticket_via_m365(
     action_color: str,
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
+    cc: Optional[List[str]] = None,
 ) -> Optional[str]:
     if not cfg.m365_tenant_id or not cfg.m365_client_id or not cfg.m365_client_secret or not cfg.m365_from:
         logger.debug("M365 not fully configured — skipping ticket email")
@@ -751,9 +778,11 @@ async def _send_ticket_via_m365(
         to_email=to_email,
         subject=subject,
         html_body=html_body,
+        cc=cc,
     )
 
-    logger.info(f"Email sent to {to_email} for {ticket.ticket_id} [{action_label}] via M365 Graph")
+    _cc_note = f" (cc: {', '.join(cc)})" if cc else ""
+    logger.info(f"Email sent to {to_email}{_cc_note} for {ticket.ticket_id} [{action_label}] via M365 Graph")
     return msg_id
 
 
@@ -767,6 +796,7 @@ async def _send_ticket_via_oauth(
     action_color: str,
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
+    cc: Optional[List[str]] = None,
 ) -> Optional[str]:
     if not cfg.oauth_access_token or not cfg.oauth_from:
         logger.debug("OAuth not authorized — skipping ticket email")
@@ -784,6 +814,7 @@ async def _send_ticket_via_oauth(
             to_email=to_email,
             subject=subject,
             html_body=html_body,
+            cc=cc,
         )
     elif provider == "google":
         import base64
@@ -795,6 +826,8 @@ async def _send_ticket_via_oauth(
         msg_full["Subject"]    = subject
         msg_full["From"]       = from_email
         msg_full["To"]         = to_email
+        if cc:
+            msg_full["Cc"] = ", ".join(cc)
         msg_full["Date"]       = formatdate(localtime=False)
         msg_full["Message-ID"] = msg_id
         msg_full.attach(MIMEText(html_body, "html", "utf-8"))
@@ -805,10 +838,11 @@ async def _send_ticket_via_oauth(
             server.starttls(context=ctx)
             server.ehlo()
             server.docmd("AUTH", f"XOAUTH2 {auth_b64}")
-            server.sendmail(from_email, [to_email], msg_full.as_bytes())
+            server.sendmail(from_email, [to_email] + list(cc or []), msg_full.as_bytes())
     else:
         logger.warning(f"Unsupported OAuth provider '{provider}' for ticket email")
         return None
 
-    logger.info(f"Email sent to {to_email} for {ticket.ticket_id} [{action_label}] via OAuth ({provider})")
+    _cc_note = f" (cc: {', '.join(cc)})" if cc else ""
+    logger.info(f"Email sent to {to_email}{_cc_note} for {ticket.ticket_id} [{action_label}] via OAuth ({provider})")
     return msg_id

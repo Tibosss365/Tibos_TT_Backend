@@ -3,7 +3,7 @@ import enum
 from datetime import datetime, timezone
 
 from sqlalchemy import String, Boolean, Integer, DateTime, Enum as SAEnum, Text, JSON
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -200,6 +200,10 @@ class DomainCompany(Base):
     contact_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     logo_url: Mapped[str | None] = mapped_column(String(512), nullable=True,
         comment="Company logo URL from Clearbit or manually set")
+    owners: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="'[]'::jsonb",
+        comment="Account owners — [{user_id, name, email}]; CC'd on this company's ticket emails",
+    )
     auto_discovered: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,
         comment="True when data was seeded by the Clearbit lookup"

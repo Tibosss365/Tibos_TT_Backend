@@ -49,6 +49,12 @@ from app.services.notification_service import (
     notify_ticket_resolved,
 )
 from app.services.email_sender import send_ticket_email
+from app.services.account_owner_service import (
+    normalize_owners,
+    owner_emails,
+    owner_label,
+    owners_for_company,
+)
 
 
 # Markers where a quoted reply trail begins — we keep only the first message.
@@ -476,6 +482,16 @@ async def create_ticket(
             if discovered:
                 company = discovered
 
+    # ── Account owners: snapshot the company's owners onto the ticket ─────
+    # An explicit list from the caller (agent chose owners on the form) wins;
+    # otherwise fall back to the company registry. Either way they are copied
+    # (not referenced) so later registry edits don't rewrite the CC list of
+    # tickets already in flight. End-users can never set owners.
+    if body.owners is not None and not is_end_user:
+        ticket_owners = normalize_owners(body.owners)
+    else:
+        ticket_owners = await owners_for_company(db, email=email, company_name=company)
+
     ticket = Ticket(
         subject=body.subject,
         category=body.category,
@@ -497,6 +513,7 @@ async def create_ticket(
         tags=body.tags or [],
         custom_field_data=body.custom_field_data or {},
         due_date=body.due_date,
+        owners=ticket_owners,
     )
     db.add(ticket)
     await db.flush()
@@ -577,6 +594,7 @@ async def create_ticket(
             + description_block +
             f"<p>We will get back to you as soon as possible. You can reply to this email to add more information.</p>"
         )
+        owner_cc = owner_emails(full.owners, exclude=full.email)
         msg_id = await send_ticket_email(
             db, full,
             to_email=full.email,
@@ -585,14 +603,18 @@ async def create_ticket(
             action_label="New Ticket Created",
             action_color="#6366f1",
             assignee_name=full.assignee.name if full.assignee else None,
+            cc=owner_cc,
         )
         if msg_id:
             # Store thread ID for reply matching and log in timeline
             ticket.email_thread_id = msg_id
+            cc_note = (
+                f", cc <strong>{owner_label(full.owners)}</strong>" if owner_cc else ""
+            )
             db.add(TicketTimeline(
                 ticket_id=ticket.id,
                 type=TimelineType.email_out,
-                text=f"Ticket confirmation email sent to <strong>{full.email}</strong>",
+                text=f"Ticket confirmation email sent to <strong>{full.email}</strong>{cc_note}",
                 author_id=current_user.id,
             ))
             await db.flush()
@@ -843,6 +865,15 @@ async def update_ticket(
         # Never write a requester field, even when the value is unchanged.
         update_data.pop(f, None)
 
+    # ── Account owners — agents only, and always stored normalized ────────────
+    owners_before: list[dict] = []
+    if "owners" in update_data:
+        if current_user.role == UserRole.user:
+            update_data.pop("owners", None)
+        else:
+            owners_before = normalize_owners(ticket.owners)
+            update_data["owners"] = normalize_owners(update_data["owners"])
+
     # ── Resolution notes are mandatory when resolving a ticket ─────────────────
     if (
         update_data.get("status") == TicketStatus.resolved
@@ -1000,6 +1031,21 @@ async def update_ticket(
             if assignee:
                 await notify_ticket_assigned(db, ticket, assignee, current_user.name)
 
+    # ── Account owner changes ────────────────────────────────────────────────
+    if "owners" in update_data and update_data["owners"] != owners_before:
+        new_label = owner_label(update_data["owners"])
+        db.add(TicketTimeline(
+            ticket_id=ticket.id,
+            type=TimelineType.assign,
+            text=(
+                f"Account owners set to <strong>{new_label}</strong> "
+                f"by <strong>{current_user.name}</strong>"
+                if new_label else
+                f"Account owners cleared by <strong>{current_user.name}</strong>"
+            ),
+            author_id=current_user.id,
+        ))
+
     # ── Reopen count ─────────────────────────────────────────────────────────
     if "status" in update_data:
         new_st = update_data["status"]
@@ -1098,6 +1144,9 @@ async def update_ticket(
             )
 
         if email_cfg_data:
+            # Account owners get every customer-facing status email — on hold,
+            # in progress, resolved, closed — just like the customer does.
+            owner_cc = owner_emails(full.owners, exclude=full.email)
             await send_ticket_email(
                 db, full,
                 to_email=full.email,
@@ -1109,11 +1158,15 @@ async def update_ticket(
                 references=full.email_thread_id,
                 assignee_name=_agent,
                 include_reopen=email_cfg_data.get("include_reopen", False),
+                cc=owner_cc,
+            )
+            cc_note = (
+                f", cc <strong>{owner_label(full.owners)}</strong>" if owner_cc else ""
             )
             db.add(TicketTimeline(
                 ticket_id=full.id,
                 type=TimelineType.email_out,
-                text=f"Status update email sent to <strong>{full.email}</strong>",
+                text=f"Status update email sent to <strong>{full.email}</strong>{cc_note}",
                 author_id=current_user.id,
             ))
             await db.flush()
@@ -1179,6 +1232,7 @@ async def add_comment(
             f"color:#374151;white-space:pre-wrap'>{safe_text}</blockquote>"
             f"<p>You can reply to this email to respond to the agent.</p>"
         )
+        owner_cc = owner_emails(ticket.owners, exclude=ticket.email)
         await send_ticket_email(
             db, ticket,
             to_email=ticket.email,
@@ -1189,11 +1243,13 @@ async def add_comment(
             in_reply_to=ticket.email_thread_id,
             references=ticket.email_thread_id,
             assignee_name=current_user.name,
+            cc=owner_cc,
         )
+        cc_note = f", cc <strong>{owner_label(ticket.owners)}</strong>" if owner_cc else ""
         db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.email_out,
-            text=f"Comment sent as email to <strong>{ticket.email}</strong> by <strong>{current_user.name}</strong>",
+            text=f"Comment sent as email to <strong>{ticket.email}</strong>{cc_note} by <strong>{current_user.name}</strong>",
             author_id=current_user.id,
         ))
         await db.flush()

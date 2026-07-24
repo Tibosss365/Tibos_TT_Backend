@@ -25,6 +25,7 @@ from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.services.email_sender import send_test_email
+from app.services.account_owner_service import normalize_owners as _normalize_owners
 from app.schemas.admin import (
     AdminStats,
     AlertSettingsOut,
@@ -932,6 +933,7 @@ async def create_domain_company(
         contact_email=body.contact_email,
         contact_phone=body.contact_phone,
         logo_url=body.logo_url,
+        owners=_normalize_owners(body.owners),
         auto_discovered=body.auto_discovered,
     )
     db.add(record)
@@ -961,6 +963,8 @@ async def update_domain_company(
         record.contact_phone = body.contact_phone
     if body.logo_url is not None:
         record.logo_url = body.logo_url
+    if body.owners is not None:
+        record.owners = _normalize_owners(body.owners)
     record.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(record)

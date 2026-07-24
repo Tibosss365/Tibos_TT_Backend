@@ -135,6 +135,9 @@ class Ticket(Base):
     work_log:  Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
     reminders: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
     approvals: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
+    # Account owners CC'd on this ticket's customer emails — [{user_id, name, email}].
+    # Seeded from the company registry at creation, editable per ticket afterwards.
+    owners:    Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="'[]'::jsonb")
 
     email_thread_id: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
     # Ticket group slug — matches Category.group_id / DEFAULT_GROUPS ids

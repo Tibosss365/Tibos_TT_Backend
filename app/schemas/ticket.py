@@ -4,7 +4,7 @@ from typing import Union
 from pydantic import BaseModel, Field, computed_field, field_serializer
 
 from app.models.ticket import SLAStatus, TicketCategory, TicketPriority, TicketStatus, TimelineType, TicketSource
-from app.schemas.user import UserPublic
+from app.schemas.user import AccountOwner, UserPublic
 
 
 def _utc_iso(dt: datetime | None) -> str | None:
@@ -69,6 +69,9 @@ class TicketCreate(TicketBase):
     tags: list[str] = []
     custom_field_data: dict = {}
     due_date: datetime | None = None
+    # Account owners CC'd on this ticket's emails. When omitted, they are
+    # auto-filled from the company registry at creation.
+    owners: list[AccountOwner] | None = None
 
 
 class TicketUpdate(BaseModel):
@@ -91,6 +94,7 @@ class TicketUpdate(BaseModel):
     tags: list[str] | None = None
     custom_field_data: dict | None = None
     due_date: datetime | None = None
+    owners: list[AccountOwner] | None = None
 
 
 class TicketOut(TicketBase):
@@ -111,6 +115,7 @@ class TicketOut(TicketBase):
     work_log:  list[dict] = []
     reminders: list[dict] = []
     approvals: list[dict] = []
+    owners:    list[AccountOwner] = []
     # ── SLA fields ──────────────────────────────────────────────────────
     sla_status: SLAStatus = SLAStatus.not_started
     sla_start_time: datetime | None = None

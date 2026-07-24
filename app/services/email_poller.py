@@ -480,6 +480,11 @@ async def _process_inbound_email(
     company = from_email.split("@")[1].lower() if "@" in from_email else ""
     category_slug = inbound.default_category or "email"
 
+    # Snapshot the account owners registered for the sender's company so this
+    # ticket CCs them on its resolved/closed emails, same as portal tickets.
+    from app.services.account_owner_service import owners_for_company
+    ticket_owners = await owners_for_company(db, email=from_email, company_name=company)
+
     ticket = Ticket(
         subject=subject or "(no subject)",
         category=category_slug,
@@ -495,6 +500,7 @@ async def _process_inbound_email(
         ticket_number_digits=number_digits,
         created_at=received_at or datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
+        owners=ticket_owners,
     )
     db.add(ticket)
     await db.flush()
