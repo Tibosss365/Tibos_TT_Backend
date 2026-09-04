@@ -20,6 +20,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 
+class TicketType(str, enum.Enum):
+    """Kept for reference/validation constants — the DB column is a plain
+    VARCHAR(20) (see Ticket.type) so admins can add more types later without
+    an enum migration."""
+    request  = "request"
+    incident = "incident"
+    problem  = "problem"
+    change   = "change"
+
+
 class TicketSource(str, enum.Enum):
     email    = "email"
     portal   = "portal"
@@ -27,6 +37,7 @@ class TicketSource(str, enum.Enum):
     api      = "api"
     walk_in  = "walk_in"
     chat     = "chat"
+    teams    = "teams"
 
 
 class SLAStatus(str, enum.Enum):
@@ -101,6 +112,9 @@ class Ticket(Base):
     ticket_number_digits: Mapped[int | None] = mapped_column(Integer,     nullable=True, default=4)
 
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Ticket type — request | incident | problem | change. Plain varchar (like
+    # `source`) so new types can be added without an enum migration.
+    type: Mapped[str] = mapped_column(String(20), nullable=False, default="request", server_default="request")
     # Plain varchar slug — references Category.slug; supports any admin-created category
     category: Mapped[str] = mapped_column(String(80), nullable=False, default="other", index=True)
     priority: Mapped[TicketPriority] = mapped_column(

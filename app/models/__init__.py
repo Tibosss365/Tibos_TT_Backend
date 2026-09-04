@@ -1,5 +1,5 @@
 from app.models.user import User
-from app.models.ticket import Ticket, TicketTimeline, TicketCategory, TicketPriority, TicketStatus, TimelineType, TicketSource, SLAStatus
+from app.models.ticket import Ticket, TicketTimeline, TicketCategory, TicketPriority, TicketStatus, TimelineType, TicketSource, TicketType, SLAStatus
 from app.models.login_session import LoginSession
 from app.models.ticket_attachment import TicketAttachment
 from app.models.notification import Notification, NotificationType
@@ -8,6 +8,17 @@ from app.models.inbound_email import InboundEmailConfig, EmailTicketLog, Inbound
 from app.models.category import Category
 from app.models.group import Group
 from app.models.sso import SSOConfig
+from app.models.teams import TeamsConfig, TeamsConversation
+from app.models.knowledge import (
+    KBCategory,
+    KBCategoryTranslation,
+    KBArticle,
+    KBArticleTranslation,
+    KBArticleVersion,
+    KBTag,
+    KBTicketArticleLink,
+    KBArticleFeedback,
+)
 from app.models.feature_models import (
     CustomField,
     TicketTemplate,
@@ -39,6 +50,7 @@ __all__ = [
     "TicketPriority",
     "TicketStatus",
     "TicketSource",
+    "TicketType",
     "SLAStatus",
     "TimelineType",
     "Notification",
@@ -52,6 +64,17 @@ __all__ = [
     "Category",
     "Group",
     "SSOConfig",
+    "TeamsConfig",
+    "TeamsConversation",
+    # Knowledge base (migration 053)
+    "KBCategory",
+    "KBCategoryTranslation",
+    "KBArticle",
+    "KBArticleTranslation",
+    "KBArticleVersion",
+    "KBTag",
+    "KBTicketArticleLink",
+    "KBArticleFeedback",
     # Activity / audit
     "LoginSession",
     # Feature models (migration 031)

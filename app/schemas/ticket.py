@@ -66,6 +66,8 @@ class TicketCreate(TicketBase):
     assignee_id: uuid.UUID | None = None
     group_id: str | None = None
     source: str = "portal"
+    # request | incident | problem | change
+    type: str = "request"
     tags: list[str] = []
     custom_field_data: dict = {}
     due_date: datetime | None = None
@@ -76,6 +78,7 @@ class TicketCreate(TicketBase):
 
 class TicketUpdate(BaseModel):
     subject: str | None = None
+    type: str | None = None
     category: str | None = Field(default=None, max_length=80)
     priority: TicketPriority | None = None
     status: TicketStatus | None = None
@@ -101,6 +104,7 @@ class TicketOut(TicketBase):
     id: uuid.UUID
     ticket_number: int
     ticket_id: str
+    type: str = "request"
     group_id: str | None = None   # nullable — not all tickets belong to a group
     status: TicketStatus
     assignee_id: uuid.UUID | None
@@ -175,6 +179,7 @@ class TicketListOut(BaseModel):
     ticket_number: int
     ticket_id: str
     subject: str
+    type: str = "request"
     category: str
     priority: TicketPriority
     status: TicketStatus

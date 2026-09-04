@@ -28,6 +28,7 @@ from app.models.ticket import (
 from app.models.user import User, UserRole
 from app.models.admin import DomainCompany, TicketSettings
 from app.models.notification import Notification
+from app.models.teams import TeamsConfig, TeamsConversation
 from app.services.sla_service import SLAService
 from app.schemas.ticket import (
     AddCommentRequest,
@@ -494,6 +495,7 @@ async def create_ticket(
 
     ticket = Ticket(
         subject=body.subject,
+        type=body.type or "request",
         category=body.category,
         priority=body.priority,
         status=initial_status.value,
@@ -1253,6 +1255,33 @@ async def add_comment(
             author_id=current_user.id,
         ))
         await db.flush()
+
+    # ── Optionally relay the comment into the ticket's linked Teams chat ────
+    if body.send_to_customer:
+        conv_res = await db.execute(
+            select(TeamsConversation).where(TeamsConversation.ticket_id == ticket.id)
+        )
+        conv = conv_res.scalar_one_or_none()
+        if conv:
+            cfg_res = await db.execute(select(TeamsConfig).limit(1))
+            cfg = cfg_res.scalar_one_or_none()
+            if cfg and cfg.enabled and cfg.tenant_id and cfg.app_id and cfg.app_password:
+                try:
+                    from app.services import teams_bot
+                    await teams_bot.send_message(
+                        tenant_id=cfg.tenant_id, app_id=cfg.app_id, app_password=cfg.app_password,
+                        service_url=conv.service_url, conversation_id=conv.conversation_id,
+                        text=f"{current_user.name}: {body.text}",
+                    )
+                    db.add(TicketTimeline(
+                        ticket_id=ticket.id,
+                        type=TimelineType.comment,
+                        text=f"Comment relayed to <strong>Microsoft Teams</strong> by <strong>{current_user.name}</strong>",
+                        author_id=current_user.id,
+                    ))
+                    await db.flush()
+                except Exception as te:
+                    logger.warning(f"[teams] relay failed: {te}")
 
     full = await _get_ticket_or_404(ticket_id, db)
 
