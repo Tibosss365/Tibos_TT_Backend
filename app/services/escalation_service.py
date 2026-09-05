@@ -1,13 +1,16 @@
 """
 Escalation service — periodic background checker.
 
-Every hour it finds open tickets that have exceeded their
-`hours_before_escalation` threshold for a matching EscalationRule,
-and reassigns / notifies accordingly.
+Every hour it finds open tickets whose age has crossed the next tier of a
+matching EscalationRule's ladder (`levels`, ordered by hours ascending) and
+fires that tier — reassign + notify. Ticket.escalation_level tracks how far
+a ticket has already climbed so a tier only fires once; it climbs further
+tiers on later checks as the ticket keeps sitting unresolved, and resets to
+0 if the ticket is reopened after being resolved/closed.
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,60 +56,71 @@ class EscalationService:
     async def _check(self) -> None:
         from app.database import AsyncSessionLocal
         from app.models.feature_models import EscalationRule
-        from app.models.ticket import Ticket, TicketStatus, TicketPriority
+        from app.models.ticket import Ticket, TicketStatus
 
         async with AsyncSessionLocal() as db:
-            # Load all active escalation rules
             result = await db.execute(
                 select(EscalationRule).where(EscalationRule.is_active == True)
             )
             rules = result.scalars().all()
+            now = datetime.now(timezone.utc)
 
             for rule in rules:
-                cutoff = datetime.now(timezone.utc) - timedelta(
-                    hours=rule.hours_before_escalation
-                )
-                # Find matching open tickets older than the threshold
+                levels = sorted((rule.levels or []), key=lambda lv: lv.get("hours", 0))
+                if not levels:
+                    continue
+
                 t_result = await db.execute(
                     select(Ticket).where(
                         Ticket.is_deleted == False,
                         Ticket.status.not_in([TicketStatus.resolved, TicketStatus.closed]),
                         Ticket.priority == rule.priority,
-                        Ticket.created_at <= cutoff,
                     )
                 )
                 tickets = t_result.scalars().all()
 
                 for ticket in tickets:
-                    await self._escalate(ticket, rule, db)
+                    created = ticket.created_at
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    elapsed_hours = (now - created).total_seconds() / 3600
+
+                    # Highest tier whose threshold has already passed.
+                    target_level = 0
+                    for idx, lvl in enumerate(levels, start=1):
+                        if elapsed_hours >= lvl.get("hours", 0):
+                            target_level = idx
+
+                    if target_level > (ticket.escalation_level or 0):
+                        await self._escalate(ticket, rule, levels[target_level - 1], target_level, now, db)
 
             await db.commit()
 
-    async def _escalate(self, ticket, rule, db) -> None:
+    async def _escalate(self, ticket, rule, level_cfg: dict, level_num: int, now: datetime, db) -> None:
         import uuid as _uuid
         from app.services.email_sender import send_email_async
 
         logger.info(
-            f"[escalation] Escalating ticket {ticket.ticket_id} "
-            f"via rule '{rule.name}'"
+            f"[escalation] Ticket {ticket.ticket_id} reached tier {level_num} "
+            f"of rule '{rule.name}'"
         )
 
-        # Reassign to first user in escalate_to_ids (if any)
-        if rule.escalate_to_ids:
+        escalate_to_ids = level_cfg.get("escalate_to_ids") or []
+        if escalate_to_ids:
             try:
-                new_assignee = _uuid.UUID(str(rule.escalate_to_ids[0]))
-                ticket.assignee_id = new_assignee
+                ticket.assignee_id = _uuid.UUID(str(escalate_to_ids[0]))
             except (ValueError, IndexError):
                 pass
 
-        # Send notification email
-        if rule.notify_email:
+        notify_email = level_cfg.get("notify_email")
+        if notify_email:
             try:
                 await send_email_async(
-                    to_addr=rule.notify_email,
-                    subject=f"[ESCALATED] Ticket {ticket.ticket_id} — {ticket.subject}",
+                    to_addr=notify_email,
+                    subject=f"[ESCALATED — Tier {level_num}] Ticket {ticket.ticket_id} — {ticket.subject}",
                     body=(
-                        f"Ticket {ticket.ticket_id} has been escalated via rule '{rule.name}'.\n\n"
+                        f"Ticket {ticket.ticket_id} has reached escalation tier {level_num} "
+                        f"of rule '{rule.name}' ({level_cfg.get('hours')}h threshold).\n\n"
                         f"Subject: {ticket.subject}\n"
                         f"Priority: {ticket.priority}\n"
                         f"Status: {ticket.status}\n"
@@ -115,6 +129,9 @@ class EscalationService:
                 )
             except Exception as exc:
                 logger.warning(f"[escalation] Email notify failed: {exc}")
+
+        ticket.escalation_level = level_num
+        ticket.last_escalated_at = now
 
 
 escalation_service = EscalationService()

@@ -14,7 +14,7 @@ from app.redis_client import close_redis, get_redis
 from app.routers import admin, agents, analytics, auth, dashboard, events, notifications, tickets, ws
 from app.routers import inbound_email, categories, sla, groups
 from app.routers import email_inbox
-from app.routers import csat, admin_features, activity, knowledge
+from app.routers import csat, admin_features, activity, knowledge, company_settings
 from app.routers.sso import auth_router as sso_auth_router, admin_router as sso_admin_router, saml_router as sso_saml_router
 from app.routers.graph_webhook import public_router as graph_public_router, admin_router as graph_admin_router
 from app.routers.teams_bot import public_router as teams_public_router, admin_router as teams_admin_router
@@ -314,6 +314,7 @@ app.include_router(graph_admin_router)     # /inbound-email/{enable,disable,webh
 app.include_router(teams_public_router)    # Teams bot: /api/messages
 app.include_router(teams_admin_router)     # /admin/teams
 app.include_router(knowledge.router)       # /kb/*
+app.include_router(company_settings.router) # /admin/company-settings
 
 
 @app.get("/health", tags=["health"])

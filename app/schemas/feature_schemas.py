@@ -346,22 +346,25 @@ class AssetHistoryOut(BaseModel):
 
 # ── Escalation Rules ──────────────────────────────────────────────────────────
 
+class EscalationLevel(BaseModel):
+    """One tier of an escalation ladder — fires once, hours after ticket creation."""
+    hours: int = Field(..., ge=1)
+    notify_email: str | None = Field(default=None, max_length=255)
+    escalate_to_ids: list[str] = []  # list of user UUID strings; reassigns to the first
+
+
 class EscalationRuleCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     is_active: bool = True
     priority: str = "high"
-    hours_before_escalation: int = Field(default=4, ge=1)
-    escalate_to_ids: list[str] = []  # list of user UUID strings
-    notify_email: str | None = Field(default=None, max_length=255)
+    levels: list[EscalationLevel] = []
 
 
 class EscalationRuleUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     is_active: bool | None = None
     priority: str | None = None
-    hours_before_escalation: int | None = Field(default=None, ge=1)
-    escalate_to_ids: list[str] | None = None
-    notify_email: str | None = None
+    levels: list[EscalationLevel] | None = None
 
 
 class EscalationRuleOut(BaseModel):
@@ -369,9 +372,7 @@ class EscalationRuleOut(BaseModel):
     name: str
     is_active: bool
     priority: str
-    hours_before_escalation: int
-    escalate_to_ids: list[str]
-    notify_email: str | None
+    levels: list[EscalationLevel]
     created_at: datetime
 
     @field_serializer("created_at", when_used="json")

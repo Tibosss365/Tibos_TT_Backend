@@ -298,14 +298,16 @@ class EscalationRule(Base):
     priority: Mapped[str] = mapped_column(
         String(20), nullable=False, default="high", server_default="high"
     )
-    hours_before_escalation: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=4, server_default="4"
-    )
-    # list of user UUIDs (as strings) to reassign/notify
-    escalate_to_ids: Mapped[list] = mapped_column(
+    # Ordered escalation tiers, e.g.:
+    #   [{"hours": 4,  "notify_email": "lead@x.com",   "escalate_to_ids": []},
+    #    {"hours": 8,  "notify_email": "mgr@x.com",    "escalate_to_ids": ["<uuid>"]},
+    #    {"hours": 24, "notify_email": "director@x.com","escalate_to_ids": []}]
+    # A matching open ticket climbs one tier at a time as it ages past each
+    # threshold — see escalation_service.py. Ticket.escalation_level tracks
+    # how far a given ticket has already climbed so a tier only fires once.
+    levels: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list, server_default="'[]'::jsonb"
     )
-    notify_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

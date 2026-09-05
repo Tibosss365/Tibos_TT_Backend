@@ -9,6 +9,7 @@ from app.models.category import Category
 from app.models.group import Group
 from app.models.sso import SSOConfig
 from app.models.teams import TeamsConfig, TeamsConversation
+from app.models.company_settings import CompanySettings
 from app.models.knowledge import (
     KBCategory,
     KBCategoryTranslation,
@@ -66,6 +67,7 @@ __all__ = [
     "SSOConfig",
     "TeamsConfig",
     "TeamsConversation",
+    "CompanySettings",
     # Knowledge base (migration 053)
     "KBCategory",
     "KBCategoryTranslation",

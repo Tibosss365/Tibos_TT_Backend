@@ -927,6 +927,7 @@ async def update_ticket(
         and update_data["status"] in (TicketStatus.open, TicketStatus.in_progress)
     ):
         ticket.reopen_count = (ticket.reopen_count or 0) + 1
+        ticket.escalation_level = 0  # reopened tickets get a fresh escalation ladder
 
     ticket.updated_at = datetime.now(timezone.utc)
 
@@ -1056,6 +1057,7 @@ async def update_ticket(
             and old_status in (TicketStatus.resolved, TicketStatus.closed)
         ):
             ticket.reopen_count = (ticket.reopen_count or 0) + 1
+            ticket.escalation_level = 0
 
     # ── Automation engine ────────────────────────────────────────────────────
     try:
