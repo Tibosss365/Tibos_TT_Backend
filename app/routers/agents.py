@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 
 from app.core.deps import get_current_user, require_admin
-from app.core.security import hash_password
+from app.core.security import hash_password, validate_password_strength
 from app.database import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserOut, UserUpdate
@@ -31,6 +31,11 @@ async def create_agent(
     existing = await db.execute(select(User).where(User.username == body.username))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Username already taken")
+
+    try:
+        validate_password_strength(body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     user = User(
         name=body.name,
@@ -83,7 +88,12 @@ async def update_agent(
         update_data["initials"] = "".join(w[0] for w in words).upper()[:4]
 
     if "password" in update_data:
-        update_data["hashed_password"] = hash_password(update_data.pop("password"))
+        new_password = update_data.pop("password")
+        try:
+            validate_password_strength(new_password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        update_data["hashed_password"] = hash_password(new_password)
     for key, val in update_data.items():
         setattr(user, key, val)
 

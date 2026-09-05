@@ -776,14 +776,18 @@ async def update_own_settings(
     db: AsyncSession = Depends(get_db),
 ):
     """Allow any authenticated user to update their own name, timezone, and password."""
-    from app.core.security import verify_password, get_password_hash
+    from app.core.security import verify_password, hash_password, validate_password_strength
 
     if body.new_password:
         if not body.current_password:
             raise HTTPException(status_code=400, detail="current_password is required to change password")
         if not verify_password(body.current_password, current_user.hashed_password):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
-        current_user.hashed_password = get_password_hash(body.new_password)
+        try:
+            validate_password_strength(body.new_password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        current_user.hashed_password = hash_password(body.new_password)
 
     if body.name:
         current_user.name = body.name

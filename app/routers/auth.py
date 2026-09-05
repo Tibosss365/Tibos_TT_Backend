@@ -81,10 +81,20 @@ async def _record_login_session(
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    from app.services.login_throttle import check_locked_out, record_failed_attempt, reset_attempts
+
+    locked_for = await check_locked_out(body.username)
+    if locked_for:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed attempts. Try again in {max(1, locked_for // 60)} minute(s).",
+        )
+
     result = await db.execute(select(User).where(User.username == body.username))
     user: User | None = result.scalar_one_or_none()
 
     if not user or not verify_password(body.password, user.hashed_password):
+        await record_failed_attempt(body.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
@@ -94,6 +104,7 @@ async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is disabled",
         )
+    await reset_attempts(body.username)
 
     # Persist login session to DB
     session = await _record_login_session(request, user, db)
@@ -162,11 +173,20 @@ async def login_with_totp(
     Accepts either a 6-digit TOTP code or an 8-char backup code.
     """
     from app.services.totp_service import verify_code, consume_backup_code
+    from app.services.login_throttle import check_locked_out, record_failed_attempt, reset_attempts
+
+    locked_for = await check_locked_out(body.username)
+    if locked_for:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed attempts. Try again in {max(1, locked_for // 60)} minute(s).",
+        )
 
     result = await db.execute(select(User).where(User.username == body.username))
     user: User | None = result.scalar_one_or_none()
 
     if not user or not verify_password(body.password, user.hashed_password):
+        await record_failed_attempt(body.username)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled")
@@ -176,15 +196,19 @@ async def login_with_totp(
     # Try TOTP code first
     if body.totp_code:
         if not verify_code(user.totp_secret, body.totp_code):
+            await record_failed_attempt(body.username)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid 2FA code")
     elif body.backup_code:
         matched, updated_codes = consume_backup_code(user.totp_backup_codes or [], body.backup_code)
         if not matched:
+            await record_failed_attempt(body.username)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid backup code")
         user.totp_backup_codes = updated_codes
         await db.commit()
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="totp_code or backup_code required")
+
+    await reset_attempts(body.username)
 
     # Persist login session to DB
     session = await _record_login_session(request, user, db)

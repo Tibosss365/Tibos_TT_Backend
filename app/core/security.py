@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -6,6 +7,22 @@ from jose import JWTError, jwt
 from app.config import get_settings
 
 settings = get_settings()
+
+
+def validate_password_strength(password: str) -> None:
+    """Raise ValueError with a user-facing message if the password is too weak.
+
+    Only call this on write paths (an agent/admin being created, a password
+    being changed) — never on login/verify, so existing accounts with an
+    older, weaker password can still log in (and are prompted to change it
+    going forward, not locked out retroactively).
+    """
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+    if not re.search(r"[A-Za-z]", password):
+        raise ValueError("Password must contain at least one letter.")
+    if not re.search(r"[0-9]", password):
+        raise ValueError("Password must contain at least one number.")
 
 
 def hash_password(plain: str) -> str:
