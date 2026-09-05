@@ -670,6 +670,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                                 received_at=parsed["received_at"],
                                 status=EmailLogStatus.filtered,
                                 error_message=str(e),
+                                body=parsed.get("body", ""),
                             )
                             filt_db.add(filt_log)
                             await filt_db.commit()
@@ -679,19 +680,12 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                         )
 
                     except ValueError:
-                        # Duplicate – mark seen silently
-                        async with AsyncSessionLocal() as dup_db:
-                            dup_log = EmailTicketLog(
-                                inbound_config_id=inbound.id,
-                                message_id=parsed["message_id"],
-                                from_email=parsed["from_email"],
-                                from_name=parsed["from_name"],
-                                subject=parsed["subject"],
-                                received_at=parsed["received_at"],
-                                status=EmailLogStatus.duplicate,
-                            )
-                            dup_db.add(dup_log)
-                            await dup_db.commit()
+                        # Duplicate message_id — a log row already exists from
+                        # this message's first delivery (whatever the outcome
+                        # was), so there's nothing new to record. Inserting
+                        # another row here would violate the unique index on
+                        # message_id anyway.
+                        logger.debug(f"Duplicate message_id skipped: {parsed.get('message_id')}")
 
                     except Exception as e:
                         logger.error(f"Error creating ticket from email {uid}: {e}")
@@ -705,6 +699,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                                 received_at=parsed.get("received_at"),
                                 status=EmailLogStatus.error,
                                 error_message=str(e),
+                                body=parsed.get("body", ""),
                             )
                             err_db.add(err_log)
                             await err_db.commit()
@@ -884,6 +879,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                             received_at=received_at,
                             status=EmailLogStatus.filtered,
                             error_message=str(e),
+                            body=body_text,
                         )
                         filt_db.add(filt_log)
                         await filt_db.commit()
@@ -893,9 +889,26 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                     )
 
                 except ValueError:
-                    pass  # duplicate
+                    # Duplicate message_id — a log row already exists from this
+                    # message's first delivery; inserting another would violate
+                    # the unique index on message_id.
+                    logger.debug(f"Duplicate message_id skipped: {message_id}")
                 except Exception as e:
                     logger.error(f"Graph ticket creation error: {e}")
+                    async with AsyncSessionLocal() as err_db:
+                        err_log = EmailTicketLog(
+                            inbound_config_id=inbound.id,
+                            message_id=message_id,
+                            from_email=from_email,
+                            from_name=from_name,
+                            subject=subject,
+                            received_at=received_at,
+                            status=EmailLogStatus.error,
+                            error_message=str(e),
+                            body=body_text,
+                        )
+                        err_db.add(err_log)
+                        await err_db.commit()
 
             # Mark as read in Graph
             await _graph_mark_read(mailbox, access_token, msg["id"])

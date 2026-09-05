@@ -108,8 +108,16 @@ class EmailTicketLogOut(BaseModel):
     ticket_number: str | None = None   # e.g. "TKT-0042", populated by router
     error_message: str | None
     processed_at: datetime
+    has_body: bool = False   # whether this entry can be manually converted
 
     model_config = {"from_attributes": True}
+
+
+class EmailTicketLogDetail(EmailTicketLogOut):
+    """Single-entry fetch — includes the actual body (omitted from the list
+    response to keep that payload light; Graph bodies can embed inline
+    images as data: URIs and get large)."""
+    body: str | None = None
 
 
 class EmailLogPage(BaseModel):

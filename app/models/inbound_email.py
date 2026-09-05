@@ -133,6 +133,10 @@ class EmailTicketLog(Base):
         nullable=True,
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Email body — saved so a filtered/duplicate/error entry can still be
+    # manually converted into a ticket later (see /inbound-email/logs/{id}/convert).
+    # Null for older rows saved before this column existed.
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
