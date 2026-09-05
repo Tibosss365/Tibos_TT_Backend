@@ -13,11 +13,18 @@ Condition schema (each item in the `conditions` JSONB list):
   {"field": "status", "operator": "in", "value": ["open", "in-progress"]}
 
 Action schema (each item in the `actions` JSONB list):
-  {"type": "assign",          "value": "<user_uuid>"}
-  {"type": "set_priority",    "value": "high"}
-  {"type": "set_status",      "value": "in-progress"}
-  {"type": "add_tag",         "value": "vip"}
-  {"type": "set_group",       "value": "microsoft-365"}
+  {"type": "assign",             "value": "<user_uuid>"}
+  {"type": "assign_least_busy",  "value": "<group_id>"}   # or "*" for any active agent
+  {"type": "set_priority",       "value": "high"}
+  {"type": "set_status",         "value": "in-progress"}
+  {"type": "add_tag",            "value": "vip"}
+  {"type": "set_group",          "value": "microsoft-365"}
+
+assign_least_busy load-balances: among active technicians/admins in the
+given group (or every active agent when value is "*"), it picks whoever
+currently has the fewest open/in-progress/on-hold tickets assigned. Ties
+are broken by name so the pick is deterministic. If no eligible agent is
+found, the ticket is left as-is rather than raising.
 """
 import logging
 import uuid as _uuid
@@ -85,6 +92,33 @@ async def _apply_action(ticket, action: dict, db: AsyncSession) -> None:
             ticket.assignee_id = _uuid.UUID(str(value))
         except (ValueError, AttributeError):
             pass
+
+    elif action_type == "assign_least_busy":
+        from app.models.user import User, UserRole
+        from app.models.ticket import Ticket, TicketStatus
+        from sqlalchemy import func
+
+        group_filter = str(value).strip() if value else ""
+        agents_stmt = select(User).where(
+            User.is_active == True,
+            User.role.in_([UserRole.admin, UserRole.technician]),
+        )
+        if group_filter and group_filter != "*":
+            agents_stmt = agents_stmt.where(User.group == group_filter)
+        agents_stmt = agents_stmt.order_by(User.name)
+        agents = (await db.execute(agents_stmt)).scalars().all()
+        if not agents:
+            logger.warning(f"[automation] assign_least_busy: no active agent found for group '{group_filter or '*'}'")
+        else:
+            open_statuses = (TicketStatus.open, TicketStatus.in_progress, TicketStatus.on_hold)
+            counts_stmt = (
+                select(Ticket.assignee_id, func.count(Ticket.id))
+                .where(Ticket.assignee_id.in_([a.id for a in agents]), Ticket.status.in_(open_statuses))
+                .group_by(Ticket.assignee_id)
+            )
+            load = dict((await db.execute(counts_stmt)).all())
+            winner = min(agents, key=lambda a: load.get(a.id, 0))
+            ticket.assignee_id = winner.id
 
     elif action_type == "set_priority":
         from app.models.ticket import TicketPriority
