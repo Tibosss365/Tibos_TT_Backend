@@ -1237,6 +1237,11 @@ async def add_comment(
             f"<p>You can reply to this email to respond to the agent.</p>"
         )
         owner_cc = owner_emails(ticket.owners, exclude=ticket.email)
+        extra_cc = [
+            addr.strip() for addr in (body.cc or "").replace(";", ",").split(",")
+            if addr.strip() and addr.strip().lower() != (ticket.email or "").lower()
+        ]
+        combined_cc = owner_cc + [addr for addr in extra_cc if addr not in owner_cc]
         await send_ticket_email(
             db, ticket,
             to_email=ticket.email,
@@ -1247,9 +1252,10 @@ async def add_comment(
             in_reply_to=ticket.email_thread_id,
             references=ticket.email_thread_id,
             assignee_name=current_user.name,
-            cc=owner_cc,
+            cc=combined_cc,
         )
-        cc_note = f", cc <strong>{owner_label(ticket.owners)}</strong>" if owner_cc else ""
+        cc_labels = ([owner_label(ticket.owners)] if owner_cc else []) + extra_cc
+        cc_note = f", cc <strong>{', '.join(cc_labels)}</strong>" if cc_labels else ""
         db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.email_out,

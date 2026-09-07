@@ -260,6 +260,7 @@ class BulkTicketAction(BaseModel):
 class AddCommentRequest(BaseModel):
     text: str = Field(..., min_length=1)
     send_to_customer: bool = False
+    cc: str | None = None
 
 
 class TicketDataUpdate(BaseModel):
