@@ -172,6 +172,21 @@ async def clear_logs(
     await db.execute(delete(EmailTicketLog))
 
 
+@router.delete("/logs/{log_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_log_entry(
+    log_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Delete one log entry. Only removes the log/audit row — a ticket it
+    already converted to (if any) is untouched; delete that separately from
+    the ticket list if you actually want it gone."""
+    log = await db.get(EmailTicketLog, log_id)
+    if not log:
+        raise HTTPException(status_code=404, detail="Log entry not found")
+    await db.delete(log)
+
+
 @router.post("/logs/{log_id}/convert", response_model=EmailTicketLogOut)
 async def convert_log_to_ticket(
     log_id: uuid.UUID,
