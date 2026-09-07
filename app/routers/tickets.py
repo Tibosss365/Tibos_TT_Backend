@@ -1254,13 +1254,15 @@ async def add_comment(
             assignee_name=current_user.name,
             cc=combined_cc,
         )
-        cc_labels = ([owner_label(ticket.owners)] if owner_cc else []) + extra_cc
-        cc_note = f", cc <strong>{', '.join(cc_labels)}</strong>" if cc_labels else ""
         db.add(TicketTimeline(
             ticket_id=ticket.id,
             type=TimelineType.email_out,
-            text=f"Comment sent as email to <strong>{ticket.email}</strong>{cc_note} by <strong>{current_user.name}</strong>",
+            text=email_body,
             author_id=current_user.id,
+            email_from=f"{current_user.name} (Helpdesk)",
+            email_to=ticket.email,
+            email_cc=", ".join(combined_cc) if combined_cc else None,
+            email_subject=f"[{ticket.ticket_id}] Update on your ticket",
         ))
         await db.flush()
 

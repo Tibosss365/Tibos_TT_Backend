@@ -432,19 +432,19 @@ async def _process_inbound_email(
 
     if existing_ticket:
         # Append reply as email_in timeline entry on the existing ticket.
-        # `body` may be HTML now — flatten to text for the timeline (which
-        # injects text as HTML) so we don't leak raw email markup/styles.
-        from app.services.email_parser import _strip_html
-        reply_text = _strip_html(body) if ("<" in body and ">" in body) else body
-        safe_body = reply_text[:2000].replace("<", "&lt;").replace(">", "&gt;")
+        # Store the full body as received (including whatever quoted trail
+        # the sender's own mail client attached) rather than flattening and
+        # truncating it — the conversation view is what renders this as a
+        # proper threaded email, so it needs the real content.
+        is_html = "<" in body and ">" in body
+        full_body = body if is_html else f"<div style='white-space:pre-wrap'>{body}</div>"
         db.add(TicketTimeline(
             ticket_id=existing_ticket.id,
             type=TimelineType.email_in,
-            text=(
-                f"<strong>{from_name or from_email}</strong> "
-                f"&lt;{from_email}&gt; replied:<br/>"
-                f"<span style='white-space:pre-wrap'>{safe_body}</span>"
-            ),
+            text=full_body,
+            email_from=f"{from_name} <{from_email}>" if from_name else from_email,
+            email_to=inbound.graph_mailbox or inbound.imap_user or "",
+            email_subject=subject,
         ))
         existing_ticket.updated_at = received_at or datetime.now(timezone.utc)
 

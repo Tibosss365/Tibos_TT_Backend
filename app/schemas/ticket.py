@@ -40,6 +40,10 @@ class TimelineEntryOut(BaseModel):
     type: TimelineType
     text: str
     author: UserPublic | None = None
+    email_from: str | None = None
+    email_to: str | None = None
+    email_cc: str | None = None
+    email_subject: str | None = None
     created_at: datetime
 
     @field_serializer("created_at", when_used="json")

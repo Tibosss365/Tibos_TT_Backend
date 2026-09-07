@@ -293,6 +293,13 @@ class TicketTimeline(Base):
     author_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # Populated only for type in (email_in, email_out) — lets the conversation
+    # view render a real threaded email (sender, recipients, subject) instead
+    # of a generic note. text carries the full HTML body, untruncated.
+    email_from:    Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_to:      Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_cc:      Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_subject: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
