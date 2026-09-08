@@ -610,14 +610,15 @@ async def create_ticket(
         if msg_id:
             # Store thread ID for reply matching and log in timeline
             ticket.email_thread_id = msg_id
-            cc_note = (
-                f", cc <strong>{owner_label(full.owners)}</strong>" if owner_cc else ""
-            )
             db.add(TicketTimeline(
                 ticket_id=ticket.id,
                 type=TimelineType.email_out,
-                text=f"Ticket confirmation email sent to <strong>{full.email}</strong>{cc_note}",
+                text=email_body,
                 author_id=current_user.id,
+                email_from="Helpdesk",
+                email_to=full.email,
+                email_cc=", ".join(owner_cc) if owner_cc else None,
+                email_subject=f"[{full.ticket_id}] {full.subject}",
             ))
             await db.flush()
 
@@ -1164,14 +1165,15 @@ async def update_ticket(
                 include_reopen=email_cfg_data.get("include_reopen", False),
                 cc=owner_cc,
             )
-            cc_note = (
-                f", cc <strong>{owner_label(full.owners)}</strong>" if owner_cc else ""
-            )
             db.add(TicketTimeline(
                 ticket_id=full.id,
                 type=TimelineType.email_out,
-                text=f"Status update email sent to <strong>{full.email}</strong>{cc_note}",
+                text=email_cfg_data["body"],
                 author_id=current_user.id,
+                email_from="Helpdesk",
+                email_to=full.email,
+                email_cc=", ".join(owner_cc) if owner_cc else None,
+                email_subject=email_cfg_data["subject"],
             ))
             await db.flush()
 
