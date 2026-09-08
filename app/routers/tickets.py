@@ -1244,6 +1244,10 @@ async def add_comment(
             if addr.strip() and addr.strip().lower() != (ticket.email or "").lower()
         ]
         combined_cc = owner_cc + [addr for addr in extra_cc if addr not in owner_cc]
+        bcc_list = [
+            addr.strip() for addr in (body.bcc or "").replace(";", ",").split(",")
+            if addr.strip()
+        ]
         await send_ticket_email(
             db, ticket,
             to_email=ticket.email,
@@ -1255,6 +1259,7 @@ async def add_comment(
             references=ticket.email_thread_id,
             assignee_name=current_user.name,
             cc=combined_cc,
+            bcc=bcc_list,
         )
         db.add(TicketTimeline(
             ticket_id=ticket.id,

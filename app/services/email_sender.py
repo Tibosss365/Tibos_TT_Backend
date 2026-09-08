@@ -274,6 +274,7 @@ async def _send_via_graph(
     subject: str,
     html_body: str,
     cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
 ) -> None:
     """Send an email via Microsoft Graph API /sendMail."""
     url = f"https://graph.microsoft.com/v1.0/users/{from_email}/sendMail"
@@ -288,6 +289,10 @@ async def _send_via_graph(
     if cc:
         payload["message"]["ccRecipients"] = [
             {"emailAddress": {"address": addr}} for addr in cc
+        ]
+    if bcc:
+        payload["message"]["bccRecipients"] = [
+            {"emailAddress": {"address": addr}} for addr in bcc
         ]
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(url, json=payload, headers={
@@ -626,6 +631,7 @@ async def send_ticket_email(
     assignee_name: str | None = None,
     include_reopen: bool = False,
     cc: List[str] | None = None,
+    bcc: List[str] | None = None,
 ) -> str | None:
     """
     Send an HTML email for a ticket event.
@@ -636,6 +642,8 @@ async def send_ticket_email(
     include_reopen — when True (resolved emails only), renders a "Reopen Ticket" mailto button.
     cc             — extra addresses copied on the mail (account owners); the
                      recipient in ``to_email`` is dropped from it automatically.
+    bcc            — extra addresses blind-copied (never appear in headers seen
+                     by To/Cc recipients).
     """
     result = await db.execute(select(EmailConfig))
     cfg: EmailConfig | None = result.scalar_one_or_none()
@@ -651,6 +659,10 @@ async def send_ticket_email(
     cc_list = list(dict.fromkeys(
         addr.strip().lower() for addr in (cc or [])
         if addr and addr.strip().lower() != _to_lower
+    ))
+    bcc_list = list(dict.fromkeys(
+        addr.strip().lower() for addr in (bcc or [])
+        if addr and addr.strip().lower() != _to_lower and addr.strip().lower() not in cc_list
     ))
 
     # Build reopen mailto URL from the helpdesk's from-address
@@ -672,17 +684,17 @@ async def send_ticket_email(
         if email_type == "smtp":
             return await _send_ticket_via_smtp(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                in_reply_to, references, assignee_name, reopen_url, cc_list,
+                in_reply_to, references, assignee_name, reopen_url, cc_list, bcc_list,
             )
         elif email_type == "m365":
             return await _send_ticket_via_m365(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                assignee_name, reopen_url, cc_list,
+                assignee_name, reopen_url, cc_list, bcc_list,
             )
         elif email_type == "oauth":
             return await _send_ticket_via_oauth(
                 cfg, ticket, to_email, subject, body_html, action_label, action_color,
-                assignee_name, reopen_url, cc_list,
+                assignee_name, reopen_url, cc_list, bcc_list,
             )
         else:
             logger.warning(f"Unknown email type '{email_type}' — skipping ticket email")
@@ -705,6 +717,7 @@ async def _send_ticket_via_smtp(
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
     cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
 ) -> Optional[str]:
     from_addr = cfg.smtp_from or cfg.smtp_user or ""
     if not from_addr or not cfg.smtp_host:
@@ -730,7 +743,9 @@ async def _send_ticket_via_smtp(
 
     port = int(cfg.smtp_port or 587)
     host = cfg.smtp_host or ""
-    envelope_to = [to_email] + list(cc or [])
+    # Bcc addresses go in the envelope recipients only — never a "Bcc:" header,
+    # which would leak them to every other recipient.
+    envelope_to = [to_email] + list(cc or []) + list(bcc or [])
 
     if cfg.smtp_security == SMTPSecurity.ssl:
         ctx = ssl.create_default_context()
@@ -762,6 +777,7 @@ async def _send_ticket_via_m365(
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
     cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
 ) -> Optional[str]:
     if not cfg.m365_tenant_id or not cfg.m365_client_id or not cfg.m365_client_secret or not cfg.m365_from:
         logger.debug("M365 not fully configured — skipping ticket email")
@@ -779,6 +795,7 @@ async def _send_ticket_via_m365(
         subject=subject,
         html_body=html_body,
         cc=cc,
+        bcc=bcc,
     )
 
     _cc_note = f" (cc: {', '.join(cc)})" if cc else ""
@@ -797,6 +814,7 @@ async def _send_ticket_via_oauth(
     assignee_name: Optional[str] = None,
     reopen_url: Optional[str] = None,
     cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
 ) -> Optional[str]:
     if not cfg.oauth_access_token or not cfg.oauth_from:
         logger.debug("OAuth not authorized — skipping ticket email")
@@ -815,6 +833,7 @@ async def _send_ticket_via_oauth(
             subject=subject,
             html_body=html_body,
             cc=cc,
+            bcc=bcc,
         )
     elif provider == "google":
         import base64
@@ -838,7 +857,7 @@ async def _send_ticket_via_oauth(
             server.starttls(context=ctx)
             server.ehlo()
             server.docmd("AUTH", f"XOAUTH2 {auth_b64}")
-            server.sendmail(from_email, [to_email] + list(cc or []), msg_full.as_bytes())
+            server.sendmail(from_email, [to_email] + list(cc or []) + list(bcc or []), msg_full.as_bytes())
     else:
         logger.warning(f"Unsupported OAuth provider '{provider}' for ticket email")
         return None
