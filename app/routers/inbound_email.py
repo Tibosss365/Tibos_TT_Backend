@@ -134,16 +134,19 @@ async def get_logs(
     )
     logs = result.scalars().all()
 
+    ticket_ids = {log.ticket_id for log in logs if log.ticket_id}
+    ticket_numbers: dict[uuid.UUID, str] = {}
+    if ticket_ids:
+        ticket_res = await db.execute(
+            select(Ticket.id, Ticket.ticket_id).where(Ticket.id.in_(ticket_ids))
+        )
+        ticket_numbers = {ticket_id: number for ticket_id, number in ticket_res.all()}
+
     items: list[EmailTicketLogOut] = []
     for log in logs:
         out = EmailTicketLogOut.model_validate(log)
         out.has_body = bool(log.body)
-        # Attach human-readable ticket number if available
-        if log.ticket_id:
-            t_res = await db.execute(select(Ticket).where(Ticket.id == log.ticket_id))
-            ticket = t_res.scalar_one_or_none()
-            if ticket:
-                out.ticket_number = ticket.ticket_id
+        out.ticket_number = ticket_numbers.get(log.ticket_id)
         items.append(out)
 
     return EmailLogPage(items=items, total=total)

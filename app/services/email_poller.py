@@ -36,6 +36,7 @@ Message-ID) and step 5g calls PATCH /messages/{id} {"isRead": true}.
 
 import asyncio
 import base64
+import html
 import logging
 import re
 import uuid
@@ -297,7 +298,7 @@ async def _graph_get_recent(
         "/mailFolders/inbox/messages"
         f"?$filter=receivedDateTime ge {since_iso}"
         "&$orderby=receivedDateTime asc"
-        "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
+        "&$select=id,subject,from,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
         "&$top=50"
     )
     messages: list[dict] = []
@@ -332,6 +333,20 @@ async def _graph_get_recent(
             messages.extend(page.get("value", []))
             next_url = page.get("@odata.nextLink")
     return messages
+
+
+async def _graph_get_message_body(mailbox: str, token: str, message_id: str) -> dict:
+    """Fetch a message body only after its ID passes the duplicate check."""
+    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/messages/{message_id}?$select=body"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Graph message body fetch failed ({resp.status_code}): {resp.text}")
+    return resp.json().get("body", {})
 
 async def _graph_get_attachments(
     mailbox: str, token: str, msg_id: str
@@ -467,6 +482,50 @@ async def _process_inbound_email(
     existing_log = dup.scalar_one_or_none()
     if existing_log and existing_log.status != EmailLogStatus.error:
         raise DuplicateMessageError(f"Duplicate message_id: {message_id}")
+
+    # Some mail systems deliver the same message as a new mailbox item with a
+    # different provider ID. Suppress only exact same-sender/subject/body copies
+    # received within five minutes; same-subject messages with different bodies
+    # remain separate tickets.
+    if received_at and body and not in_reply_to and not references:
+        window_start = received_at - timedelta(minutes=5)
+        window_end = received_at + timedelta(minutes=5)
+        recent_res = await db.execute(
+            select(EmailTicketLog)
+            .where(
+                EmailTicketLog.status == EmailLogStatus.processed,
+                EmailTicketLog.ticket_id.is_not(None),
+                func.lower(EmailTicketLog.from_email) == from_email.lower(),
+                func.lower(EmailTicketLog.subject) == (subject or "").lower(),
+                EmailTicketLog.received_at >= window_start,
+                EmailTicketLog.received_at <= window_end,
+            )
+            .order_by(EmailTicketLog.processed_at.desc())
+            .limit(20)
+        )
+        body_key = re.sub(
+            r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", body))
+        ).strip().lower()
+        for prior in recent_res.scalars():
+            prior_key = re.sub(
+                r"\s+", " ",
+                html.unescape(re.sub(r"<[^>]*>", " ", prior.body or "")),
+            ).strip().lower()
+            if body_key and body_key == prior_key:
+                await _upsert_email_log(
+                    db,
+                    inbound_config_id=inbound.id,
+                    message_id=message_id,
+                    from_email=from_email,
+                    from_name=from_name,
+                    subject=subject,
+                    received_at=received_at,
+                    status=EmailLogStatus.duplicate,
+                    ticket_id=prior.ticket_id,
+                    error_message="Duplicate email content received within five minutes.",
+                    body=body,
+                )
+                raise DuplicateMessageError("Duplicate email content")
 
     # ── Try to match an existing ticket via threading headers ─────────────
     existing_ticket: Ticket | None = None
@@ -745,6 +804,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
 
                     except DuplicateMessageError:
                         logger.debug(f"Duplicate message_id skipped: {parsed.get('message_id')}")
+                        await db.commit()
                         handled = True
 
                     except Exception as e:
@@ -853,14 +913,43 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
     messages = await _graph_get_recent(mailbox, access_token, since_iso)
     logger.info(f"Graph poller: found {len(messages)} message(s) since {since_iso}")
 
+    # The Graph query intentionally overlaps the prior window. Exclude messages
+    # already handled before downloading bodies/attachments or opening them one
+    # at a time. Error entries remain eligible for retry.
+    candidate_ids = {
+        (msg.get("internetMessageId") or f"<graph-{msg['id']}>").strip().lower()
+        for msg in messages
+    }
+    handled_ids: set[str] = set()
+    if candidate_ids:
+        async with AsyncSessionLocal() as db:
+            candidate_list = list(candidate_ids)
+            for start in range(0, len(candidate_list), 500):
+                handled_res = await db.execute(
+                    select(func.lower(EmailTicketLog.message_id)).where(
+                        func.lower(EmailTicketLog.message_id).in_(candidate_list[start:start + 500]),
+                        EmailTicketLog.status != EmailLogStatus.error,
+                    )
+                )
+                handled_ids.update(handled_res.scalars().all())
+
     for msg in messages:
         handled = False
         try:
+            message_id = (msg.get("internetMessageId") or f"<graph-{msg['id']}>").strip().lower()
+            if message_id in handled_ids:
+                if not msg.get("isRead", False):
+                    try:
+                        await _graph_mark_read(mailbox, access_token, msg["id"])
+                    except Exception as read_error:
+                        errors.append(f"Could not mark '{msg.get('subject', '')}' as read: {read_error}")
+                continue
+
             from_info = msg.get("from", {}).get("emailAddress", {})
             from_email = from_info.get("address", "unknown@unknown")
             from_name  = from_info.get("name", "")
             subject    = msg.get("subject", "(no subject)")
-            body_raw   = msg.get("body", {})
+            body_raw   = await _graph_get_message_body(mailbox, access_token, msg["id"])
             body_text  = body_raw.get("content", "")
             if body_raw.get("contentType", "").lower() == "html":
                 # Keep the HTML so the ticket preserves the email's structure,
@@ -881,8 +970,6 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                     )
                 except Exception:
                     pass
-
-            message_id = (msg.get("internetMessageId") or f"<graph-{msg['id']}>").strip().lower()
 
             # Graph API doesn't expose In-Reply-To directly; check internetMessageHeaders
             in_reply_to = ""
@@ -964,6 +1051,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
 
                 except DuplicateMessageError:
                     logger.debug(f"Duplicate message_id skipped: {message_id}")
+                    await db.commit()
                     handled = True
                 except Exception as e:
                     logger.error(f"Graph ticket creation error: {e}")
@@ -994,6 +1082,26 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
         except Exception as e:
             logger.error(f"Graph message processing error: {e}")
             errors.append(f"{msg.get('subject') or msg.get('id')}: {e}")
+            try:
+                from_info = msg.get("from", {}).get("emailAddress", {})
+                message_id = (
+                    msg.get("internetMessageId") or f"<graph-{msg['id']}>"
+                ).strip().lower()
+                async with AsyncSessionLocal() as err_db:
+                    await _upsert_email_log(
+                        err_db,
+                        inbound_config_id=inbound.id,
+                        message_id=message_id,
+                        from_email=from_info.get("address", "unknown@unknown"),
+                        from_name=from_info.get("name", ""),
+                        subject=msg.get("subject", "(no subject)"),
+                        received_at=None,
+                        status=EmailLogStatus.error,
+                        error_message=str(e),
+                    )
+                    await err_db.commit()
+            except Exception as log_error:
+                logger.error("Could not save Graph message failure log: %s", log_error)
 
     if errors:
         raise PollingError(
@@ -1156,16 +1264,23 @@ class EmailPoller:
         start = datetime.now(timezone.utc)
         processed = 0
         error: str | None = None
+        mailbox_scan_completed = False
 
         try:
             if inbound.auth_type == InboundAuthType.graph:
                 processed = await _poll_graph(inbound, email_cfg)  # type: ignore[arg-type]
             else:
                 processed = await _poll_imap(inbound, email_cfg)  # type: ignore[arg-type]
+            mailbox_scan_completed = True
 
         except Exception as e:
             error = str(e)
             processed = getattr(e, "processed", 0)
+            # A PollingError means the mailbox scan completed and individual
+            # messages were logged, even if one or more failed. Advance the
+            # checkpoint so every 30-second cycle does not replay an ever-
+            # growing batch. Connection/auth failures leave it unchanged.
+            mailbox_scan_completed = isinstance(e, PollingError)
             logger.error(f"poll_once error: {e}")
 
         # Update stats
@@ -1175,7 +1290,7 @@ class EmailPoller:
             if cfg:
                 cfg.last_poll_attempt_at = start
                 cfg.last_poll_error = error[:4000] if error else None
-                if error is None:
+                if mailbox_scan_completed:
                     cfg.last_polled_at = datetime.now(timezone.utc)
                 if processed:
                     cfg.processed_count = (cfg.processed_count or 0) + processed
