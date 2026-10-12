@@ -86,6 +86,8 @@ class InboundEmailConfig(Base):
 
     # ── Stats (updated by poller) ─────────────────────────────────────
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_poll_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_poll_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     processed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

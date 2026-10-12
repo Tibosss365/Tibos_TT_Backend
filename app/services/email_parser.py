@@ -293,7 +293,7 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
     msg = email.message_from_bytes(raw, policy=email.policy.compat32)
 
     # Message-ID
-    message_id = (msg.get("Message-ID") or "").strip()
+    message_id = (msg.get("Message-ID") or "").strip().lower()
     if not message_id:
         # Fallback: synthesise one so we can de-duplicate
         from hashlib import sha256

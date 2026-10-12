@@ -28,6 +28,8 @@ class InboundEmailConfigOut(BaseModel):
     # Filter rules — list of {field, operator, value} dicts
     filter_rules: list[dict] = []
     last_polled_at: datetime | None
+    last_poll_attempt_at: datetime | None = None
+    last_poll_error: str | None = None
     processed_count: int
     updated_at: datetime
 

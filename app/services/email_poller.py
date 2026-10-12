@@ -44,7 +44,7 @@ from typing import Optional
 
 import aioimaplib
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -110,7 +110,9 @@ async def _upsert_email_log(
 ) -> EmailTicketLog:
     """Create or update a message log, allowing failed messages to retry."""
     result = await db.execute(
-        select(EmailTicketLog).where(EmailTicketLog.message_id == message_id)
+        select(EmailTicketLog)
+        .where(func.lower(EmailTicketLog.message_id) == message_id.lower())
+        .limit(1)
     )
     log = result.scalar_one_or_none()
     values = {
@@ -450,8 +452,17 @@ async def _process_inbound_email(
             raise FilteredEmailError(f"Filtered by rule: {rule_desc}")
 
     # De-duplicate check
+    # Serialize processing of the same RFC Message-ID across overlapping polls
+    # and app instances. The transaction lock is released on commit/rollback.
+    canonical_message_id = message_id.strip().lower()
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:message_id))"),
+        {"message_id": canonical_message_id},
+    )
     dup = await db.execute(
-        select(EmailTicketLog).where(EmailTicketLog.message_id == message_id)
+        select(EmailTicketLog).where(
+            func.lower(EmailTicketLog.message_id) == canonical_message_id
+        ).limit(1)
     )
     existing_log = dup.scalar_one_or_none()
     if existing_log and existing_log.status != EmailLogStatus.error:
@@ -871,7 +882,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                 except Exception:
                     pass
 
-            message_id = msg.get("internetMessageId") or f"<graph-{msg['id']}>"
+            message_id = (msg.get("internetMessageId") or f"<graph-{msg['id']}>").strip().lower()
 
             # Graph API doesn't expose In-Reply-To directly; check internetMessageHeaders
             in_reply_to = ""
@@ -1002,6 +1013,7 @@ class EmailPoller:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._running: bool = False
+        self._wake_event = asyncio.Event()
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -1013,14 +1025,21 @@ class EmailPoller:
 
     def stop(self) -> None:
         self._running = False
+        self._wake_event.set()
         if self._task and not self._task.done():
             self._task.cancel()
         logger.info("EmailPoller stopped")
+
+    def wake(self) -> None:
+        """Apply saved enable/interval changes without waiting for old sleep."""
+        self._wake_event.set()
 
     # ── Background loop ────────────────────────────────────────────────
 
     async def _loop(self) -> None:
         while self._running:
+            self._wake_event.clear()
+            cycle_started = asyncio.get_running_loop().time()
             interval = 5  # default minutes
             try:
                 async with AsyncSessionLocal() as db:
@@ -1040,13 +1059,33 @@ class EmailPoller:
                 break
             except Exception as e:
                 logger.error(f"EmailPoller loop error: {e}")
+                await self._record_poll_error(str(e))
 
-            # interval == 0 → near real-time mode (poll every 30 seconds)
-            sleep_secs = 30 if interval == 0 else interval * 60
+            if not self._running:
+                break
+
+            # Keep cadence start-to-start; mailbox latency must not add to the
+            # configured interval. interval == 0 means ~30 seconds.
+            sleep_secs = max(0, (30 if interval == 0 else interval * 60)
+                             - (asyncio.get_running_loop().time() - cycle_started))
             try:
-                await asyncio.sleep(sleep_secs)
+                await asyncio.wait_for(self._wake_event.wait(), timeout=sleep_secs)
             except asyncio.CancelledError:
                 break
+            except asyncio.TimeoutError:
+                pass
+
+    async def _record_poll_error(self, message: str) -> None:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(select(InboundEmailConfig))
+                cfg = result.scalar_one_or_none()
+                if cfg:
+                    cfg.last_poll_attempt_at = datetime.now(timezone.utc)
+                    cfg.last_poll_error = message[:4000]
+                    await db.commit()
+        except Exception as e:
+            logger.error("Could not persist inbound email poll error: %s", e)
 
     # ── Single poll cycle (also called from API for manual trigger) ────
 
@@ -1134,6 +1173,8 @@ class EmailPoller:
             res = await db.execute(select(InboundEmailConfig))
             cfg = res.scalar_one_or_none()
             if cfg:
+                cfg.last_poll_attempt_at = start
+                cfg.last_poll_error = error[:4000] if error else None
                 if error is None:
                     cfg.last_polled_at = datetime.now(timezone.utc)
                 if processed:

@@ -77,10 +77,12 @@ async def upsert_inbound_config(
 
     await db.flush()
     await db.refresh(cfg)
+    await db.commit()
 
     # Restart poller to pick up new interval / enabled state
     if cfg.enabled:
         email_poller.start()
+        email_poller.wake()
     else:
         email_poller.stop()
 
@@ -105,8 +107,10 @@ async def manual_poll(
     except HTTPException:
         raise
     except RuntimeError as e:
+        await email_poller._record_poll_error(str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        await email_poller._record_poll_error(str(e))
         raise HTTPException(status_code=502, detail=f"Poll failed: {e}")
 
 
