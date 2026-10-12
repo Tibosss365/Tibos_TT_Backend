@@ -45,7 +45,7 @@ def upgrade() -> None:
                 ELSE 8
             END * INTERVAL '1 hour'
         )
-        WHERE t.status NOT IN ('resolved', 'closed', 'on-hold')
+        WHERE t.status::TEXT NOT IN ('resolved', 'closed', 'on-hold', 'on_hold')
           AND t.sla_due_at IS NULL
     """)
 

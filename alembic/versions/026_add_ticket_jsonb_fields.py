@@ -15,10 +15,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("tickets", sa.Column("tasks",     JSONB, nullable=False, server_default="'[]'::jsonb"))
-    op.add_column("tickets", sa.Column("work_log",  JSONB, nullable=False, server_default="'[]'::jsonb"))
-    op.add_column("tickets", sa.Column("reminders", JSONB, nullable=False, server_default="'[]'::jsonb"))
-    op.add_column("tickets", sa.Column("approvals", JSONB, nullable=False, server_default="'[]'::jsonb"))
+    op.add_column("tickets", sa.Column("tasks",     JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")))
+    op.add_column("tickets", sa.Column("work_log",  JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")))
+    op.add_column("tickets", sa.Column("reminders", JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")))
+    op.add_column("tickets", sa.Column("approvals", JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")))
 
 
 def downgrade() -> None:

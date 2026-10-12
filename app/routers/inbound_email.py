@@ -99,7 +99,11 @@ async def manual_poll(
     """
     try:
         result = await email_poller.poll_once()
+        if result.get("error"):
+            raise HTTPException(status_code=502, detail=result["error"])
         return PollResult(**result)
+    except HTTPException:
+        raise
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -1,6 +1,7 @@
 from app.models.user import User
 from app.models.ticket import Ticket, TicketTimeline, TicketCategory, TicketPriority, TicketStatus, TimelineType, TicketSource, TicketType, SLAStatus
 from app.models.login_session import LoginSession
+from app.models.audit_log import AuditLog
 from app.models.ticket_attachment import TicketAttachment
 from app.models.notification import Notification, NotificationType
 from app.models.admin import SLAConfig, EmailConfig
@@ -79,6 +80,7 @@ __all__ = [
     "KBArticleFeedback",
     # Activity / audit
     "LoginSession",
+    "AuditLog",
     # Feature models (migration 031)
     "CustomField",
     "TicketTemplate",

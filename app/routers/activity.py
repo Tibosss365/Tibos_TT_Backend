@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.core.deps import get_current_user
 from app.database import get_db
 from app.models.login_session import LoginSession
+from app.models.audit_log import AuditLog
 from app.models.ticket import Ticket, TicketTimeline
 from app.models.user import User, UserRole
 
@@ -75,6 +76,27 @@ class PaginatedModifications(BaseModel):
     pages: int
 
 
+class RequestAuditOut(BaseModel):
+    id: str
+    user_id: str | None = None
+    user_name: str | None = None
+    user_email: str | None = None
+    method: str
+    path: str
+    status_code: int
+    outcome: str
+    ip_address: str | None = None
+    ts: str
+
+
+class PaginatedRequestAudit(BaseModel):
+    items: list[RequestAuditOut]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _fmt_dt(dt: datetime | None) -> str | None:
@@ -84,6 +106,69 @@ def _fmt_dt(dt: datetime | None) -> str | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
+
+
+@router.get("/requests", response_model=PaginatedRequestAudit)
+async def get_request_audit(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    search: str | None = Query(None, description="Filter by user, endpoint, or IP"),
+    method: str | None = Query(None),
+    outcome: str | None = Query(None, pattern="^(pass|fail)$"),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(_require_staff),
+):
+    stmt = select(AuditLog)
+    count_stmt = select(func.count()).select_from(AuditLog)
+    if search:
+        pattern = f"%{search.strip()}%"
+        condition = (
+            AuditLog.user_name.ilike(pattern)
+            | AuditLog.user_email.ilike(pattern)
+            | AuditLog.path.ilike(pattern)
+            | AuditLog.ip_address.ilike(pattern)
+        )
+        stmt = stmt.where(condition)
+        count_stmt = count_stmt.where(condition)
+    if method:
+        method = method.upper()
+        stmt = stmt.where(AuditLog.method == method)
+        count_stmt = count_stmt.where(AuditLog.method == method)
+    if outcome == "pass":
+        stmt = stmt.where(AuditLog.status_code < 400)
+        count_stmt = count_stmt.where(AuditLog.status_code < 400)
+    elif outcome == "fail":
+        stmt = stmt.where(AuditLog.status_code >= 400)
+        count_stmt = count_stmt.where(AuditLog.status_code >= 400)
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    result = await db.execute(
+        stmt.order_by(AuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    items = [
+        RequestAuditOut(
+            id=str(entry.id),
+            user_id=str(entry.user_id) if entry.user_id else None,
+            user_name=entry.user_name,
+            user_email=entry.user_email,
+            method=entry.method,
+            path=entry.path,
+            status_code=entry.status_code,
+            outcome="pass" if entry.status_code < 400 else "fail",
+            ip_address=entry.ip_address,
+            ts=_fmt_dt(entry.created_at),
+        )
+        for entry in result.scalars().all()
+    ]
+    return PaginatedRequestAudit(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=math.ceil(total / page_size) if total else 1,
+    )
 
 
 # ── Login History ──────────────────────────────────────────────────────────────

@@ -82,6 +82,60 @@ class FilteredEmailError(Exception):
     """Raised when an inbound email matches a filter rule and should be skipped."""
 
 
+class DuplicateMessageError(Exception):
+    """Raised when a message already has a non-retryable processing result."""
+
+
+class PollingError(RuntimeError):
+    """A poll had per-message failures after processing some messages."""
+
+    def __init__(self, message: str, processed: int = 0) -> None:
+        super().__init__(message)
+        self.processed = processed
+
+
+async def _upsert_email_log(
+    db: AsyncSession,
+    *,
+    inbound_config_id: uuid.UUID,
+    message_id: str,
+    from_email: str,
+    from_name: str,
+    subject: str,
+    received_at: datetime | None,
+    status: EmailLogStatus,
+    ticket_id: uuid.UUID | None = None,
+    error_message: str | None = None,
+    body: str | None = None,
+) -> EmailTicketLog:
+    """Create or update a message log, allowing failed messages to retry."""
+    result = await db.execute(
+        select(EmailTicketLog).where(EmailTicketLog.message_id == message_id)
+    )
+    log = result.scalar_one_or_none()
+    values = {
+        "inbound_config_id": inbound_config_id,
+        "message_id": message_id,
+        "from_email": from_email,
+        "from_name": from_name,
+        "subject": subject,
+        "received_at": received_at,
+        "status": status,
+        "ticket_id": ticket_id,
+        "error_message": error_message,
+        "body": body,
+        "processed_at": datetime.now(timezone.utc),
+    }
+    if log is None:
+        log = EmailTicketLog(**values)
+        db.add(log)
+    else:
+        for key, value in values.items():
+            setattr(log, key, value)
+    await db.flush()
+    return log
+
+
 def _check_filter_rules(
     rules: list[dict], subject: str, from_email: str
 ) -> tuple[bool, str]:
@@ -235,15 +289,7 @@ async def _get_m365_graph_token(cfg: EmailConfig, db: AsyncSession) -> str:
 async def _graph_get_recent(
     mailbox: str, token: str, since_iso: str
 ) -> list[dict]:
-    """
-    Fetch inbox messages received at/after ``since_iso`` (ISO-8601 UTC, e.g.
-    '2026-07-08T10:00:00Z'), regardless of read/unread state, oldest first.
-
-    Deliberately NOT filtered on isRead: staff who open the shared mailbox in
-    Outlook mark messages read, and an unread-only filter would then skip them
-    forever. The Message-ID dedup in _process_inbound_email prevents duplicates
-    when the overlap window re-returns an already-processed message.
-    """
+    """Fetch all inbox messages received at/after ``since_iso``, oldest first."""
     url = (
         f"https://graph.microsoft.com/v1.0/users/{mailbox}"
         "/mailFolders/inbox/messages"
@@ -252,42 +298,38 @@ async def _graph_get_recent(
         "&$select=id,subject,from,body,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
         "&$top=50"
     )
+    messages: list[dict] = []
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=20,
-        )
-    if resp.status_code == 403:
-        err_code = ""
-        try:
-            err_code = resp.json().get("error", {}).get("code", "")
-        except Exception:
-            pass
-        if err_code == "ErrorAccessDenied":
-            raise RuntimeError(
-                f"Graph API 403 ErrorAccessDenied for mailbox '{mailbox}'. "
-                "Permissions are granted, so this is usually a configuration mismatch. Check:\n"
-                "1. Mailbox address — make sure '{mailbox}' is the exact address of an "
-                "Exchange Online mailbox in YOUR tenant (no typos, correct domain).\n"
-                "2. Tenant ID — the Tenant ID in Admin → Email → Outbound must match the "
-                "tenant where that mailbox lives (check Azure Portal → Overview for your "
-                "Directory/Tenant ID).\n"
-                "3. Mailbox type — the mailbox must be Exchange Online (not on-premises). "
-                "Shared mailboxes work; distribution lists do not."
+        next_url: str | None = url
+        while next_url:
+            resp = await client.get(
+                next_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=20,
             )
-        raise RuntimeError(
-            f"Graph API 403 for mailbox '{mailbox}': {resp.text}"
-        )
-    if resp.status_code == 404:
-        raise RuntimeError(
-            f"Graph API 404 — mailbox '{mailbox}' not found in this tenant. "
-            "Verify the shared mailbox address is correct and exists in Exchange Online."
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Graph API error {resp.status_code}: {resp.text}")
-    return resp.json().get("value", [])
-
+            if resp.status_code == 403:
+                err_code = ""
+                try:
+                    err_code = resp.json().get("error", {}).get("code", "")
+                except Exception:
+                    pass
+                if err_code == "ErrorAccessDenied":
+                    raise RuntimeError(
+                        f"Graph API 403 ErrorAccessDenied for mailbox '{mailbox}'. "
+                        "Check that the mailbox address and tenant ID match, and that the "
+                        "mailbox exists in Exchange Online."
+                    )
+                raise RuntimeError(f"Graph API 403 for mailbox '{mailbox}': {resp.text}")
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"Graph API 404: mailbox '{mailbox}' not found in this tenant."
+                )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Graph API error {resp.status_code}: {resp.text}")
+            page = resp.json()
+            messages.extend(page.get("value", []))
+            next_url = page.get("@odata.nextLink")
+    return messages
 
 async def _graph_get_attachments(
     mailbox: str, token: str, msg_id: str
@@ -301,7 +343,7 @@ async def _graph_get_attachments(
 async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/messages/{msg_id}"
     async with httpx.AsyncClient() as client:
-        await client.patch(
+        resp = await client.patch(
             url,
             json={"isRead": True},
             headers={
@@ -310,6 +352,7 @@ async def _graph_mark_read(mailbox: str, token: str, msg_id: str) -> None:
             },
             timeout=10,
         )
+        resp.raise_for_status()
 
 
 # ── Ticket creation helper ────────────────────────────────────────────────────
@@ -410,8 +453,9 @@ async def _process_inbound_email(
     dup = await db.execute(
         select(EmailTicketLog).where(EmailTicketLog.message_id == message_id)
     )
-    if dup.scalar_one_or_none():
-        raise ValueError(f"Duplicate message_id: {message_id}")
+    existing_log = dup.scalar_one_or_none()
+    if existing_log and existing_log.status != EmailLogStatus.error:
+        raise DuplicateMessageError(f"Duplicate message_id: {message_id}")
 
     # ── Try to match an existing ticket via threading headers ─────────────
     existing_ticket: Ticket | None = None
@@ -448,7 +492,8 @@ async def _process_inbound_email(
         ))
         existing_ticket.updated_at = received_at or datetime.now(timezone.utc)
 
-        log = EmailTicketLog(
+        log = await _upsert_email_log(
+            db,
             inbound_config_id=inbound.id,
             message_id=message_id,
             from_email=from_email,
@@ -457,8 +502,8 @@ async def _process_inbound_email(
             received_at=received_at,
             status=EmailLogStatus.processed,
             ticket_id=existing_ticket.id,
+            body=body,
         )
-        db.add(log)
         # ── Save attachments on replies too ───────────────────────────────
         if attachments:
             raw_list = _to_raw_attachment_list(attachments)
@@ -530,7 +575,8 @@ async def _process_inbound_email(
             text="Auto-assigned by inbound email rule",
         ))
 
-    log = EmailTicketLog(
+    log = await _upsert_email_log(
+        db,
         inbound_config_id=inbound.id,
         message_id=message_id,
         from_email=from_email,
@@ -539,6 +585,7 @@ async def _process_inbound_email(
         received_at=received_at,
         status=EmailLogStatus.processed,
         ticket_id=ticket.id,
+        body=body,
     )
     # ── Save attachments via object storage ──────────────────────────────
     if attachments:
@@ -546,8 +593,6 @@ async def _process_inbound_email(
             db, ticket.id, _to_raw_attachment_list(attachments), skip_inline=True
         )
 
-    db.add(log)
-    await db.flush()
     return ticket, log, False
 
 
@@ -556,6 +601,7 @@ async def _process_inbound_email(
 async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int:
     """Connect to IMAP, fetch UNSEEN messages, create tickets. Returns count."""
     processed = 0
+    errors: list[str] = []
 
     # Determine credentials
     user = inbound.imap_user or ""
@@ -605,10 +651,12 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
         logger.info(f"Email poller: found {len(uid_list)} unseen message(s)")
 
         for uid in uid_list:
+            handled = False
             try:
-                # Fetch raw RFC822 bytes
-                fetch_res = await client.fetch(uid, "(RFC822)")
+                # PEEK avoids marking the message read before ticket creation succeeds.
+                fetch_res = await client.fetch(uid, "(BODY.PEEK[])")
                 if fetch_res[0] != "OK":
+                    errors.append(f"UID {uid}: IMAP FETCH failed")
                     continue
 
                 # aioimaplib returns lines; find the bytes line
@@ -618,6 +666,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                         raw = part
                         break
                 if not raw:
+                    errors.append(f"UID {uid}: IMAP FETCH returned no message body")
                     continue
 
                 parsed = parse_raw_email(raw)
@@ -638,30 +687,34 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                         )
                         await db.commit()
                         processed += 1
+                        handled = True
 
-                        # Invalidate cache + broadcast
-                        redis = await get_redis()
-                        await invalidate_tickets(redis)
-                        event_name = "ticket_updated" if is_reply else "ticket_created"
-                        await broadcast_ticket_event(
-                            event_name,
-                            {
-                                "ticket_id": str(ticket.id),
-                                "ticket_number": ticket.ticket_id,
-                                "source": "email",
-                                "from_email": parsed["from_email"],
-                            },
-                        )
                         action = "reply appended to" if is_reply else "created"
                         logger.info(
                             f"Email→Ticket {action}: {ticket.ticket_id} from "
                             f"<{parsed['from_email']}> subject='{parsed['subject'][:60]}'"
                         )
+                        try:
+                            redis = await get_redis()
+                            await invalidate_tickets(redis)
+                            event_name = "ticket_updated" if is_reply else "ticket_created"
+                            await broadcast_ticket_event(
+                                event_name,
+                                {
+                                    "ticket_id": str(ticket.id),
+                                    "ticket_number": ticket.ticket_id,
+                                    "source": "email",
+                                    "from_email": parsed["from_email"],
+                                },
+                            )
+                        except Exception as notify_error:
+                            logger.warning("Email ticket notification failed: %s", notify_error)
 
                     except FilteredEmailError as e:
                         # Email matched a filter rule — log as filtered, skip ticket creation
                         async with AsyncSessionLocal() as filt_db:
-                            filt_log = EmailTicketLog(
+                            await _upsert_email_log(
+                                filt_db,
                                 inbound_config_id=inbound.id,
                                 message_id=parsed["message_id"],
                                 from_email=parsed["from_email"],
@@ -672,25 +725,23 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                                 error_message=str(e),
                                 body=parsed.get("body", ""),
                             )
-                            filt_db.add(filt_log)
                             await filt_db.commit()
+                        handled = True
                         logger.debug(
                             f"Email filtered: '{parsed['subject'][:50]}' "
                             f"from <{parsed['from_email']}> — {e}"
                         )
 
-                    except ValueError:
-                        # Duplicate message_id — a log row already exists from
-                        # this message's first delivery (whatever the outcome
-                        # was), so there's nothing new to record. Inserting
-                        # another row here would violate the unique index on
-                        # message_id anyway.
+                    except DuplicateMessageError:
                         logger.debug(f"Duplicate message_id skipped: {parsed.get('message_id')}")
+                        handled = True
 
                     except Exception as e:
                         logger.error(f"Error creating ticket from email {uid}: {e}")
+                        await db.rollback()
                         async with AsyncSessionLocal() as err_db:
-                            err_log = EmailTicketLog(
+                            await _upsert_email_log(
+                                err_db,
                                 inbound_config_id=inbound.id,
                                 message_id=parsed.get("message_id", f"<error-{uid}>"),
                                 from_email=parsed.get("from_email", "unknown"),
@@ -701,20 +752,20 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                                 error_message=str(e),
                                 body=parsed.get("body", ""),
                             )
-                            err_db.add(err_log)
                             await err_db.commit()
+                        errors.append(f"UID {uid}: {e}")
 
-                # Mark as seen (even on error/dup to avoid re-processing)
-                if inbound.mark_seen:
-                    await client.store(uid, "+FLAGS", r"(\Seen)")
+                if handled:
+                    if inbound.mark_seen:
+                        await client.store(uid, "+FLAGS", r"(\Seen)")
 
-                # Optionally move to processed folder
-                if inbound.move_to_folder:
-                    await client.copy(uid, inbound.move_to_folder)
-                    await client.store(uid, "+FLAGS", r"(\Deleted)")
+                    if inbound.move_to_folder:
+                        await client.copy(uid, inbound.move_to_folder)
+                        await client.store(uid, "+FLAGS", r"(\Deleted)")
 
             except Exception as e:
                 logger.error(f"Failed to process email UID {uid}: {e}")
+                errors.append(f"UID {uid}: {e}")
                 continue
 
         if inbound.move_to_folder:
@@ -725,6 +776,11 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
             await client.logout()
         except Exception:
             pass
+
+    if errors:
+        raise PollingError(
+            f"{len(errors)} email(s) failed; first error: {errors[0]}", processed
+        )
 
     return processed
 
@@ -748,6 +804,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
         )
 
     processed = 0
+    errors: list[str] = []
     async with AsyncSessionLocal() as db:
         # Reload email_cfg inside the session so we can write back the cached token
         from app.models.admin import EmailType
@@ -786,6 +843,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
     logger.info(f"Graph poller: found {len(messages)} message(s) since {since_iso}")
 
     for msg in messages:
+        handled = False
         try:
             from_info = msg.get("from", {}).get("emailAddress", {})
             from_email = from_info.get("address", "unknown@unknown")
@@ -853,24 +911,29 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                     )
                     await db.commit()
                     processed += 1
+                    handled = True
 
-                    redis = await get_redis()
-                    await invalidate_tickets(redis)
-                    event_name = "ticket_updated" if is_reply else "ticket_created"
-                    await broadcast_ticket_event(
-                        event_name,
-                        {
-                            "ticket_id":     str(ticket.id),
-                            "ticket_number": ticket.ticket_id,
-                            "source":        "email_graph",
-                            "from_email":    from_email,
-                        },
-                    )
+                    try:
+                        redis = await get_redis()
+                        await invalidate_tickets(redis)
+                        event_name = "ticket_updated" if is_reply else "ticket_created"
+                        await broadcast_ticket_event(
+                            event_name,
+                            {
+                                "ticket_id":     str(ticket.id),
+                                "ticket_number": ticket.ticket_id,
+                                "source":        "email_graph",
+                                "from_email":    from_email,
+                            },
+                        )
+                    except Exception as notify_error:
+                        logger.warning("Graph email ticket notification failed: %s", notify_error)
 
                 except FilteredEmailError as e:
                     # Email matched a filter rule — log as filtered, skip ticket
                     async with AsyncSessionLocal() as filt_db:
-                        filt_log = EmailTicketLog(
+                        await _upsert_email_log(
+                            filt_db,
                             inbound_config_id=inbound.id,
                             message_id=message_id,
                             from_email=from_email,
@@ -881,22 +944,22 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                             error_message=str(e),
                             body=body_text,
                         )
-                        filt_db.add(filt_log)
                         await filt_db.commit()
+                    handled = True
                     logger.debug(
                         f"Graph email filtered: '{subject[:50]}' "
                         f"from <{from_email}> — {e}"
                     )
 
-                except ValueError:
-                    # Duplicate message_id — a log row already exists from this
-                    # message's first delivery; inserting another would violate
-                    # the unique index on message_id.
+                except DuplicateMessageError:
                     logger.debug(f"Duplicate message_id skipped: {message_id}")
+                    handled = True
                 except Exception as e:
                     logger.error(f"Graph ticket creation error: {e}")
+                    await db.rollback()
                     async with AsyncSessionLocal() as err_db:
-                        err_log = EmailTicketLog(
+                        await _upsert_email_log(
+                            err_db,
                             inbound_config_id=inbound.id,
                             message_id=message_id,
                             from_email=from_email,
@@ -907,15 +970,24 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                             error_message=str(e),
                             body=body_text,
                         )
-                        err_db.add(err_log)
                         await err_db.commit()
+                    errors.append(f"{subject or message_id}: {e}")
 
-            # Mark as read in Graph
-            await _graph_mark_read(mailbox, access_token, msg["id"])
+            if handled:
+                try:
+                    await _graph_mark_read(mailbox, access_token, msg["id"])
+                except Exception as read_error:
+                    errors.append(f"Could not mark '{subject}' as read: {read_error}")
+                    logger.error("Graph mark-read failed for %s: %s", message_id, read_error)
 
         except Exception as e:
             logger.error(f"Graph message processing error: {e}")
+            errors.append(f"{msg.get('subject') or msg.get('id')}: {e}")
 
+    if errors:
+        raise PollingError(
+            f"{len(errors)} email(s) failed; first error: {errors[0]}", processed
+        )
     return processed
 
 
@@ -1054,6 +1126,7 @@ class EmailPoller:
 
         except Exception as e:
             error = str(e)
+            processed = getattr(e, "processed", 0)
             logger.error(f"poll_once error: {e}")
 
         # Update stats
@@ -1061,7 +1134,8 @@ class EmailPoller:
             res = await db.execute(select(InboundEmailConfig))
             cfg = res.scalar_one_or_none()
             if cfg:
-                cfg.last_polled_at = datetime.now(timezone.utc)
+                if error is None:
+                    cfg.last_polled_at = datetime.now(timezone.utc)
                 if processed:
                     cfg.processed_count = (cfg.processed_count or 0) + processed
                 await db.commit()

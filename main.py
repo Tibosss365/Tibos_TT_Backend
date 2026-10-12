@@ -24,6 +24,7 @@ from app.services.report_scheduler import report_scheduler
 from app.services.condition_alert_service import condition_alert_service
 from app.services.audit_cleanup import audit_cleanup
 from app.services.trash_cleanup import trash_cleanup
+from app.middleware.request_audit import RequestAuditMiddleware
 from app.services.escalation_service import escalation_service
 from app.services.recurring_ticket_service import recurring_ticket_service
 
@@ -54,6 +55,27 @@ async def _auto_migrate() -> None:
         except Exception as first_err:
             err_lower = str(first_err).lower()
             if "already exists" in err_lower or "duplicate" in err_lower:
+                # Only treat this as an untracked pre-existing schema when the
+                # core tables are actually present. A duplicate during a fresh
+                # install must remain visible instead of stamping an empty DB.
+                async def _has_existing_schema() -> bool:
+                    import asyncpg
+
+                    db_url = settings.DATABASE_URL.replace(
+                        "postgresql+asyncpg://", "postgresql://", 1
+                    )
+                    conn = await asyncpg.connect(db_url)
+                    try:
+                        return await conn.fetchval(
+                            "SELECT to_regclass('public.users') IS NOT NULL "
+                            "AND to_regclass('public.tickets') IS NOT NULL "
+                            "AND to_regclass('public.sla_config') IS NOT NULL"
+                        )
+                    finally:
+                        await conn.close()
+
+                if not asyncio.run(_has_existing_schema()):
+                    raise
                 _log("  Detected untracked schema — stamping to baseline (006)…")
                 alembic_command.stamp(cfg, "006")
                 alembic_command.upgrade(cfg, "head")
@@ -257,7 +279,7 @@ app = FastAPI(
     version=settings.APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
-
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -267,6 +289,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestAuditMiddleware)
 
 
 @app.exception_handler(Exception)

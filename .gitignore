@@ -1,4 +1,6 @@
 .env
 .venv
+.uv-cache
+.local-postgres
 __pycache__
 .claude

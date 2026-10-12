@@ -59,6 +59,7 @@ def upgrade() -> None:
     op.create_index("ix_tickets_category", "tickets", ["category"])
 
     # ── 4. Change inbound_email_config.default_category: enum → varchar ─────
+    op.execute("ALTER TABLE inbound_email_config ALTER COLUMN default_category DROP DEFAULT")
     op.execute(
         "ALTER TABLE inbound_email_config "
         "ALTER COLUMN default_category TYPE VARCHAR(80) USING default_category::TEXT"
@@ -67,6 +68,7 @@ def upgrade() -> None:
     op.execute(
         "UPDATE inbound_email_config SET default_category = 'email'"
     )
+    op.execute("ALTER TABLE inbound_email_config ALTER COLUMN default_category SET DEFAULT 'email'")
 
     # ── 5. Drop the old ticketcategory enum ─────────────────────────────────
     # (Must happen after all columns referencing it are converted)
