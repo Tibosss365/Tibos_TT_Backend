@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import secrets
 import smtplib
@@ -26,6 +27,7 @@ from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.services.email_sender import send_test_email
 from app.services.account_owner_service import normalize_owners as _normalize_owners
+from app.services.report_sections import gather_report_sections, render_report_sections, report_subject
 from app.schemas.admin import (
     AdminStats,
     AlertSettingsOut,
@@ -583,7 +585,10 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
         or (sys_cfg.trigger_timezone if use_same and sys_cfg and getattr(sys_cfg, "trigger_timezone", None) else None)
         or "Asia/Kolkata"
     )
-    _tz = zoneinfo.ZoneInfo(_tz_name)
+    try:
+        _tz = zoneinfo.ZoneInfo(_tz_name)
+    except Exception:
+        _tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc).astimezone(_tz)
 
     unassigned_res = await db.execute(
@@ -665,8 +670,18 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
     }
 
     # ── 4. Build HTML email ───────────────────────────────────────────────
-    subject = "Alert Summary: Ticket Health Report — " + now.strftime("%b %d, %Y")
-    html_body = _build_alert_html(counts, now, agent_stats=agent_stats)
+    report_template = ((_reports_cfg.get("daily") or {}).get("template") or {})
+    subject = report_subject(report_template, now, "daily")
+    section_data = (
+        await gather_report_sections(db, now, report_template)
+        if any(report_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
+    )
+    html_body = _build_alert_html(
+        counts, now, agent_stats=agent_stats, template=report_template,
+        report_type="daily", report_sections=section_data,
+    )
 
     # ── 5. Send (non-blocking) ────────────────────────────────────────────
     errors: list[str] = []
@@ -691,6 +706,7 @@ def _build_alert_html(
     agent_stats: list | None = None,
     template: dict | None = None,
     report_type: str | None = None,
+    report_sections: dict | None = None,
 ) -> str:
     """
     Build the full alert/report HTML email.
@@ -705,6 +721,17 @@ def _build_alert_html(
         return template.get(key, True) is not False
 
     date_str = now.strftime("%B %d, %Y at %H:%M ") + (now.strftime("%Z") or "UTC")
+    intro_text = str((template or {}).get("intro") or "").strip()
+    footer_text = str((template or {}).get("footer") or "").strip()
+    intro_row = (
+        '<tr><td style="padding:16px 24px 4px;font-size:13px;line-height:1.5;color:#4b5563;">'
+        + html.escape(intro_text).replace("\n", "<br>") + '</td></tr>'
+        if intro_text else ""
+    )
+    custom_footer = (
+        '<br><br>' + html.escape(footer_text).replace("\n", "<br>")
+        if footer_text else ""
+    )
 
     # ── Period-aware labels for created/resolved counts ───────────────────
     _PERIOD = {
@@ -764,7 +791,7 @@ def _build_alert_html(
         for i, ag in enumerate(agent_stats):
             row_bg     = "#f9fafb" if i % 2 == 0 else "#ffffff"
             avatar_bg  = _AVATAR_COLORS[i % len(_AVATAR_COLORS)]
-            initials   = ag.get("initials") or "?"
+            initials   = html.escape(str(ag.get("initials") or "?"))
             total      = ag["total"]
             open_c     = ag["open"]
             inp_c      = ag["in_progress"]
@@ -783,7 +810,7 @@ def _build_alert_html(
                 f'<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr>'
                 f'<td style="width:30px;height:30px;min-width:30px;background:{avatar_bg};border-radius:50%;'
                 f'text-align:center;vertical-align:middle;font-size:11px;font-weight:700;color:#fff;">{initials}</td>'
-                f'<td style="padding-left:10px;font-size:13px;font-weight:600;color:#374151;white-space:nowrap;">{ag["name"]}</td>'
+                f'<td style="padding-left:10px;font-size:13px;font-weight:600;color:#374151;white-space:nowrap;">{html.escape(str(ag["name"]))}</td>'
                 f'</tr></table></td>'
                 f'<td style="padding:10px 14px;text-align:right;">'
                 f'<span style="font-size:13px;font-weight:700;color:#111827;">{total}</span></td>'
@@ -821,6 +848,7 @@ def _build_alert_html(
         f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
         f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_str}</div>'
         '</td></tr>'
+        + intro_row
         + (
             '<tr><td style="padding:20px 0 8px;">'
             '<div style="font-size:11px;font-weight:700;color:#9ca3af;text-transform:uppercase;'
@@ -830,8 +858,11 @@ def _build_alert_html(
             if stat_rows else ""
         )
         + agent_section
+        + render_report_sections(report_sections or {}, template)
         + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
+        + custom_footer
+        + '<br>'
         'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
         'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
         '</td></tr>'

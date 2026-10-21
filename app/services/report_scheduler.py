@@ -49,6 +49,7 @@ from app.database import AsyncSessionLocal
 from app.models.admin import AlertSettings, EmailConfig
 from app.models.ticket import Ticket, TicketStatus
 from app.models.user import User
+from app.services.report_sections import gather_report_sections, report_subject
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,12 @@ class ReportScheduler:
         # ── Ticket data for the correct period ────────────────────────────
         period_start_utc = _period_start(report_type, now_tz)
         counts, agent_stats = await _gather_data(db, period_start_utc)
+        section_data = (
+            await gather_report_sections(db, now_tz, template)
+            if any(template.get(key) is True for key in (
+                "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+            )) else {}
+        )
 
         # ── Subject ───────────────────────────────────────────────────────
         default_subjects = {
@@ -239,6 +246,7 @@ class ReportScheduler:
             agent_stats=agent_stats,
             template=template,
             report_type=report_type,
+            report_sections=section_data,
         )
 
         # ── Send ──────────────────────────────────────────────────────────
