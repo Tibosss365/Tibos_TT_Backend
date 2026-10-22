@@ -19,11 +19,15 @@ class ReportSectionTests(unittest.TestCase):
             "includeCategorySpecialists": True,
         }
         data = {
-            "agent_performance": [{"name": "<img src=x>", "count": 4}],
+            "agent_performance": [
+                {"name": "<img src=x>", "count": 4},
+                {"name": "A&B", "count": 3},
+            ],
             "daily_agent_report": [{
                 "name": "A&B", "created_today": 1, "under_1h": 2,
-                "one_to_two_hours": 3, "two_to_24_hours": 4,
-                "resolved_today": 5, "created_this_month": 6,
+                "one_to_two_hours": 3, "resolved_today": 5,
+                "resolved_under_1h": 1, "resolved_1_to_2h": 2,
+                "resolved_2_to_24h": 2, "created_this_month": 6,
             }],
             "category_specialists": [{"category": "<script>", "agent": "A&B", "count": 7}],
         }
@@ -37,6 +41,9 @@ class ReportSectionTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", html)
         self.assertIn("A&amp;B", html)
         self.assertNotIn("<script>", html)
+        self.assertIn("Today created", html)
+        self.assertIn("Resolved 2–24h", html)
+        self.assertNotIn("Open 2–24h", html)
 
     def test_disabled_or_missing_new_sections_are_omitted(self):
         data = {

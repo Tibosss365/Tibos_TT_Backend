@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
 from html import escape, unescape
+import re
 
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.category import Category
-from app.models.ticket import Ticket, TicketStatus
+from app.models.ticket import Ticket, TicketStatus, TicketTimeline, TimelineType
 from app.models.user import User, UserRole
 
 
@@ -83,7 +84,6 @@ async def gather_report_sections(
     day_start, tomorrow_start, month_start = report_time_bounds(now)
     hour_1 = now_utc - timedelta(hours=1)
     hour_2 = now_utc - timedelta(hours=2)
-    hour_24 = now_utc - timedelta(hours=24)
 
     perf_result = await db.execute(
         select(Ticket.assignee_id, func.count(Ticket.id))
@@ -101,24 +101,85 @@ async def gather_report_sections(
             created_today.label("created_today"),
             func.sum(case((unresolved & (Ticket.created_at > hour_1) & (Ticket.created_at <= now_utc), 1), else_=0)).label("under_1h"),
             func.sum(case((unresolved & (Ticket.created_at > hour_2) & (Ticket.created_at <= hour_1), 1), else_=0)).label("one_to_two_hours"),
-            func.sum(case((unresolved & (Ticket.created_at >= hour_24) & (Ticket.created_at <= hour_2), 1), else_=0)).label("two_to_24_hours"),
-            func.sum(case((Ticket.status.in_(COMPLETED) & (Ticket.updated_at >= day_start) & (Ticket.updated_at < tomorrow_start), 1), else_=0)).label("resolved_today"),
             func.sum(case((Ticket.created_at >= month_start, 1), else_=0)).label("created_this_month"),
         )
         .where(Ticket.assignee_id.in_(user_ids))
         .group_by(Ticket.assignee_id)
     )
     daily_counts = {row[0]: row._mapping for row in daily_result.all()}
+
+    # Resolve durations from the actual status/resolved timeline event. updated_at
+    # is only a fallback for bulk/status updates that do not create timeline rows.
+    completed_result = await db.execute(
+        select(Ticket.id, Ticket.assignee_id, Ticket.created_at, Ticket.updated_at)
+        .where(
+            Ticket.assignee_id.in_(user_ids),
+            Ticket.status.in_(COMPLETED),
+            Ticket.updated_at >= day_start,
+            Ticket.updated_at < tomorrow_start,
+        )
+    )
+    completed_today = completed_result.all()
+    resolution_times = {}
+    ticket_ids = [row[0] for row in completed_today]
+    if ticket_ids:
+        timeline_result = await db.execute(
+            select(
+                TicketTimeline.ticket_id, TicketTimeline.type,
+                TicketTimeline.text, TicketTimeline.created_at,
+            )
+            .where(
+                TicketTimeline.ticket_id.in_(ticket_ids),
+                TicketTimeline.type.in_([TimelineType.resolved, TimelineType.status]),
+            )
+            .order_by(TicketTimeline.created_at.desc())
+        )
+        for ticket_id, event_type, event_text, event_at in timeline_result.all():
+            if ticket_id in resolution_times:
+                continue
+            text = re.sub(r"<[^>]*>", "", unescape(event_text or ""))
+            is_completion = event_type == TimelineType.resolved or (
+                event_type == TimelineType.status
+                and re.search(r"\bstatus changed to\s+(?:resolved|closed)\b", text, re.IGNORECASE)
+            )
+            if is_completion:
+                resolution_times[ticket_id] = event_at
+
+    duration_counts = {
+        user.id: {
+            "resolved_today": 0,
+            "resolved_under_1h": 0,
+            "resolved_1_to_2h": 0,
+            "resolved_2_to_24h": 0,
+        }
+        for user in users
+    }
+    for ticket_id, assignee_id, created_at, updated_at in completed_today:
+        resolved_at = resolution_times.get(ticket_id, updated_at)
+        if not (day_start <= resolved_at < tomorrow_start):
+            continue
+        counts = duration_counts.get(assignee_id)
+        if counts is None:
+            continue
+        counts["resolved_today"] += 1
+        elapsed_hours = (resolved_at - created_at).total_seconds() / 3600
+        if 0 <= elapsed_hours < 1:
+            counts["resolved_under_1h"] += 1
+        elif 1 <= elapsed_hours < 2:
+            counts["resolved_1_to_2h"] += 1
+        elif 2 <= elapsed_hours < 24:
+            counts["resolved_2_to_24h"] += 1
+
     daily = []
     for user in users:
         row = daily_counts.get(user.id, {})
+        resolved = duration_counts[user.id]
         daily.append({
             "name": names[user.id],
             "created_today": int(row.get("created_today") or 0),
             "under_1h": int(row.get("under_1h") or 0),
             "one_to_two_hours": int(row.get("one_to_two_hours") or 0),
-            "two_to_24_hours": int(row.get("two_to_24_hours") or 0),
-            "resolved_today": int(row.get("resolved_today") or 0),
+            **resolved,
             "created_this_month": int(row.get("created_this_month") or 0),
         })
 
@@ -177,17 +238,32 @@ def render_report_sections(data: dict[str, list[dict]], template: dict | None) -
         )
 
     if template.get("includeAgentPerformance") is True:
-        table("Agent Performance", ["Agent", "Resolved / Closed"], [
+        table("Agent Performance", ["Agent", "Completed"], [
             [row["name"], row["count"]] for row in data.get("agent_performance", [])
         ])
     if template.get("includeDailyAgentReport") is True:
-        table("Daily Report", ["Agent", "Created Today", "Under 1 Hour", "1–2 Hours", "2–24 Hours", "Resolved Today", "Created This Month"], [
-            [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["two_to_24_hours"], row["resolved_today"], row["created_this_month"]]
+        table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
+            [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
             for row in data.get("daily_agent_report", [])
         ])
     if template.get("includeCategorySpecialists") is True:
-        table("Category Specialists · Completed Tickets", ["Category", "Agent", "Completed"], [
-            [row["category"], row["agent"], row["count"]]
-            for row in data.get("category_specialists", [])
-        ])
+        specialists = data.get("category_specialists", [])
+        agent_names = [row["name"] for row in data.get("agent_performance", [])]
+        counts_by_category: dict[str, dict[str, int]] = {}
+        for row in specialists:
+            category = str(row["category"])
+            counts_by_category.setdefault(category, {})[str(row["agent"])] = int(row["count"] or 0)
+        category_rows = [
+            [category, *[
+                f"{counts_by_category[category].get(agent, 0)} completed"
+                if counts_by_category[category].get(agent, 0) else "—"
+                for agent in agent_names
+            ]]
+            for category in sorted(counts_by_category)
+        ]
+        table(
+            "Category Specialists · Completed Tickets",
+            ["Category", *agent_names] if agent_names else ["Category"],
+            category_rows,
+        )
     return "".join(sections)
