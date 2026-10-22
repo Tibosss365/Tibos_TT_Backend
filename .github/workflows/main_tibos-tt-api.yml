@@ -12,7 +12,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read #This is required for actions/checkout
 
@@ -41,7 +41,11 @@ jobs:
       #     source antenv/bin/activate
       #     alembic upgrade head
 
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size.
+      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets
+      # the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine
+      # that handles application compilation and dependency installation (e.g., pip install) directly on the platform
+      # during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact
+      # to reduce the payload size.
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -53,11 +57,11 @@ jobs:
       # 🚫 Opting Out of Oryx Build
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
       # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
+      # 2. Refer to sample workflows for alternative deployment strategies:
+      #    https://github.com/Azure/actions-workflow-samples/tree/master/AppService
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     permissions:
       id-token: write #This is required for requesting the JWT
@@ -68,10 +72,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
+          auth-type: IDENTITY
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_C23E8A878A8D4596978D9BC0F0CA533F }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A59D9DC850354ADEB44E5356A94823BF }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_2600BA9388D34ACBA241CF2AD627BA34 }}
@@ -82,4 +87,3 @@ jobs:
         with:
           app-name: 'tibos-tt-api'
           slot-name: 'Production'
-          
