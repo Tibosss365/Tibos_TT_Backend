@@ -217,26 +217,7 @@ class ReportScheduler:
         )
 
         # ── Subject ───────────────────────────────────────────────────────
-        default_subjects = {
-            "daily":   "&#128202; Daily Helpdesk Report &#8212; {date}",
-            "weekly":  "&#128198; Weekly Helpdesk Report &#8212; Week of {date}",
-            "monthly": "&#128197;&#65039; Monthly Helpdesk Report &#8212; {month} {year}",
-        }
-        raw_subject = template.get("subject") or default_subjects[report_type]
-        # Strip HTML entities from subject (email subjects are plain text)
-        raw_subject = (
-            raw_subject
-            .replace("&#128202;", "📊").replace("&#128198;", "📆")
-            .replace("&#128197;&#65039;", "🗓️").replace("&#8212;", "—")
-        )
-        day_str = f"{now_tz.day} {now_tz.strftime('%b')} {now_tz.year}"
-        subject = (
-            raw_subject
-            .replace("{date}",        day_str)
-            .replace("{month}",       now_tz.strftime("%B"))
-            .replace("{year}",        str(now_tz.year))
-            .replace("{system_name}", "Tibos Helpdesk")
-        )
+        subject = report_subject(template, now_tz, report_type)
 
         # ── HTML body ─────────────────────────────────────────────────────
         # Import here to avoid circular import at module load time
