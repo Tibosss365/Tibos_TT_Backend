@@ -17,10 +17,10 @@ jobs:
       contents: read #This is required for actions/checkout
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Python version
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
@@ -47,14 +47,14 @@ jobs:
       # during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact
       # to reduce the payload size.
       - name: Upload artifact for deployment jobs
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
             .
             !antenv/
 
-      # 🚫 Opting Out of Oryx Build
+      # Opting Out of Oryx Build
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
       # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
       # 2. Refer to sample workflows for alternative deployment strategies:
@@ -69,19 +69,16 @@ jobs:
 
     steps:
       - name: Download artifact from build job
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           name: python-app
 
       - name: Login to Azure
-        uses: azure/login@v3
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_C23E8A878A8D4596978D9BC0F0CA533F }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A59D9DC850354ADEB44E5356A94823BF }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_2600BA9388D34ACBA241CF2AD627BA34 }}
-          # Work around Azure CLI's intermittent empty subscription enumeration during OIDC login.
-          # This does not grant access; the identity still needs RBAC on the subscription/app.
-          allow-no-subscriptions: true
 
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
