@@ -35,15 +35,24 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04
     needs: build
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Download application package
         uses: actions/download-artifact@v4
         with:
           name: python-app
 
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_C23E8A878A8D4596978D9BC0F0CA533F }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A59D9DC850354ADEB44E5356A94823BF }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_2600BA9388D34ACBA241CF2AD627BA34 }}
+
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: tibos-tt-api
           slot-name: Production
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
