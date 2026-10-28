@@ -430,7 +430,7 @@ async def get_alert_settings(
     settings = await _get_or_create_alert_settings(db)
     response = AlertSettingsOut.model_validate(settings)
     response.reports = dict(response.reports or {})
-    response.reports.setdefault("dailyMonthly", {"enabled": True, "time": "17:45"})
+    response.reports.pop("dailyMonthly", None)
     return response
 
 
@@ -443,11 +443,7 @@ async def update_alert_settings(
     settings = await _get_or_create_alert_settings(db)
     settings.conditions         = body.conditions
     reports = dict(body.reports)
-    current_reports = settings.reports or {}
-    reports.setdefault(
-        "dailyMonthly",
-        current_reports.get("dailyMonthly", {"enabled": True, "time": "17:45"}),
-    )
+    reports.pop("dailyMonthly", None)
     settings.reports            = reports
     settings.recipients         = body.recipients
     settings.alert_email_config = body.alert_email_config
@@ -479,7 +475,7 @@ async def preview_daily_monthly_alert(
         tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc).astimezone(tz)
     subject, html_body = await build_daily_monthly_email(db, settings, now)
-    schedule = reports.get("dailyMonthly") or {"enabled": True, "time": "17:45"}
+    schedule = reports.get("daily") or {"enabled": False, "time": "08:00"}
     return {
         "subject": subject,
         "html": html_body,
@@ -520,7 +516,7 @@ async def preview_daily_monthly_alert_draft(
     subject, html_body = await build_daily_monthly_email(
         db, settings, now, reports_override=reports
     )
-    schedule = reports.get("dailyMonthly") or {"enabled": True, "time": "17:45"}
+    schedule = reports.get("daily") or {"enabled": False, "time": "08:00"}
     return {
         "subject": subject,
         "html": html_body,

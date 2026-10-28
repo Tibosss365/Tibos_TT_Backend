@@ -144,27 +144,19 @@ class ReportScheduler:
             today = now_tz.date()
             last_sent = dict(alert_cfg.last_reports_sent or {})
             changed   = False
-            combined_rep = reports.get("dailyMonthly") or {
-                "enabled": True,
-                "time": "17:45",
-            }
-            combined_enabled = combined_rep.get("enabled", True)
-
             for report_type in ("daily", "weekly", "monthly"):
                 rep = reports.get(report_type) or {}
                 if not rep.get("enabled", False):
-                    continue
-                if report_type == "daily" and combined_enabled:
-                    logger.info(
-                        "Report scheduler: skipping legacy daily template because the combined digest replaces it"
-                    )
                     continue
                 if not _is_due(report_type, rep, last_sent, now_tz, today):
                     continue
 
                 logger.info("Report scheduler: %s report is due — sending…", report_type)
                 try:
-                    await self._send_report(db, alert_cfg, report_type, rep, now_tz)
+                    if report_type == "daily":
+                        await self._send_daily_report(db, alert_cfg, rep, now_tz)
+                    else:
+                        await self._send_report(db, alert_cfg, report_type, rep, now_tz)
                     last_sent[report_type] = now_utc.isoformat()
                     changed = True
                     logger.info(
@@ -175,28 +167,6 @@ class ReportScheduler:
                     logger.error(
                         "Report scheduler: %s report failed — %s",
                         report_type, exc, exc_info=True,
-                    )
-
-            # Combined digest is now the scheduled daily email whenever enabled;
-            # the legacy daily template is skipped above to avoid duplicate mail.
-            if combined_rep.get("enabled", True) and _is_due(
-                "dailyMonthly", combined_rep, last_sent, now_tz, today
-            ):
-                logger.info("Report scheduler: dailyMonthly report is due — sending…")
-                try:
-                    await self._send_daily_monthly_report(
-                        db, alert_cfg, combined_rep, now_tz
-                    )
-                    last_sent["dailyMonthly"] = now_utc.isoformat()
-                    changed = True
-                    logger.info(
-                        "Report scheduler: dailyMonthly report sent at %s",
-                        now_utc.isoformat(),
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Report scheduler: dailyMonthly report failed — %s",
-                        exc, exc_info=True,
                     )
 
             if changed:
@@ -279,7 +249,7 @@ class ReportScheduler:
                 f"All {report_type} report deliveries failed: {errors[0]}"
             )
 
-    async def _send_daily_monthly_report(
+    async def _send_daily_report(
         self,
         db: AsyncSession,
         alert_cfg: AlertSettings,
@@ -297,7 +267,7 @@ class ReportScheduler:
                 if addr and addr not in to_emails:
                     to_emails.append(addr)
         if not to_emails:
-            logger.warning("Daily + monthly report skipped — no recipients configured")
+            logger.warning("Daily report skipped — no recipients configured")
             return
 
         send_params = await _resolve_email_params(db, alert_cfg)
@@ -308,10 +278,10 @@ class ReportScheduler:
             try:
                 await _dispatch_alert_email(send_params, to_email, subject, html_body)
             except Exception as exc:
-                logger.warning("Daily + monthly report send to %s failed — %s", to_email, exc)
+                logger.warning("Daily report send to %s failed — %s", to_email, exc)
                 errors.append(str(exc))
         if errors and len(errors) == len(to_emails):
-            raise RuntimeError(f"All daily + monthly report deliveries failed: {errors[0]}")
+            raise RuntimeError(f"All daily report deliveries failed: {errors[0]}")
 
 
 # ── Pure helpers (module-level, no class state) ────────────────────────────────
@@ -349,7 +319,7 @@ def _is_due(
         except (ValueError, TypeError):
             pass  # Malformed timestamp — treat as never sent
 
-    if report_type in ("daily", "dailyMonthly"):
+    if report_type == "daily":
         return True
 
     if report_type == "weekly":
