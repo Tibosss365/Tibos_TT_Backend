@@ -389,11 +389,20 @@ async def build_daily_monthly_email(
         (reports.get("monthly") or {}).get("template") or daily_template
     )
     include_monthly = daily_template.get("includeDailyMonthlyReport", True) is not False
-    # This digest explicitly promises both daily and monthly agent metrics.
-    # The regular daily report's optional table checkbox must not suppress the
-    # daily half of this separate combined digest.
+    # This digest explicitly promises a daily and a month-to-date snapshot.
+    # Keep the daily half complete even when individual sections are unchecked
+    # in the regular daily email template.
     if include_monthly:
-        daily_template["includeDailyAgentReport"] = True
+        for key in (
+            "includeUnassigned",
+            "includeSla",
+            "includeOnHold",
+            "includeOpenToday",
+            "includeCreatedToday",
+            "includeResolvedToday",
+            "includeDailyAgentReport",
+        ):
+            daily_template[key] = True
     # The combined email has one shared introduction; the monthly fragment
     # must not repeat it.
     monthly_template["intro"] = ""
