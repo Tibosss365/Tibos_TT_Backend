@@ -424,7 +424,9 @@ async def build_daily_monthly_email(
     daily_html = _build_alert_html(
         daily_counts,
         now_tz,
-        agent_stats=agent_stats,
+        # The combined 17:45 email includes the agent performance and daily
+        # metrics sections below, but omits the separate status-count table.
+        agent_stats=None,
         template=daily_template,
         report_type="daily",
         report_sections=daily_sections,
