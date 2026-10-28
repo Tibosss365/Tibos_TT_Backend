@@ -92,8 +92,6 @@ class ReportScheduler:
     # ── Main loop ──────────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
-        # Brief pause on startup so migrations / seeding finish first
-        await asyncio.sleep(30)
         while self._running:
             try:
                 await self._check_and_send()
@@ -102,7 +100,14 @@ class ReportScheduler:
             except Exception as exc:
                 logger.error("Report scheduler error: %s", exc, exc_info=True)
             try:
-                await asyncio.sleep(60)
+                # Keep checks aligned to wall-clock minute boundaries. Sleeping
+                # a fixed 60 seconds after each check lets processing time
+                # accumulate as schedule drift, and delaying the first check
+                # on startup can make a report miss its configured minute.
+                now = datetime.now(timezone.utc)
+                seconds_into_minute = now.second + now.microsecond / 1_000_000
+                delay = 60 - seconds_into_minute
+                await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 break
 
