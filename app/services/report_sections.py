@@ -61,8 +61,9 @@ async def gather_report_sections(
     db: AsyncSession,
     now: datetime,
     template: dict | None = None,
+    report_type: str = "daily",
 ) -> dict[str, list[dict]]:
-    """Gather the three optional report datasets using the report timezone."""
+    """Gather optional per-agent report datasets using the report timezone."""
     selected = _selected_ids(template)
     users_result = await db.execute(
         select(User).where(
@@ -76,7 +77,12 @@ async def gather_report_sections(
     user_ids = [user.id for user in users]
     names = {user.id: (user.name or user.username) for user in users}
 
-    empty = {"agent_performance": [], "daily_agent_report": [], "category_specialists": []}
+    empty = {
+        "agent_performance": [],
+        "daily_agent_report": [],
+        "monthly_agent_report": [],
+        "category_specialists": [],
+    }
     if not user_ids:
         return empty
 
@@ -183,34 +189,140 @@ async def gather_report_sections(
             "created_this_month": int(row.get("created_this_month") or 0),
         })
 
-    specialist_result = await db.execute(
-        select(Ticket.category, Ticket.assignee_id, func.count(Ticket.id))
+    # Monthly activity uses local month boundaries converted to UTC, matching
+    # the timezone configured for scheduled reports.
+    next_month_date = (now.date().replace(day=28) + timedelta(days=4)).replace(day=1)
+    month_end = _utc(datetime.combine(next_month_date, time.min, tzinfo=now.tzinfo))
+    hour_24 = now_utc - timedelta(hours=24)
+    monthly_result = await db.execute(
+        select(
+            Ticket.assignee_id,
+            func.sum(case(
+                ((Ticket.created_at >= month_start)
+                 & (Ticket.created_at < month_end)
+                 & (Ticket.created_at <= now_utc), 1),
+                else_=0,
+            )).label("created_this_month"),
+            func.sum(case((unresolved & (Ticket.created_at > hour_1) & (Ticket.created_at <= now_utc), 1), else_=0)).label("under_1h"),
+            func.sum(case((unresolved & (Ticket.created_at > hour_2) & (Ticket.created_at <= hour_1), 1), else_=0)).label("one_to_two_hours"),
+            func.sum(case((unresolved & (Ticket.created_at > hour_24) & (Ticket.created_at <= hour_2), 1), else_=0)).label("two_to_24_hours"),
+        )
+        .where(Ticket.assignee_id.in_(user_ids))
+        .group_by(Ticket.assignee_id)
+    )
+    monthly_counts = {row[0]: row._mapping for row in monthly_result.all()}
+
+    # Resolve monthly completion counts and duration buckets from the actual
+    # status timeline where available; updated_at remains the fallback, as in
+    # the daily metrics report.
+    monthly_completed_result = await db.execute(
+        select(Ticket.id, Ticket.assignee_id, Ticket.created_at, Ticket.updated_at)
         .where(
             Ticket.assignee_id.in_(user_ids),
             Ticket.status.in_(COMPLETED),
+            Ticket.updated_at >= month_start,
+            Ticket.updated_at <= now_utc,
         )
-        .group_by(Ticket.category, Ticket.assignee_id)
-        .order_by(Ticket.category, Ticket.assignee_id)
     )
-    category_result = await db.execute(select(Category.slug, Category.name))
-    category_names = {slug: name for slug, name in category_result.all()}
-    specialists = [
-        {
-            "category": category_names.get(category, category or "Uncategorized"),
-            "agent": names[agent_id],
-            "count": int(count or 0),
+    completed_this_month = monthly_completed_result.all()
+    resolution_times = {}
+    monthly_ticket_ids = [row[0] for row in completed_this_month]
+    if monthly_ticket_ids:
+        monthly_timeline_result = await db.execute(
+            select(
+                TicketTimeline.ticket_id, TicketTimeline.type,
+                TicketTimeline.text, TicketTimeline.created_at,
+            )
+            .where(
+                TicketTimeline.ticket_id.in_(monthly_ticket_ids),
+                TicketTimeline.type.in_([TimelineType.resolved, TimelineType.status]),
+            )
+            .order_by(TicketTimeline.created_at.desc())
+        )
+        for ticket_id, event_type, event_text, event_at in monthly_timeline_result.all():
+            if ticket_id in resolution_times:
+                continue
+            text = re.sub(r"<[^>]*>", "", unescape(event_text or ""))
+            is_completion = event_type == TimelineType.resolved or (
+                event_type == TimelineType.status
+                and re.search(r"\bstatus changed to\s+(?:resolved|closed)\b", text, re.IGNORECASE)
+            )
+            if is_completion:
+                resolution_times[ticket_id] = event_at
+
+    monthly_resolutions = {
+        user.id: {
+            "resolved_this_month": 0,
+            "resolved_under_1h": 0,
+            "resolved_1_to_2h": 0,
+            "resolved_2_to_24h": 0,
         }
-        for category, agent_id, count in specialist_result.all()
-        if agent_id in names
-    ]
+        for user in users
+    }
+    for ticket_id, assignee_id, created_at, updated_at in completed_this_month:
+        resolved_at = resolution_times.get(ticket_id, updated_at)
+        if not (month_start <= resolved_at <= now_utc):
+            continue
+        counts = monthly_resolutions.get(assignee_id)
+        if counts is None:
+            continue
+        counts["resolved_this_month"] += 1
+        elapsed_hours = (resolved_at - created_at).total_seconds() / 3600
+        if 0 <= elapsed_hours < 1:
+            counts["resolved_under_1h"] += 1
+        elif 1 <= elapsed_hours < 2:
+            counts["resolved_1_to_2h"] += 1
+        elif 2 <= elapsed_hours < 24:
+            counts["resolved_2_to_24h"] += 1
+
+    monthly = []
+    for user in users:
+        row = monthly_counts.get(user.id, {})
+        resolved = monthly_resolutions[user.id]
+        monthly.append({
+            "name": names[user.id],
+            "created_this_month": int(row.get("created_this_month") or 0),
+            "under_1h": int(row.get("under_1h") or 0),
+            "one_to_two_hours": int(row.get("one_to_two_hours") or 0),
+            "two_to_24_hours": int(row.get("two_to_24_hours") or 0),
+            **resolved,
+        })
+
+    specialists = []
+    if report_type != "monthly":
+        specialist_result = await db.execute(
+            select(Ticket.category, Ticket.assignee_id, func.count(Ticket.id))
+            .where(
+                Ticket.assignee_id.in_(user_ids),
+                Ticket.status.in_(COMPLETED),
+            )
+            .group_by(Ticket.category, Ticket.assignee_id)
+            .order_by(Ticket.category, Ticket.assignee_id)
+        )
+        category_result = await db.execute(select(Category.slug, Category.name))
+        category_names = {slug: name for slug, name in category_result.all()}
+        specialists = [
+            {
+                "category": category_names.get(category, category or "Uncategorized"),
+                "agent": names[agent_id],
+                "count": int(count or 0),
+            }
+            for category, agent_id, count in specialist_result.all()
+            if agent_id in names
+        ]
     return {
         "agent_performance": performance,
         "daily_agent_report": daily,
+        "monthly_agent_report": monthly,
         "category_specialists": specialists,
     }
 
 
-def render_report_sections(data: dict[str, list[dict]], template: dict | None) -> str:
+def render_report_sections(
+    data: dict[str, list[dict]],
+    template: dict | None,
+    report_type: str = "daily",
+) -> str:
     """Render enabled sections as Outlook-friendly, table-based HTML."""
     template = template or {}
     sections: list[str] = []
@@ -238,15 +350,35 @@ def render_report_sections(data: dict[str, list[dict]], template: dict | None) -
         )
 
     if template.get("includeAgentPerformance") is True:
-        table("Agent Performance", ["Agent", "Completed"], [
-            [row["name"], row["count"]] for row in data.get("agent_performance", [])
-        ])
+        if report_type == "monthly":
+            table("Agent Performance", ["Agent", "Completed this month"], [
+                [row["name"], row["resolved_this_month"]]
+                for row in data.get("monthly_agent_report", [])
+            ])
+        else:
+            table("Agent Performance", ["Agent", "Completed"], [
+                [row["name"], row["count"]] for row in data.get("agent_performance", [])
+            ])
     if template.get("includeDailyAgentReport") is True:
-        table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
-            [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
-            for row in data.get("daily_agent_report", [])
-        ])
-    if template.get("includeCategorySpecialists") is True:
+        if report_type == "monthly":
+            table("Monthly Agent Metrics", [
+                "Agent", "Month created", "Open < 1h", "Open 1–2h", "Open 2–24h",
+                "Resolved this month", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h",
+            ], [
+                [
+                    row["name"], row["created_this_month"], row["under_1h"],
+                    row["one_to_two_hours"], row["two_to_24_hours"],
+                    row["resolved_this_month"], row["resolved_under_1h"],
+                    row["resolved_1_to_2h"], row["resolved_2_to_24h"],
+                ]
+                for row in data.get("monthly_agent_report", [])
+            ])
+        else:
+            table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
+                [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
+                for row in data.get("daily_agent_report", [])
+            ])
+    if report_type != "monthly" and template.get("includeCategorySpecialists") is True:
         specialists = data.get("category_specialists", [])
         agent_names = [row["name"] for row in data.get("agent_performance", [])]
         counts_by_category: dict[str, dict[str, int]] = {}

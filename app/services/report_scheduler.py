@@ -145,7 +145,7 @@ class ReportScheduler:
             last_sent = dict(alert_cfg.last_reports_sent or {})
             changed   = False
 
-            for report_type in ("daily", "weekly", "monthly"):  # "timezone" key is intentionally skipped
+            for report_type in ("daily", "weekly", "monthly"):  # Existing schedules remain unchanged.
                 rep = reports.get(report_type) or {}
                 if not rep.get("enabled", False):
                     continue
@@ -165,6 +165,32 @@ class ReportScheduler:
                     logger.error(
                         "Report scheduler: %s report failed — %s",
                         report_type, exc, exc_info=True,
+                    )
+
+            # Separate combined digest. This has its own schedule and dedupe
+            # key, so it never replaces or suppresses the existing reports.
+            combined_rep = reports.get("dailyMonthly") or {
+                "enabled": True,
+                "time": "17:45",
+            }
+            if combined_rep.get("enabled", True) and _is_due(
+                "dailyMonthly", combined_rep, last_sent, now_tz, today
+            ):
+                logger.info("Report scheduler: dailyMonthly report is due — sending…")
+                try:
+                    await self._send_daily_monthly_report(
+                        db, alert_cfg, combined_rep, now_tz
+                    )
+                    last_sent["dailyMonthly"] = now_utc.isoformat()
+                    changed = True
+                    logger.info(
+                        "Report scheduler: dailyMonthly report sent at %s",
+                        now_utc.isoformat(),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Report scheduler: dailyMonthly report failed — %s",
+                        exc, exc_info=True,
                     )
 
             if changed:
@@ -210,7 +236,7 @@ class ReportScheduler:
         period_start_utc = _period_start(report_type, now_tz)
         counts, agent_stats = await _gather_data(db, period_start_utc)
         section_data = (
-            await gather_report_sections(db, now_tz, template)
+            await gather_report_sections(db, now_tz, template, report_type=report_type)
             if any(template.get(key) is True for key in (
                 "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
             )) else {}
@@ -246,6 +272,40 @@ class ReportScheduler:
             raise RuntimeError(
                 f"All {report_type} report deliveries failed: {errors[0]}"
             )
+
+    async def _send_daily_monthly_report(
+        self,
+        db: AsyncSession,
+        alert_cfg: AlertSettings,
+        rep: dict,
+        now_tz: datetime,
+    ) -> None:
+        recipients_cfg = alert_cfg.recipients or {}
+        to_emails: list[str] = list(recipients_cfg.get("emails") or [])
+        if recipients_cfg.get("includeAdmin", True):
+            admin_res = await db.execute(
+                select(User).where(User.role == "admin", User.is_active == True)
+            )
+            for admin_user in admin_res.scalars().all():
+                addr = admin_user.username if "@" in (admin_user.username or "") else None
+                if addr and addr not in to_emails:
+                    to_emails.append(addr)
+        if not to_emails:
+            logger.warning("Daily + monthly report skipped — no recipients configured")
+            return
+
+        send_params = await _resolve_email_params(db, alert_cfg)
+        subject, html_body = await build_daily_monthly_email(db, alert_cfg, now_tz)
+        from app.routers.admin import _dispatch_alert_email
+        errors: list[str] = []
+        for to_email in to_emails:
+            try:
+                await _dispatch_alert_email(send_params, to_email, subject, html_body)
+            except Exception as exc:
+                logger.warning("Daily + monthly report send to %s failed — %s", to_email, exc)
+                errors.append(str(exc))
+        if errors and len(errors) == len(to_emails):
+            raise RuntimeError(f"All daily + monthly report deliveries failed: {errors[0]}")
 
 
 # ── Pure helpers (module-level, no class state) ────────────────────────────────
@@ -283,7 +343,7 @@ def _is_due(
         except (ValueError, TypeError):
             pass  # Malformed timestamp — treat as never sent
 
-    if report_type == "daily":
+    if report_type in ("daily", "dailyMonthly"):
         return True
 
     if report_type == "weekly":
@@ -314,6 +374,96 @@ def _period_start(report_type: str, now_tz: datetime) -> datetime:
         start_tz = midnight  # daily
     
     return start_tz.astimezone(timezone.utc)
+
+
+async def build_daily_monthly_email(
+    db: AsyncSession,
+    alert_cfg: AlertSettings,
+    now_tz: datetime,
+    reports_override: dict | None = None,
+) -> tuple[str, str]:
+    """Build the separate combined daily + month-to-date email and subject."""
+    reports = reports_override or alert_cfg.reports or {}
+    daily_template = dict((reports.get("daily") or {}).get("template") or {})
+    monthly_template = dict(
+        (reports.get("monthly") or {}).get("template") or daily_template
+    )
+    # The combined email has one shared introduction; the monthly fragment
+    # must not repeat it.
+    monthly_template["intro"] = ""
+
+    daily_start = _period_start("daily", now_tz)
+    month_start = _period_start("monthly", now_tz)
+    daily_counts, agent_stats = await _gather_data(db, daily_start)
+    monthly_counts, _ = await _gather_data(db, month_start)
+
+    daily_sections = (
+        await gather_report_sections(db, now_tz, daily_template, report_type="daily")
+        if any(daily_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
+    )
+    monthly_sections = (
+        await gather_report_sections(db, now_tz, monthly_template, report_type="monthly")
+        if any(monthly_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
+    )
+
+    from app.routers.admin import _build_alert_html
+
+    def content_fragment(email_html: str) -> str:
+        header_end = email_html.find("</td></tr>")
+        footer_start = email_html.rfind(
+            '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
+        )
+        if header_end < 0 or footer_start < 0 or footer_start <= header_end:
+            raise RuntimeError("Could not extract report content for combined email")
+        return email_html[header_end + len("</td></tr>"):footer_start]
+
+    daily_html = _build_alert_html(
+        daily_counts,
+        now_tz,
+        agent_stats=agent_stats,
+        template=daily_template,
+        report_type="daily",
+        report_sections=daily_sections,
+    )
+    monthly_html = _build_alert_html(
+        monthly_counts,
+        now_tz,
+        agent_stats=None,
+        template=monthly_template,
+        report_type="monthly",
+        report_sections=monthly_sections,
+    )
+    date_text = now_tz.strftime("%B %d, %Y")
+    subject = f"Daily + Monthly Ticket Health Report — {date_text}"
+    html_body = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        '<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">'
+        '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 16px;">'
+        '<tr><td align="center"><table width="600" cellpadding="0" cellspacing="0" '
+        'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
+        '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
+        '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);text-transform:uppercase;'
+        'letter-spacing:1px;margin-bottom:6px;">&#128276; Combined Daily + Monthly Report</div>'
+        f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
+        f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_text} at {now_tz:%H:%M} {now_tz.tzname() or "local time"}</div>'
+        '</td></tr>'
+        '<tr><td style="padding:18px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
+        'text-transform:uppercase;letter-spacing:.8px;">Daily Report</td></tr>'
+        + content_fragment(daily_html)
+        + '<tr><td style="padding:22px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
+        'text-transform:uppercase;letter-spacing:.8px;border-top:1px solid #e5e7eb;">Monthly Report · Month to Date</td></tr>'
+        + content_fragment(monthly_html)
+        + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
+        '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
+        'Automated combined report from your Tibos Helpdesk.<br>'
+        'Manage report settings in <strong>Admin &rarr; Alerts</strong>.</p>'
+        '</td></tr></table></td></tr></table></body></html>'
+    )
+    return subject, html_body
 
 
 async def _gather_data(

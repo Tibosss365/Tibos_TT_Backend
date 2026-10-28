@@ -428,7 +428,10 @@ async def get_alert_settings(
     _: User = Depends(get_current_user),
 ):
     settings = await _get_or_create_alert_settings(db)
-    return AlertSettingsOut.model_validate(settings)
+    response = AlertSettingsOut.model_validate(settings)
+    response.reports = dict(response.reports or {})
+    response.reports.setdefault("dailyMonthly", {"enabled": True, "time": "17:45"})
+    return response
 
 
 @router.put("/alerts", response_model=AlertSettingsOut, response_model_by_alias=True)
@@ -439,12 +442,92 @@ async def update_alert_settings(
 ):
     settings = await _get_or_create_alert_settings(db)
     settings.conditions         = body.conditions
-    settings.reports            = body.reports
+    reports = dict(body.reports)
+    current_reports = settings.reports or {}
+    reports.setdefault(
+        "dailyMonthly",
+        current_reports.get("dailyMonthly", {"enabled": True, "time": "17:45"}),
+    )
+    settings.reports            = reports
     settings.recipients         = body.recipients
     settings.alert_email_config = body.alert_email_config
     await db.flush()
     await db.refresh(settings)
     return AlertSettingsOut.model_validate(settings)
+
+
+@router.get("/alerts/daily-monthly/preview")
+async def preview_daily_monthly_alert(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Return the combined daily + month-to-date email HTML for frontend preview."""
+    from app.services.report_scheduler import build_daily_monthly_email
+
+    settings = await _get_or_create_alert_settings(db)
+    reports = settings.reports or {}
+    email_result = await db.execute(select(EmailConfig))
+    email_cfg: EmailConfig | None = email_result.scalar_one_or_none()
+    tz_name = (
+        reports.get("timezone")
+        or (email_cfg.trigger_timezone if email_cfg and getattr(email_cfg, "trigger_timezone", None) else None)
+        or "Asia/Kolkata"
+    )
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+    now = datetime.now(timezone.utc).astimezone(tz)
+    subject, html_body = await build_daily_monthly_email(db, settings, now)
+    schedule = reports.get("dailyMonthly") or {"enabled": True, "time": "17:45"}
+    return {
+        "subject": subject,
+        "html": html_body,
+        "enabled": schedule.get("enabled", True),
+        "time": schedule.get("time", "17:45"),
+        "timezone": tz_name,
+    }
+
+
+@router.post("/alerts/daily-monthly/preview")
+async def preview_daily_monthly_alert_draft(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Render a draft using unsaved frontend report settings; never sends email."""
+    from app.services.report_scheduler import build_daily_monthly_email
+
+    settings = await _get_or_create_alert_settings(db)
+    reports = body.get("reports")
+    if not isinstance(reports, dict):
+        raise HTTPException(status_code=422, detail="Request must include a reports object")
+    saved_reports = settings.reports or {}
+    email_result = await db.execute(select(EmailConfig))
+    email_cfg: EmailConfig | None = email_result.scalar_one_or_none()
+    tz_name = (
+        reports.get("timezone")
+        or saved_reports.get("timezone")
+        or (email_cfg.trigger_timezone if email_cfg and getattr(email_cfg, "trigger_timezone", None) else None)
+        or "Asia/Kolkata"
+    )
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("Asia/Kolkata")
+        tz_name = "Asia/Kolkata"
+    now = datetime.now(timezone.utc).astimezone(tz)
+    subject, html_body = await build_daily_monthly_email(
+        db, settings, now, reports_override=reports
+    )
+    schedule = reports.get("dailyMonthly") or {"enabled": True, "time": "17:45"}
+    return {
+        "subject": subject,
+        "html": html_body,
+        "enabled": schedule.get("enabled", True),
+        "time": schedule.get("time", "17:45"),
+        "timezone": tz_name,
+    }
 
 
 @router.post("/alerts/test")
@@ -858,7 +941,9 @@ def _build_alert_html(
             if stat_rows else ""
         )
         + agent_section
-        + render_report_sections(report_sections or {}, template)
+        + render_report_sections(
+            report_sections or {}, template, report_type=report_type or "daily"
+        )
         + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
         + custom_footer

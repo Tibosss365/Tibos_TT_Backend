@@ -105,6 +105,7 @@ class AlertSettings(Base):
         "daily":    {"enabled": False, "time": "08:00"},
         "weekly":   {"enabled": False, "day": "monday",  "time": "08:00"},
         "monthly":  {"enabled": False, "dayOfMonth": 1,  "time": "08:00"},
+        "dailyMonthly": {"enabled": True, "time": "17:45"},
     })
     recipients: Mapped[dict] = mapped_column(JSON, nullable=False, default=lambda: {
         "includeAdmin": True,
@@ -116,8 +117,9 @@ class AlertSettings(Base):
         "smtp": {"host": "", "port": "587", "security": "tls", "from": "", "user": "", "pass": ""},
         "m365": {"tenantId": "", "clientId": "", "clientSecret": "", "from": ""},
     })
-    # Tracks when each report type was last successfully sent
-    # {"daily": "2026-04-21T08:00:00+00:00", "weekly": "...", "monthly": "..."}
+    # Tracks when each report type was last successfully sent, including the
+    # separately scheduled daily + month-to-date digest.
+    # {"daily": "...", "weekly": "...", "monthly": "...", "dailyMonthly": "..."}
     last_reports_sent: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     # Condition-alert dedup state — tickets already alerted, per condition:
     # {"unassigned": {"<ticket-uuid>": "<iso-ts>"}, "slaBreach": {...}, ...}
