@@ -388,17 +388,14 @@ async def build_daily_monthly_email(
     monthly_template = dict(
         (reports.get("monthly") or {}).get("template") or daily_template
     )
-    include_monthly = daily_template.get("includeDailyMonthlyReport", True) is not False
     # The combined email has one shared introduction; the monthly fragment
     # must not repeat it.
     monthly_template["intro"] = ""
 
     daily_start = _period_start("daily", now_tz)
+    month_start = _period_start("monthly", now_tz)
     daily_counts, agent_stats = await _gather_data(db, daily_start)
-    monthly_counts = {}
-    if include_monthly:
-        month_start = _period_start("monthly", now_tz)
-        monthly_counts, _ = await _gather_data(db, month_start)
+    monthly_counts, _ = await _gather_data(db, month_start)
 
     daily_sections = (
         await gather_report_sections(db, now_tz, daily_template, report_type="daily")
@@ -408,7 +405,7 @@ async def build_daily_monthly_email(
     )
     monthly_sections = (
         await gather_report_sections(db, now_tz, monthly_template, report_type="monthly")
-        if include_monthly and any(monthly_template.get(key) is True for key in (
+        if any(monthly_template.get(key) is True for key in (
             "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
         )) else {}
     )
@@ -434,25 +431,16 @@ async def build_daily_monthly_email(
         report_type="daily",
         report_sections=daily_sections,
     )
-    monthly_fragment = ""
-    if include_monthly:
-        monthly_html = _build_alert_html(
-            monthly_counts,
-            now_tz,
-            agent_stats=None,
-            template=monthly_template,
-            report_type="monthly",
-            report_sections=monthly_sections,
-        )
-        monthly_fragment = (
-            '<tr><td style="padding:22px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
-            'text-transform:uppercase;letter-spacing:.8px;border-top:1px solid #e5e7eb;">'
-            'Monthly Report · Month to Date</td></tr>'
-            + content_fragment(monthly_html)
-        )
+    monthly_html = _build_alert_html(
+        monthly_counts,
+        now_tz,
+        agent_stats=None,
+        template=monthly_template,
+        report_type="monthly",
+        report_sections=monthly_sections,
+    )
     date_text = now_tz.strftime("%B %d, %Y")
-    report_label = "Daily + Monthly" if include_monthly else "Daily"
-    subject = f"{report_label} Ticket Health Report — {date_text}"
+    subject = f"Daily + Monthly Ticket Health Report — {date_text}"
     html_body = (
         '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
         '<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">'
@@ -461,14 +449,16 @@ async def build_daily_monthly_email(
         'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
         '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
         '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);text-transform:uppercase;'
-        f'letter-spacing:1px;margin-bottom:6px;">&#128276; {report_label} Report</div>'
+        'letter-spacing:1px;margin-bottom:6px;">&#128276; Combined Daily + Monthly Report</div>'
         f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
         f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_text} at {now_tz:%H:%M} {now_tz.tzname() or "local time"}</div>'
         '</td></tr>'
         '<tr><td style="padding:18px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
         'text-transform:uppercase;letter-spacing:.8px;">Daily Report</td></tr>'
         + content_fragment(daily_html)
-        + monthly_fragment
+        + '<tr><td style="padding:22px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
+        'text-transform:uppercase;letter-spacing:.8px;border-top:1px solid #e5e7eb;">Monthly Report · Month to Date</td></tr>'
+        + content_fragment(monthly_html)
         + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
         'Automated combined report from your Tibos Helpdesk.<br>'
