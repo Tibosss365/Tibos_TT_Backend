@@ -3,7 +3,7 @@ Report Scheduler
 ================
 Background asyncio service that sends scheduled digest reports.
 
-Checks every 60 s whether a daily / weekly / monthly report is due,
+Checks every 5 s whether a daily / weekly / monthly report is due,
 then builds and sends the HTML email to all configured recipients.
 
 Schedule logic
@@ -52,6 +52,7 @@ from app.models.user import User
 from app.services.report_sections import gather_report_sections, report_subject
 
 logger = logging.getLogger(__name__)
+_CHECK_INTERVAL_SECONDS = 5
 
 _DAY_NAME_MAP = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -77,7 +78,7 @@ class ReportScheduler:
             self._task = asyncio.create_task(
                 self._loop(), name="report-scheduler"
             )
-            logger.info("Report scheduler started (checks every 60 s)")
+            logger.info("Report scheduler started (checks every %s s)", _CHECK_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         self._running = False
@@ -100,14 +101,9 @@ class ReportScheduler:
             except Exception as exc:
                 logger.error("Report scheduler error: %s", exc, exc_info=True)
             try:
-                # Keep checks aligned to wall-clock minute boundaries. Sleeping
-                # a fixed 60 seconds after each check lets processing time
-                # accumulate as schedule drift, and delaying the first check
-                # on startup can make a report miss its configured minute.
-                now = datetime.now(timezone.utc)
-                seconds_into_minute = now.second + now.microsecond / 1_000_000
-                delay = 60 - seconds_into_minute
-                await asyncio.sleep(delay)
+                # Poll frequently so a configured HH:MM is acted on within a
+                # few seconds, without accumulating processing-time drift.
+                await asyncio.sleep(_CHECK_INTERVAL_SECONDS)
             except asyncio.CancelledError:
                 break
 
@@ -159,9 +155,11 @@ class ReportScheduler:
                 logger.info("Report scheduler: %s report is due — sending…", report_type)
                 try:
                     if report_type == "daily":
-                        await self._send_daily_report(db, alert_cfg, rep, now_tz)
+                        sent = await self._send_daily_report(db, alert_cfg, rep, now_tz)
                     else:
-                        await self._send_report(db, alert_cfg, report_type, rep, now_tz)
+                        sent = await self._send_report(db, alert_cfg, report_type, rep, now_tz)
+                    if not sent:
+                        continue
                     last_sent[report_type] = now_utc.isoformat()
                     changed = True
                     logger.info(
@@ -187,7 +185,7 @@ class ReportScheduler:
         report_type: str,
         rep: dict,
         now_tz: datetime,
-    ) -> None:
+    ) -> bool:
         template = rep.get("template") or {}
 
         # ── Recipients ────────────────────────────────────────────────────
@@ -208,7 +206,7 @@ class ReportScheduler:
                 "Report scheduler: %s report skipped — no recipients configured",
                 report_type,
             )
-            return
+            return False
 
         # ── Email credentials ─────────────────────────────────────────────
         send_params = await _resolve_email_params(db, alert_cfg)
@@ -253,6 +251,7 @@ class ReportScheduler:
             raise RuntimeError(
                 f"All {report_type} report deliveries failed: {errors[0]}"
             )
+        return True
 
     async def _send_daily_report(
         self,
@@ -260,7 +259,7 @@ class ReportScheduler:
         alert_cfg: AlertSettings,
         rep: dict,
         now_tz: datetime,
-    ) -> None:
+    ) -> bool:
         recipients_cfg = alert_cfg.recipients or {}
         to_emails: list[str] = list(recipients_cfg.get("emails") or [])
         if recipients_cfg.get("includeAdmin", True):
@@ -273,7 +272,7 @@ class ReportScheduler:
                     to_emails.append(addr)
         if not to_emails:
             logger.warning("Daily report skipped — no recipients configured")
-            return
+            return False
 
         send_params = await _resolve_email_params(db, alert_cfg)
         subject, html_body = await build_daily_monthly_email(db, alert_cfg, now_tz)
@@ -287,6 +286,7 @@ class ReportScheduler:
                 errors.append(str(exc))
         if errors and len(errors) == len(to_emails):
             raise RuntimeError(f"All daily report deliveries failed: {errors[0]}")
+        return True
 
 
 # ── Pure helpers (module-level, no class state) ────────────────────────────────
@@ -307,10 +307,17 @@ def _is_due(
         logger.warning("Report scheduler: invalid time %r — skipping", time_str)
         return False
 
-    # Current time must be at or past the scheduled time today
-    scheduled_today = now_tz.replace(hour=h, minute=m, second=0, microsecond=0)
-    if now_tz < scheduled_today:
-        return False  # Not yet time today
+    if report_type == "daily":
+        # Daily reports should fire only during the configured local minute.
+        # Do not send them late later in the day after a restart or a missed
+        # scheduler tick.
+        if now_tz.hour != h or now_tz.minute != m:
+            return False
+    else:
+        # Weekly and monthly reports retain catch-up behavior for missed runs.
+        scheduled_today = now_tz.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now_tz < scheduled_today:
+            return False  # Not yet time today
 
     # Guard against duplicate sends on the same day
     last_str = last_sent.get(report_type)

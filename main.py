@@ -216,7 +216,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] SLA breach detector could not start: {e}")
 
-    # 5. Start scheduled report sender (checks every 60 s)
+    # 5. Start scheduled report sender (checks every 5 s)
     try:
         report_scheduler.start()
         _log("[OK] Report scheduler started")
