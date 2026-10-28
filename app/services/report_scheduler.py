@@ -144,10 +144,20 @@ class ReportScheduler:
             today = now_tz.date()
             last_sent = dict(alert_cfg.last_reports_sent or {})
             changed   = False
+            combined_rep = reports.get("dailyMonthly") or {
+                "enabled": True,
+                "time": "17:45",
+            }
+            combined_enabled = combined_rep.get("enabled", True)
 
-            for report_type in ("daily", "weekly", "monthly"):  # Existing schedules remain unchanged.
+            for report_type in ("daily", "weekly", "monthly"):
                 rep = reports.get(report_type) or {}
                 if not rep.get("enabled", False):
+                    continue
+                if report_type == "daily" and combined_enabled:
+                    logger.info(
+                        "Report scheduler: skipping legacy daily template because the combined digest replaces it"
+                    )
                     continue
                 if not _is_due(report_type, rep, last_sent, now_tz, today):
                     continue
@@ -167,12 +177,8 @@ class ReportScheduler:
                         report_type, exc, exc_info=True,
                     )
 
-            # Separate combined digest. This has its own schedule and dedupe
-            # key, so it never replaces or suppresses the existing reports.
-            combined_rep = reports.get("dailyMonthly") or {
-                "enabled": True,
-                "time": "17:45",
-            }
+            # Combined digest is now the scheduled daily email whenever enabled;
+            # the legacy daily template is skipped above to avoid duplicate mail.
             if combined_rep.get("enabled", True) and _is_due(
                 "dailyMonthly", combined_rep, last_sent, now_tz, today
             ):

@@ -532,17 +532,23 @@ async def preview_daily_monthly_alert_draft(
 
 @router.post("/alerts/test")
 async def test_alert(
+    body: dict | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
     """
-    Send an immediate alert-summary email to all configured recipients.
+    Send an immediate Daily + Monthly report to all configured recipients.
     All blocking I/O (SMTP) runs in a thread-pool executor so the async
     event loop is never blocked.  A top-level try/except guarantees that
     the client always receives a proper HTTP response (never a bare drop).
     """
     try:
-        return await _run_test_alert(db, current_user)
+        reports = (body or {}).get("reports")
+        if reports is not None and not isinstance(reports, dict):
+            raise HTTPException(status_code=422, detail="reports must be an object")
+        return await _run_test_alert(
+            db, current_user, combined_report=True, reports_override=reports
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -550,7 +556,12 @@ async def test_alert(
         raise HTTPException(status_code=500, detail=f"Internal error: {exc}")
 
 
-async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
+async def _run_test_alert(
+    db: AsyncSession,
+    current_user: User,
+    combined_report: bool = False,
+    reports_override: dict | None = None,
+) -> dict:
     """Inner implementation — separated so the outer handler can catch everything."""
 
     # ── 1. Load alert settings ────────────────────────────────────────────
@@ -662,7 +673,7 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
             raise HTTPException(status_code=400, detail=f"Unsupported alert email type: '{atype}'")
 
     # ── 3. Gather live ticket counts ──────────────────────────────────────
-    _reports_cfg: dict = alert_cfg.reports or {}
+    _reports_cfg: dict = reports_override or alert_cfg.reports or {}
     _tz_name = (
         _reports_cfg.get("timezone")
         or (sys_cfg.trigger_timezone if use_same and sys_cfg and getattr(sys_cfg, "trigger_timezone", None) else None)
@@ -673,6 +684,29 @@ async def _run_test_alert(db: AsyncSession, current_user: User) -> dict:
     except Exception:
         _tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc).astimezone(_tz)
+
+    if combined_report:
+        from app.services.report_scheduler import build_daily_monthly_email
+
+        subject, html_body = await build_daily_monthly_email(
+            db, alert_cfg, now, reports_override=reports_override
+        )
+        errors: list[str] = []
+        for to_email in to_emails:
+            try:
+                await _dispatch_alert_email(send_params, to_email, subject, html_body)
+            except Exception as exc:
+                logger.warning("Daily + monthly test email to %s failed: %s", to_email, exc)
+                errors.append(f"{to_email}: {exc}")
+        if errors and len(errors) == len(to_emails):
+            raise HTTPException(status_code=502, detail=f"Email delivery failed — {errors[0]}")
+        return {
+            "ok": True,
+            "sent": len(to_emails) - len(errors),
+            "recipients": to_emails,
+            "subject": subject,
+            "report": "daily-monthly",
+        }
 
     unassigned_res = await db.execute(
         select(func.count()).select_from(Ticket).where(
