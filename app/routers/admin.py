@@ -442,8 +442,21 @@ async def update_alert_settings(
 ):
     settings = await _get_or_create_alert_settings(db)
     settings.conditions         = body.conditions
+    previous_reports = settings.reports or {}
     reports = dict(body.reports)
     reports.pop("dailyMonthly", None)
+    previous_daily = previous_reports.get("daily") or {}
+    new_daily = reports.get("daily") or {}
+    if (
+        previous_daily.get("time") != new_daily.get("time")
+        or previous_daily.get("enabled") != new_daily.get("enabled")
+        or previous_reports.get("timezone") != reports.get("timezone")
+    ):
+        # A changed daily schedule is a new run. Don't let an earlier delivery
+        # today suppress the newly configured time.
+        last_sent = dict(settings.last_reports_sent or {})
+        last_sent.pop("daily", None)
+        settings.last_reports_sent = last_sent or None
     settings.reports            = reports
     settings.recipients         = body.recipients
     settings.alert_email_config = body.alert_email_config

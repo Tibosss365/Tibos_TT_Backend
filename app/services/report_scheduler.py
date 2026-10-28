@@ -302,22 +302,16 @@ def _is_due(
     # Parse the configured HH:MM send time
     time_str = rep.get("time") or "08:00"
     try:
-        h, m = map(int, time_str.split(":"))
-    except (ValueError, AttributeError):
+        h, m = _parse_schedule_time(time_str)
+    except (ValueError, TypeError, AttributeError):
         logger.warning("Report scheduler: invalid time %r — skipping", time_str)
         return False
 
-    if report_type == "daily":
-        # Daily reports should fire only during the configured local minute.
-        # Do not send them late later in the day after a restart or a missed
-        # scheduler tick.
-        if now_tz.hour != h or now_tz.minute != m:
-            return False
-    else:
-        # Weekly and monthly reports retain catch-up behavior for missed runs.
-        scheduled_today = now_tz.replace(hour=h, minute=m, second=0, microsecond=0)
-        if now_tz < scheduled_today:
-            return False  # Not yet time today
+    # Catch up if a check lands a few seconds late or the process briefly
+    # pauses. The report still only fires once on its configured schedule day.
+    scheduled_today = now_tz.replace(hour=h, minute=m, second=0, microsecond=0)
+    if now_tz < scheduled_today:
+        return False  # Not yet time today
 
     # Guard against duplicate sends on the same day
     last_str = last_sent.get(report_type)
@@ -349,6 +343,25 @@ def _is_due(
         return today.day == min(dom, last_day)
 
     return False
+
+
+def _parse_schedule_time(value: str) -> tuple[int, int]:
+    """Parse both 24-hour API values and localized 12-hour UI values."""
+    normalized = value.strip()
+    for fmt in ("%I:%M %p", "%I:%M%p"):
+        try:
+            parsed = datetime.strptime(normalized.upper(), fmt)
+            return parsed.hour, parsed.minute
+        except ValueError:
+            pass
+
+    parts = normalized.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Expected HH:MM or h:mm AM/PM, got {value!r}")
+    hour, minute = (int(part) for part in parts)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Invalid 24-hour time: {value!r}")
+    return hour, minute
 
 
 def _period_start(report_type: str, now_tz: datetime) -> datetime:
