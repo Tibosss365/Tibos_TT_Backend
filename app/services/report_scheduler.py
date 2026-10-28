@@ -388,6 +388,7 @@ async def build_daily_monthly_email(
     monthly_template = dict(
         (reports.get("monthly") or {}).get("template") or daily_template
     )
+    include_monthly = daily_template.get("includeDailyMonthlyReport", True) is not False
     # The combined email has one shared introduction; the monthly fragment
     # must not repeat it.
     monthly_template["intro"] = ""
@@ -405,7 +406,7 @@ async def build_daily_monthly_email(
     )
     monthly_sections = (
         await gather_report_sections(db, now_tz, monthly_template, report_type="monthly")
-        if any(monthly_template.get(key) is True for key in (
+        if include_monthly and any(monthly_template.get(key) is True for key in (
             "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
         )) else {}
     )
@@ -424,46 +425,79 @@ async def build_daily_monthly_email(
     daily_html = _build_alert_html(
         daily_counts,
         now_tz,
-        # The combined 17:45 email includes the agent performance and daily
-        # metrics sections below, but omits the separate status-count table.
         agent_stats=None,
         template=daily_template,
         report_type="daily",
         report_sections=daily_sections,
     )
-    monthly_html = _build_alert_html(
-        monthly_counts,
-        now_tz,
-        agent_stats=None,
-        template=monthly_template,
-        report_type="monthly",
-        report_sections=monthly_sections,
-    )
+    monthly_html = None
+    if include_monthly:
+        monthly_html = _build_alert_html(
+            monthly_counts,
+            now_tz,
+            agent_stats=None,
+            template=monthly_template,
+            report_type="monthly",
+            report_sections=monthly_sections,
+        )
+
     date_text = now_tz.strftime("%B %d, %Y")
-    subject = f"Daily + Monthly Ticket Health Report — {date_text}"
-    html_body = (
-        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
-        '<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">'
-        '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:32px 16px;">'
-        '<tr><td align="center"><table width="600" cellpadding="0" cellspacing="0" '
-        'style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">'
-        '<tr><td style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px 24px;">'
-        '<div style="font-size:11px;font-weight:700;color:rgba(255,255,255,.7);text-transform:uppercase;'
-        'letter-spacing:1px;margin-bottom:6px;">&#128276; Combined Daily + Monthly Report</div>'
-        f'<div style="font-size:22px;font-weight:800;color:#fff;">Ticket Health Report</div>'
-        f'<div style="font-size:12px;color:rgba(255,255,255,.7);margin-top:4px;">{date_text} at {now_tz:%H:%M} {now_tz.tzname() or "local time"}</div>'
-        '</td></tr>'
-        '<tr><td style="padding:18px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
-        'text-transform:uppercase;letter-spacing:.8px;">Daily Report</td></tr>'
+    report_label = "Daily + Monthly" if include_monthly else "Daily"
+    subject = f"{report_label} Ticket Health Report — {date_text}"
+    daily_block = (
+        '<tr><td class="section-pad" style="padding:18px 26px 0;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        '<tr><td bgcolor="#eef2ff" style="padding:11px 14px;background:#eef2ff;border-left:4px solid #4f46e5;'
+        'font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#3730a3;">'
+        'Daily Report</td></tr>'
         + content_fragment(daily_html)
-        + '<tr><td style="padding:22px 24px 0;font-size:11px;font-weight:700;color:#4f46e5;'
-        'text-transform:uppercase;letter-spacing:.8px;border-top:1px solid #e5e7eb;">Monthly Report · Month to Date</td></tr>'
-        + content_fragment(monthly_html)
-        + '<tr><td style="padding:20px 24px 28px;border-top:1px solid #f3f4f6;">'
-        '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
-        'Automated combined report from your Tibos Helpdesk.<br>'
-        'Manage report settings in <strong>Admin &rarr; Alerts</strong>.</p>'
-        '</td></tr></table></td></tr></table></body></html>'
+        + '</table></td></tr>'
+    )
+    monthly_block = ""
+    if monthly_html:
+        monthly_block = (
+            '<tr><td class="section-pad" style="padding:24px 26px 0;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            '<tr><td bgcolor="#ecfdf5" style="padding:11px 14px;background:#ecfdf5;border-left:4px solid #059669;'
+            'font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#047857;">'
+            'Monthly Report &nbsp;·&nbsp; Month to Date</td></tr>'
+            + content_fragment(monthly_html)
+            + '</table></td></tr>'
+        )
+
+    html_body = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>@media only screen and (max-width:640px){.report-shell{width:100%!important}.section-pad{padding-left:14px!important;padding-right:14px!important}}</style></head>'
+        '<body style="margin:0;padding:0;background:#eef2f7;font-family:Arial,Helvetica,sans-serif;color:#1f2937;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eef2f7" style="background:#eef2f7;">'
+        '<tr><td align="center" style="padding:28px 12px;">'
+        '<table role="presentation" class="report-shell" width="640" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" '
+        'style="width:640px;max-width:640px;background:#ffffff;border:1px solid #e3e8f0;border-radius:14px;overflow:hidden;">'
+        '<tr><td height="6" bgcolor="#818cf8" style="height:6px;background:#818cf8;font-size:0;line-height:0;">&nbsp;</td></tr>'
+        '<tr><td bgcolor="#312e81" style="background:#312e81;padding:28px 30px 26px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td>'
+        '<span style="display:inline-block;padding:6px 10px;border:1px solid #7772c8;border-radius:20px;'
+        'font-family:Arial,sans-serif;font-size:10px;font-weight:700;color:#e0e7ff;letter-spacing:1px;text-transform:uppercase;">'
+        f'{report_label} &nbsp;|&nbsp; 5:45 PM DIGEST</span>'
+        '<div style="padding-top:15px;font-family:Arial,sans-serif;font-size:27px;line-height:1.2;font-weight:700;color:#ffffff;">Ticket Health Report</div>'
+        f'<div style="padding-top:8px;font-family:Arial,sans-serif;font-size:13px;line-height:1.5;color:#c7d2fe;">{date_text} &nbsp;·&nbsp; {now_tz:%H:%M} {now_tz.tzname() or "local time"}</div>'
+        '</td></tr></table></td></tr>'
+        '<tr><td style="padding:20px 26px 2px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f5f6ff" '
+        'style="background:#f5f6ff;border:1px solid #e5e7ff;border-radius:10px;"><tr>'
+        '<td style="padding:12px 15px;font-family:Arial,sans-serif;font-size:12px;line-height:1.5;color:#4338ca;">'
+        '<strong>Daily snapshot</strong> &nbsp;•&nbsp; '
+        + ("<strong>Month to date</strong>" if include_monthly else "Monthly section hidden by your template selection")
+        + '</td></tr></table></td></tr>'
+        + daily_block
+        + monthly_block
+        + '<tr><td style="padding:23px 26px 25px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
+        '<td height="1" bgcolor="#e8ecf2" style="height:1px;background:#e8ecf2;font-size:0;line-height:0;">&nbsp;</td>'
+        '</tr><tr><td align="center" style="padding-top:16px;font-family:Arial,sans-serif;font-size:11px;line-height:1.7;color:#98a2b3;">'
+        'Automated report from Tibos Helpdesk.<br>Manage report settings in <strong style="color:#667085;">Admin &rarr; Alerts</strong>.'
+        '</td></tr></table></td></tr>'
+        '</table></td></tr></table></body></html>'
     )
     return subject, html_body
 
