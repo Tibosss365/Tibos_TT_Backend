@@ -496,7 +496,7 @@ async def export_resolved_excel(
 
 @router.get("/company-suggestions")
 async def company_suggestions(
-    q: str = Query(..., min_length=1, max_length=100),
+    q: str = Query("", max_length=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -505,17 +505,16 @@ async def company_suggestions(
         raise HTTPException(status_code=403, detail="Only support staff can search customer companies")
 
     query = q.strip()
-    if not query:
-        return []
     escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     prefix_pattern = f"{escaped_query}%"
+    result_limit = 2000 if not query else 100
     companies: dict[str, dict] = {}
 
     registry_result = await db.execute(
         select(DomainCompany)
         .where(DomainCompany.company_name.ilike(prefix_pattern, escape="\\"))
         .order_by(DomainCompany.company_name, DomainCompany.domain)
-        .limit(100)
+        .limit(result_limit)
     )
     for company in registry_result.scalars().all():
         key = company.company_name.strip().casefold()
@@ -539,7 +538,7 @@ async def company_suggestions(
             Ticket.company != "",
         )
         .order_by(Ticket.updated_at.desc())
-        .limit(500)
+        .limit(result_limit)
     )
     for company_name, contact_name, email, phone in ticket_result.all():
         name = (company_name or "").strip()
@@ -556,7 +555,7 @@ async def company_suggestions(
         item["contact_email"] = item["contact_email"] or email or ""
         item["contact_phone"] = item["contact_phone"] or phone or ""
 
-    return sorted(companies.values(), key=lambda item: item["company_name"].casefold())[:50]
+    return sorted(companies.values(), key=lambda item: item["company_name"].casefold())[:result_limit]
 
 
 @router.post("", response_model=TicketOut, status_code=status.HTTP_201_CREATED)
