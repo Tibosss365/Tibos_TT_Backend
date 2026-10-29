@@ -431,6 +431,69 @@ async def export_csv(
     )
 
 
+@router.get("/export/resolved.xlsx")
+async def export_resolved_excel(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download every non-deleted resolved ticket as an Excel workbook."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    result = await db.execute(
+        select(Ticket)
+        .options(selectinload(Ticket.assignee))
+        .where(
+            Ticket.is_deleted == False,  # noqa: E712
+            Ticket.status == TicketStatus.resolved,
+        )
+        .order_by(Ticket.updated_at.desc())
+    )
+    tickets = result.scalars().all()
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Resolved Tickets"
+    headers = [
+        "Ticket ID", "Subject", "Type", "Category", "Priority", "Status",
+        "Assignee", "Submitter", "Company", "Email", "Phone", "Asset",
+        "Description", "Resolution", "Resolution Code", "Group",
+        "Created", "Updated",
+    ]
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2563EB")
+
+    for ticket in tickets:
+        sheet.append([
+            ticket.ticket_id, ticket.subject, ticket.type, ticket.category,
+            ticket.priority.value, ticket.status.value,
+            ticket.assignee.name if ticket.assignee else "Unassigned",
+            ticket.submitter_name, ticket.company, ticket.email, ticket.phone,
+            ticket.asset, ticket.description, ticket.resolution,
+            ticket.resolution_code, ticket.group_id,
+            ticket.created_at.replace(tzinfo=None) if ticket.created_at else None,
+            ticket.updated_at.replace(tzinfo=None) if ticket.updated_at else None,
+        ])
+
+    for column_cells in sheet.columns:
+        column_letter = column_cells[0].column_letter
+        max_length = max(len(str(cell.value or "")) for cell in column_cells)
+        sheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 50)
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=resolved_tickets.xlsx"},
+    )
+
+
 @router.post("", response_model=TicketOut, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     body: TicketCreate,
