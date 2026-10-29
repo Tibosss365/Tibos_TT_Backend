@@ -494,6 +494,71 @@ async def export_resolved_excel(
     )
 
 
+@router.get("/company-suggestions")
+async def company_suggestions(
+    q: str = Query(..., min_length=1, max_length=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Suggest company contacts from the company registry and ticket history."""
+    if current_user.role == UserRole.user:
+        raise HTTPException(status_code=403, detail="Only support staff can search customer companies")
+
+    query = q.strip()
+    if not query:
+        return []
+    escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    prefix_pattern = f"{escaped_query}%"
+    companies: dict[str, dict] = {}
+
+    registry_result = await db.execute(
+        select(DomainCompany)
+        .where(DomainCompany.company_name.ilike(prefix_pattern, escape="\\"))
+        .order_by(DomainCompany.company_name, DomainCompany.domain)
+        .limit(100)
+    )
+    for company in registry_result.scalars().all():
+        key = company.company_name.strip().casefold()
+        if not key:
+            continue
+        item = companies.setdefault(key, {
+            "company_name": company.company_name,
+            "contact_name": "",
+            "contact_email": "",
+            "contact_phone": "",
+        })
+        item["contact_name"] = item["contact_name"] or company.contact_name or ""
+        item["contact_email"] = item["contact_email"] or company.contact_email or ""
+        item["contact_phone"] = item["contact_phone"] or company.contact_phone or ""
+
+    ticket_result = await db.execute(
+        select(Ticket.company, Ticket.contact_name, Ticket.email, Ticket.phone)
+        .where(
+            Ticket.is_deleted == False,  # noqa: E712
+            Ticket.company.ilike(prefix_pattern, escape="\\"),
+            Ticket.company != "",
+        )
+        .order_by(Ticket.updated_at.desc())
+        .limit(500)
+    )
+    for company_name, contact_name, email, phone in ticket_result.all():
+        name = (company_name or "").strip()
+        key = name.casefold()
+        if not key:
+            continue
+        item = companies.setdefault(key, {
+            "company_name": name,
+            "contact_name": "",
+            "contact_email": "",
+            "contact_phone": "",
+        })
+        item["contact_name"] = item["contact_name"] or contact_name or ""
+        item["contact_email"] = item["contact_email"] or email or ""
+        item["contact_phone"] = item["contact_phone"] or phone or ""
+
+    return sorted(companies.values(), key=lambda item: item["company_name"].casefold())[:50]
+
+
 @router.post("", response_model=TicketOut, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     body: TicketCreate,
