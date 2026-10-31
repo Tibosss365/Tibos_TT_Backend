@@ -90,6 +90,7 @@ async def gather_report_sections(
     day_start, tomorrow_start, month_start = report_time_bounds(now)
     hour_1 = now_utc - timedelta(hours=1)
     hour_2 = now_utc - timedelta(hours=2)
+    hour_24 = now_utc - timedelta(hours=24)
 
     perf_result = await db.execute(
         select(Ticket.assignee_id, func.count(Ticket.id))
@@ -107,6 +108,7 @@ async def gather_report_sections(
             created_today.label("created_today"),
             func.sum(case((unresolved & (Ticket.created_at > hour_1) & (Ticket.created_at <= now_utc), 1), else_=0)).label("under_1h"),
             func.sum(case((unresolved & (Ticket.created_at > hour_2) & (Ticket.created_at <= hour_1), 1), else_=0)).label("one_to_two_hours"),
+            func.sum(case((unresolved & (Ticket.created_at > hour_24) & (Ticket.created_at <= hour_2), 1), else_=0)).label("two_to_24_hours"),
             func.sum(case((Ticket.created_at >= month_start, 1), else_=0)).label("created_this_month"),
         )
         .where(Ticket.assignee_id.in_(user_ids))
@@ -185,6 +187,7 @@ async def gather_report_sections(
             "created_today": int(row.get("created_today") or 0),
             "under_1h": int(row.get("under_1h") or 0),
             "one_to_two_hours": int(row.get("one_to_two_hours") or 0),
+            "two_to_24_hours": int(row.get("two_to_24_hours") or 0),
             **resolved,
             "created_this_month": int(row.get("created_this_month") or 0),
         })
@@ -193,7 +196,6 @@ async def gather_report_sections(
     # the timezone configured for scheduled reports.
     next_month_date = (now.date().replace(day=28) + timedelta(days=4)).replace(day=1)
     month_end = _utc(datetime.combine(next_month_date, time.min, tzinfo=now.tzinfo))
-    hour_24 = now_utc - timedelta(hours=24)
     monthly_result = await db.execute(
         select(
             Ticket.assignee_id,
@@ -374,8 +376,8 @@ def render_report_sections(
                 for row in data.get("monthly_agent_report", [])
             ])
         else:
-            table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
-                [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
+            table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Open 2–24h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
+                [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["two_to_24_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
                 for row in data.get("daily_agent_report", [])
             ])
     if report_type != "monthly" and template.get("includeCategorySpecialists") is True:
