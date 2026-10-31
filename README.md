@@ -82,7 +82,7 @@ This creates 5 default agents and 15 sample tickets:
 ### 7. Start the server
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+uvicorn main:app --reload --port 8000
 ```
 
 API docs available at: http://localhost:8000/docs

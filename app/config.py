@@ -1,10 +1,23 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from functools import lru_cache
 from typing import Optional
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug_mode(cls, value):
+        """Accept common deployment mode strings in environments that export DEBUG."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"debug", "development", "dev", "true", "yes", "on", "1"}:
+                return True
+            if normalized in {"release", "production", "prod", "false", "no", "off", "0"}:
+                return False
+        return value
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost:5432/helpdesk"

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 
 from app.config import get_settings
@@ -338,6 +338,12 @@ app.include_router(teams_public_router)    # Teams bot: /api/messages
 app.include_router(teams_admin_router)     # /admin/teams
 app.include_router(knowledge.router)       # /kb/*
 app.include_router(company_settings.router) # /admin/company-settings
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Send browser visits to the interactive API documentation."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", tags=["health"])

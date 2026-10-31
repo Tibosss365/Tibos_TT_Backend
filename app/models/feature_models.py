@@ -93,6 +93,9 @@ class TicketTemplate(Base):
     subject: Mapped[str] = mapped_column(
         String(255), nullable=False, default="", server_default=""
     )
+    type: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="request", server_default="request"
+    )
     category: Mapped[str] = mapped_column(
         String(80), nullable=False, default="other", server_default="other"
     )

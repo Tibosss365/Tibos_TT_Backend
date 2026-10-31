@@ -88,6 +88,7 @@ class TicketTemplateCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = None
     subject: str = Field(default="", max_length=255)
+    type: str = Field(default="request", max_length=30)
     category: str = Field(default="other", max_length=80)
     priority: str = "medium"
     group_id: str | None = None
@@ -100,6 +101,7 @@ class TicketTemplateUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     description: str | None = None
     subject: str | None = Field(default=None, max_length=255)
+    type: str | None = Field(default=None, max_length=30)
     category: str | None = Field(default=None, max_length=80)
     priority: str | None = None
     group_id: str | None = None
@@ -113,6 +115,7 @@ class TicketTemplateOut(BaseModel):
     name: str
     description: str | None
     subject: str
+    type: str = "request"
     category: str
     priority: str
     group_id: str | None
