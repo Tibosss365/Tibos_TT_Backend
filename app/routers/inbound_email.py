@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -31,6 +31,7 @@ from app.schemas.inbound_email import (
     PollResult,
 )
 from app.services.email_poller import email_poller
+from app.services.email_inbox_service import normalize_subject
 from app.services.sla_service import SLAService
 
 router = APIRouter(prefix="/inbound-email", tags=["inbound-email"])
@@ -214,6 +215,30 @@ async def convert_log_to_ticket(
         raise HTTPException(status_code=404, detail="Log entry not found")
     if log.ticket_id:
         raise HTTPException(status_code=400, detail="This email was already converted to a ticket")
+
+    # Manual conversion must obey the same subject rule as automatic polling.
+    # Lock by normalized subject so concurrent conversions cannot race.
+    normalized_subject = normalize_subject(log.subject or "")
+    if normalized_subject:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:subject_key))"),
+            {"subject_key": f"ticket-subject:{normalized_subject}"},
+        )
+        subject_pattern = r"^\s*((re|fwd?|aw|sv)\s*:\s*)+"
+        normalized_ticket_subject = func.btrim(func.regexp_replace(
+            func.regexp_replace(func.lower(Ticket.subject), subject_pattern, "", "g"),
+            r"\s+", " ", "g",
+        ))
+        duplicate_res = await db.execute(
+            select(Ticket.id)
+            .where(normalized_ticket_subject == normalized_subject)
+            .limit(1)
+        )
+        if duplicate_res.scalar_one_or_none():
+            raise HTTPException(
+                status_code=409,
+                detail="A ticket already exists with this subject, regardless of sender.",
+            )
 
     inbound = await db.get(InboundEmailConfig, log.inbound_config_id)
 

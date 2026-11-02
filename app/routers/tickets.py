@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, or_, update, delete, String
+from sqlalchemy import func, select, or_, update, delete, String, text
 from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -56,6 +56,7 @@ from app.services.account_owner_service import (
     owner_label,
     owners_for_company,
 )
+from app.services.email_inbox_service import normalize_subject
 
 
 # Markers where a quoted reply trail begins — we keep only the first message.
@@ -564,6 +565,30 @@ async def create_ticket(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Enforce duplicate subjects on the shared ticket-creation API too. Email
+    # forwarding setups may reach this endpoint instead of the IMAP poller.
+    normalized_subject = normalize_subject(body.subject)
+    if normalized_subject:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:subject_key))"),
+            {"subject_key": f"ticket-subject:{normalized_subject}"},
+        )
+        subject_pattern = r"^\s*((re|fwd?|aw|sv)\s*:\s*)+"
+        normalized_ticket_subject = func.btrim(func.regexp_replace(
+            func.regexp_replace(func.lower(Ticket.subject), subject_pattern, "", "g"),
+            r"\s+", " ", "g",
+        ))
+        duplicate_res = await db.execute(
+            select(Ticket.id)
+            .where(normalized_ticket_subject == normalized_subject)
+            .limit(1)
+        )
+        if duplicate_res.scalar_one_or_none():
+            raise HTTPException(
+                status_code=409,
+                detail="A ticket already exists with this subject, regardless of sender.",
+            )
+
     # ── Load ticket settings (prefix, digits, defaults) ──────────────────
     ts_result = await db.execute(select(TicketSettings).limit(1))
     ts = ts_result.scalar_one_or_none()

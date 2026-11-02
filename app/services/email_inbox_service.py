@@ -43,7 +43,9 @@ def _utcnow() -> datetime:
 
 
 def normalize_subject(subject: str) -> str:
-    return _SUBJECT_PREFIX_RE.sub("", subject or "").strip().lower()
+    # Mail relays and clients may add reply/forward prefixes and vary spacing.
+    # Normalize both so those messages compare as the same subject.
+    return " ".join(_SUBJECT_PREFIX_RE.sub("", subject or "").lower().split())
 
 
 def render_template_string(text: str, variables: dict[str, str]) -> str:
