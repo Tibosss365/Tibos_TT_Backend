@@ -583,44 +583,19 @@ async def _process_inbound_email(
         return existing_ticket, log, True
 
     # ── No match — create a new ticket ───────────────────────────────────
-    # Load ticket settings so prefix/digits/default-status honour admin config.
-    # A subject is a duplicate across senders and intake paths, so check actual
-    # tickets as well as email logs (which can omit tickets created elsewhere).
+    # Load ticket settings so prefix/digits/default-status honour admin config
+    # Emails without usable threading headers can still be forwards or copies
+    # of an email that already opened a ticket. Compare normalized subjects
+    # against successfully processed inbound email logs so portal-created
+    # tickets with the same title are not accidentally suppressed.
     normalized_subject = normalize_subject(subject)
     if normalized_subject:
-        subject_lock_key = f"ticket-subject:{normalized_subject}"
+        subject_lock_key = f"email-ticket-subject:{normalized_subject}"
         await db.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:subject_key))"),
             {"subject_key": subject_lock_key},
         )
         subject_pattern = r"^\s*((re|fwd?|aw|sv)\s*:\s*)+"
-        normalized_ticket_subject = func.btrim(func.regexp_replace(
-            func.regexp_replace(func.lower(Ticket.subject), subject_pattern, "", "g"),
-            r"\s+", " ", "g",
-        ))
-        existing_ticket_res = await db.execute(
-            select(Ticket)
-            .where(normalized_ticket_subject == normalized_subject)
-            .order_by(Ticket.created_at.desc())
-            .limit(1)
-        )
-        existing_subject_ticket = existing_ticket_res.scalar_one_or_none()
-        if existing_subject_ticket:
-            await _upsert_email_log(
-                db,
-                inbound_config_id=inbound.id,
-                message_id=message_id,
-                from_email=from_email,
-                from_name=from_name,
-                subject=subject,
-                received_at=received_at,
-                status=EmailLogStatus.duplicate,
-                ticket_id=existing_subject_ticket.id,
-                error_message="A ticket already exists with this subject, regardless of sender.",
-                body=body,
-            )
-            raise DuplicateMessageError("Duplicate normalized email subject")
-
         duplicate_subject_res = await db.execute(
             select(EmailTicketLog)
             .where(
