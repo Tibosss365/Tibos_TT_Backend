@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_, update, delete, String
 from sqlalchemy.dialects.postgresql import array as pg_array
@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.deps import get_current_user
-from app.database import get_db
+from app.database import AsyncSessionLocal, get_db
 from app.models.ticket import (
     Ticket,
     TicketCategory,
@@ -112,7 +112,9 @@ async def _auto_discover_domain(domain: str, db: AsyncSession) -> str | None:
     """
     url = f"https://autocomplete.clearbit.com/v1/companies/suggest?query={domain}"
     try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        # Company enrichment is optional; cap its wait so it cannot hold up a
+        # ticket submission when the third-party lookup is slow or unavailable.
+        async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.get(url, headers={"User-Agent": "TibosTT/1.0"})
             if resp.status_code == 200:
                 results = resp.json()
@@ -194,6 +196,61 @@ async def _get_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return ticket
+
+
+async def _deliver_ticket_email_background(
+    ticket_id: str,
+    actor_id: str,
+    *,
+    subject: str,
+    body_html: str,
+    action_label: str,
+    action_color: str,
+    include_reopen: bool = False,
+) -> None:
+    """Send ticket email after the API response, using a fresh DB session."""
+    try:
+        async with AsyncSessionLocal() as bg_db:
+            ticket = await _get_ticket_or_404(uuid.UUID(ticket_id), bg_db)
+            owner_cc = owner_emails(ticket.owners, exclude=ticket.email)
+            msg_id = await send_ticket_email(
+                bg_db,
+                ticket,
+                to_email=ticket.email,
+                subject=subject,
+                body_html=body_html,
+                action_label=action_label,
+                action_color=action_color,
+                assignee_name=ticket.assignee.name if ticket.assignee else None,
+                in_reply_to=ticket.email_thread_id,
+                references=ticket.email_thread_id,
+                include_reopen=include_reopen,
+                cc=owner_cc,
+            )
+            if msg_id:
+                if action_label == "New Ticket Created":
+                    ticket.email_thread_id = msg_id
+                bg_db.add(TicketTimeline(
+                    ticket_id=ticket.id,
+                    type=TimelineType.email_out,
+                    text=body_html,
+                    author_id=uuid.UUID(actor_id),
+                    email_from="Helpdesk",
+                    email_to=ticket.email,
+                    email_cc=", ".join(owner_cc) if owner_cc else None,
+                    email_subject=subject,
+                ))
+
+            # CSAT delivery is also external I/O; keep it off the resolution request.
+            if action_label == "Ticket Resolved":
+                from app.services.csat_service import send_csat_survey
+                from app.config import get_settings
+                settings = get_settings()
+                base_url = str(settings.FRONTEND_URL).rstrip("/") if settings.FRONTEND_URL else "https://support.tibos.in"
+                await send_csat_survey(ticket, bg_db, base_url)
+            await bg_db.commit()
+    except Exception as exc:
+        logger.exception("Background ticket email failed for %s: %s", ticket_id, exc)
 
 
 async def _get_any_ticket_or_404(ticket_id: uuid.UUID, db: AsyncSession) -> Ticket:
@@ -561,6 +618,7 @@ async def company_suggestions(
 @router.post("", response_model=TicketOut, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     body: TicketCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -700,6 +758,8 @@ async def create_ticket(
             await notify_ticket_assigned(db, full, assignee, current_user.name)
 
     # ── Email: ticket created confirmation to submitter ────────────────
+    # Build the confirmation now, but deliver it after the API response so a
+    # slow SMTP/Graph service cannot hold up ticket submission.
     if full.email:
         description_block = ""
         if full.description:
@@ -723,32 +783,15 @@ async def create_ticket(
             + description_block +
             f"<p>We will get back to you as soon as possible. You can reply to this email to add more information.</p>"
         )
-        owner_cc = owner_emails(full.owners, exclude=full.email)
-        msg_id = await send_ticket_email(
-            db, full,
-            to_email=full.email,
+        background_tasks.add_task(
+            _deliver_ticket_email_background,
+            str(ticket.id),
+            str(current_user.id),
             subject=f"[{full.ticket_id}] {full.subject}",
             body_html=email_body,
             action_label="New Ticket Created",
             action_color="#6366f1",
-            assignee_name=full.assignee.name if full.assignee else None,
-            cc=owner_cc,
         )
-        if msg_id:
-            # Store thread ID for reply matching and log in timeline
-            ticket.email_thread_id = msg_id
-            db.add(TicketTimeline(
-                ticket_id=ticket.id,
-                type=TimelineType.email_out,
-                text=email_body,
-                author_id=current_user.id,
-                email_from="Helpdesk",
-                email_to=full.email,
-                email_cc=", ".join(owner_cc) if owner_cc else None,
-                email_subject=f"[{full.ticket_id}] {full.subject}",
-            ))
-            await db.flush()
-
     # Commit before broadcasting so any SSE-triggered fetchTickets sees the new ticket
     await db.commit()
     try:
@@ -973,6 +1016,7 @@ async def download_attachment(
 async def update_ticket(
     ticket_id: uuid.UUID,
     body: TicketUpdate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1218,32 +1262,19 @@ async def update_ticket(
     if status_changed and update_data["status"] == TicketStatus.resolved:
         admins = await _get_admins(db)
         await notify_ticket_resolved(db, full, current_user.name, None, admins)
-        try:
-            from app.services.csat_service import send_csat_survey
-            from app.config import get_settings as _gs
-            _base = str(_gs().FRONTEND_URL).rstrip("/") if hasattr(_gs(), "FRONTEND_URL") else "https://support.tibos.in"
-            await send_csat_survey(full, db, _base)
-        except Exception as _ce:
-            logger.warning(f"[CSAT] Survey dispatch failed: {_ce}")
 
-    # ── Email: status-change notifications to submitter ──────────────────
     if status_changed and full.email:
         new_st = update_data["status"]
         email_cfg_data: dict | None = None
-        _agent = full.assignee.name if full.assignee else None
-
         if new_st == TicketStatus.on_hold:
             email_cfg_data = dict(
                 subject=f"[{full.ticket_id}] Your ticket is on hold",
                 body=(
                     f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
                     f"<p>Your ticket <strong>{full.subject}</strong> has been placed <strong>on hold</strong>.</p>"
-                    f"<p>We will resume work on it as soon as possible. "
-                    f"Reply to this email if you have additional information.</p>"
+                    f"<p>We will resume work on it as soon as possible. Reply to this email if you have additional information.</p>"
                 ),
-                action_label="Ticket On Hold",
-                action_color="#f59e0b",
-                include_reopen=False,
+                action_label="Ticket On Hold", action_color="#f59e0b", include_reopen=False,
             )
         elif new_st == TicketStatus.resolved:
             resolution_note = full.resolution or ""
@@ -1254,9 +1285,7 @@ async def update_ticket(
                     f"<p>Your ticket <strong>{full.subject}</strong> has been <strong>resolved</strong>.</p>"
                     + (f"<p><strong>Resolution:</strong><br/>{resolution_note}</p>" if resolution_note else "")
                 ),
-                action_label="Ticket Resolved",
-                action_color="#10b981",
-                include_reopen=True,
+                action_label="Ticket Resolved", action_color="#10b981", include_reopen=True,
             )
         elif new_st == TicketStatus.closed:
             email_cfg_data = dict(
@@ -1266,9 +1295,7 @@ async def update_ticket(
                     f"<p>Your ticket <strong>{full.subject}</strong> has been <strong>closed</strong>.</p>"
                     f"<p>Thank you for contacting us. If you need further assistance, please submit a new request.</p>"
                 ),
-                action_label="Ticket Closed",
-                action_color="#6b7280",
-                include_reopen=False,
+                action_label="Ticket Closed", action_color="#6b7280", include_reopen=False,
             )
         elif new_st == TicketStatus.in_progress and old_status == TicketStatus.open:
             email_cfg_data = dict(
@@ -1276,43 +1303,22 @@ async def update_ticket(
                 body=(
                     f"<p>Hi <strong>{full.submitter_name}</strong>,</p>"
                     f"<p>Our team has started working on your ticket <strong>{full.subject}</strong>.</p>"
-                    f"<p>We will keep you updated on the progress. "
-                    f"Reply to this email if you have additional information.</p>"
+                    f"<p>We will keep you updated on the progress. Reply to this email if you have additional information.</p>"
                 ),
-                action_label="Ticket In Progress",
-                action_color="#8b5cf6",
-                include_reopen=False,
+                action_label="Ticket In Progress", action_color="#8b5cf6", include_reopen=False,
             )
 
         if email_cfg_data:
-            # Account owners get every customer-facing status email — on hold,
-            # in progress, resolved, closed — just like the customer does.
-            owner_cc = owner_emails(full.owners, exclude=full.email)
-            await send_ticket_email(
-                db, full,
-                to_email=full.email,
+            background_tasks.add_task(
+                _deliver_ticket_email_background,
+                str(ticket_id),
+                str(current_user.id),
                 subject=email_cfg_data["subject"],
                 body_html=email_cfg_data["body"],
                 action_label=email_cfg_data["action_label"],
                 action_color=email_cfg_data["action_color"],
-                in_reply_to=full.email_thread_id,
-                references=full.email_thread_id,
-                assignee_name=_agent,
                 include_reopen=email_cfg_data.get("include_reopen", False),
-                cc=owner_cc,
             )
-            db.add(TicketTimeline(
-                ticket_id=full.id,
-                type=TimelineType.email_out,
-                text=email_cfg_data["body"],
-                author_id=current_user.id,
-                email_from="Helpdesk",
-                email_to=full.email,
-                email_cc=", ".join(owner_cc) if owner_cc else None,
-                email_subject=email_cfg_data["subject"],
-            ))
-            await db.flush()
-
     # Commit before broadcasting so any SSE-triggered fetchTickets sees the update
     await db.commit()
     try:

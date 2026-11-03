@@ -7,6 +7,7 @@ using the EmailConfig stored in the DB.
 All ticket email events (created, comment, status, resolved) call send_ticket_email().
 The /admin/email/test endpoint calls send_test_email() to verify config.
 """
+import asyncio
 import logging
 import smtplib
 import ssl
@@ -747,19 +748,23 @@ async def _send_ticket_via_smtp(
     # which would leak them to every other recipient.
     envelope_to = [to_email] + list(cc or []) + list(bcc or [])
 
-    if cfg.smtp_security == SMTPSecurity.ssl:
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as server:
-            server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-            server.sendmail(from_addr, envelope_to, msg.as_bytes())
-    else:
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.ehlo()
-            if cfg.smtp_security == SMTPSecurity.tls:
-                server.starttls(context=ssl.create_default_context())
+    def _deliver() -> None:
+        if cfg.smtp_security == SMTPSecurity.ssl:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as server:
+                server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
+                server.sendmail(from_addr, envelope_to, msg.as_bytes())
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as server:
                 server.ehlo()
-            server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
-            server.sendmail(from_addr, envelope_to, msg.as_bytes())
+                if cfg.smtp_security == SMTPSecurity.tls:
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                server.login(cfg.smtp_user or "", cfg.smtp_pass or "")
+                server.sendmail(from_addr, envelope_to, msg.as_bytes())
+
+    # smtplib is synchronous; keep DNS/TLS/SMTP waits off the asyncio event loop.
+    await asyncio.to_thread(_deliver)
 
     _cc_note = f" (cc: {', '.join(cc)})" if cc else ""
     logger.info(f"Email sent to {to_email}{_cc_note} for {ticket.ticket_id} [{action_label}] via SMTP")
