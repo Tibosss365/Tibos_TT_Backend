@@ -985,15 +985,24 @@ async def update_ticket(
     # ── Requester details are locked — they may not be changed via update ──────
     # The frontend keeps name / email / company read-only; enforce it server-side
     # too so a direct API call can't alter the requester.
-    LOCKED_REQUESTER_FIELDS = ("contact_name", "email", "company")
-    for f in LOCKED_REQUESTER_FIELDS:
-        if f in update_data and (update_data[f] or "") != (getattr(ticket, f) or ""):
-            raise HTTPException(
-                status_code=400,
-                detail="Requester details (name, email, company) are locked and cannot be changed.",
+    if current_user.role == UserRole.user:
+        for field in ("contact_name", "submitter_name", "email", "company"):
+            update_data.pop(field, None)
+    else:
+        # Keep the legacy contact_name and submitter_name fields in sync so the
+        # requester panel and customer notifications use the same contact name.
+        if "contact_name" in update_data or "submitter_name" in update_data:
+            changed_contact = (
+                update_data.get("contact_name")
+                if "contact_name" in update_data
+                else update_data.get("submitter_name")
             )
-        # Never write a requester field, even when the value is unchanged.
-        update_data.pop(f, None)
+            if changed_contact is None:
+                update_data.pop("contact_name", None)
+                update_data.pop("submitter_name", None)
+            else:
+                update_data["contact_name"] = changed_contact
+                update_data["submitter_name"] = changed_contact
 
     # ── Account owners — agents only, and always stored normalized ────────────
     owners_before: list[dict] = []

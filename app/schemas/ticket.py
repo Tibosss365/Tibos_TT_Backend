@@ -89,6 +89,7 @@ class TicketUpdate(BaseModel):
     assignee_id: uuid.UUID | None = None
     company: str | None = None
     contact_name: str | None = None
+    submitter_name: str | None = Field(default=None, max_length=100)
     email: str | None = None
     phone: str | None = None
     asset: str | None = None
