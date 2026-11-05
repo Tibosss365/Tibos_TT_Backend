@@ -353,58 +353,58 @@ async def get_stats(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    # Count by status
-    status_counts: dict[str, int] = {}
-    for s in TicketStatus:
-        res = await db.execute(
-            select(func.count()).select_from(Ticket).where(Ticket.status == s)
-        )
-        status_counts[s.value] = res.scalar_one()
-
-    critical_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
+    metrics_stmt = select(
+        func.count().label("total"),
+        func.count().filter(Ticket.status == TicketStatus.open).label("open"),
+        func.count().filter(Ticket.status == TicketStatus.in_progress).label("in_progress"),
+        func.count().filter(Ticket.status == TicketStatus.resolved).label("resolved"),
+        func.count().filter(Ticket.status == TicketStatus.closed).label("closed"),
+        func.count().filter(
             Ticket.priority == TicketPriority.critical,
             Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
-        )
-    )
-    critical = critical_res.scalar_one()
-
-    unassigned_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
+        ).label("critical"),
+        func.count().filter(
             Ticket.assignee_id.is_(None),
             Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
-        )
-    )
-    unassigned = unassigned_res.scalar_one()
+        ).label("unassigned"),
+    ).select_from(Ticket)
+    metrics = (await db.execute(metrics_stmt)).one()
 
-    # Agent workload
-    agents_res = await db.execute(select(User).where(User.is_active == True))
-    agents = agents_res.scalars().all()
-    agent_workload = []
-    for agent in agents:
-        open_res = await db.execute(
-            select(func.count()).select_from(Ticket).where(
-                Ticket.assignee_id == agent.id,
-                Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
-            )
+    agents_stmt = (
+        select(
+            User.id,
+            User.name,
+            User.initials,
+            User.group,
+            func.count(Ticket.id).filter(
+                Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed])
+            ).label("open_tickets"),
         )
-        agent_workload.append({
+        .select_from(User)
+        .outerjoin(Ticket, Ticket.assignee_id == User.id)
+        .where(User.is_active == True)  # noqa: E712
+        .group_by(User.id, User.name, User.initials, User.group)
+    )
+    agents = (await db.execute(agents_stmt)).all()
+    agent_workload = [
+        {
             "id": str(agent.id),
             "name": agent.name,
             "initials": agent.initials,
             "group": agent.group,
-            "open_tickets": open_res.scalar_one(),
-        })
+            "open_tickets": agent.open_tickets or 0,
+        }
+        for agent in agents
+    ]
 
-    total = sum(status_counts.values())
     return AdminStats(
-        total_tickets=total,
-        open_tickets=status_counts.get("open", 0),
-        in_progress_tickets=status_counts.get("in-progress", 0),
-        resolved_tickets=status_counts.get("resolved", 0),
-        closed_tickets=status_counts.get("closed", 0),
-        critical_tickets=critical,
-        unassigned_tickets=unassigned,
+        total_tickets=metrics.total,
+        open_tickets=metrics.open,
+        in_progress_tickets=metrics.in_progress,
+        resolved_tickets=metrics.resolved,
+        closed_tickets=metrics.closed,
+        critical_tickets=metrics.critical,
+        unassigned_tickets=metrics.unassigned,
         agent_workload=agent_workload,
     )
 

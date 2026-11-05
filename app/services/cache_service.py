@@ -65,6 +65,10 @@ def stats_key() -> str:
     return "stats:dashboard"
 
 
+def dashboard_stats_key(params: dict) -> str:
+    return _make_key("stats:dashboard", params)
+
+
 def agent_stats_key(params: dict) -> str:
     return _make_key("stats:agent", params)
 

@@ -22,6 +22,7 @@ def _base_filters(
     category: str | None,
     status: TicketStatus | None,
 ):
+    stmt = stmt.where(Ticket.is_deleted == False)  # noqa: E712
     if date_from:
         stmt = stmt.where(Ticket.created_at >= date_from)
     if date_to:
@@ -51,70 +52,66 @@ async def dashboard_stats(
     that reflect only the filtered subset of tickets.
     """
 
+    cache_params = {
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "priority": priority.value if priority else None,
+        "category": category,
+        "status": status.value if status else None,
+    }
+    redis = await get_redis()
+    cache_key = cache_service.dashboard_stats_key(cache_params)
+    cached = await cache_service.cache_get(redis, cache_key)
+    if cached is not None:
+        return cached
+
     def f(stmt):
         return _base_filters(stmt, date_from, date_to, priority, category, status)
 
-    # ── Status counts ────────────────────────────────────────────────────────
-    status_counts: dict[str, int] = {}
-    for s in TicketStatus:
-        res = await db.execute(
-            f(select(func.count()).select_from(Ticket).where(Ticket.status == s))
-        )
-        status_counts[s.value] = res.scalar_one()
-
-    # ── Totals ───────────────────────────────────────────────────────────────
-    total_res = await db.execute(f(select(func.count()).select_from(Ticket)))
-    total = total_res.scalar_one()
-
-    critical_res = await db.execute(
-        f(select(func.count()).select_from(Ticket).where(Ticket.priority == TicketPriority.critical))
-    )
-    critical = critical_res.scalar_one()
-
-    # ── SLA overdue ──────────────────────────────────────────────────────────
-    sla_overdue_res = await db.execute(
-        f(
-            select(func.count()).select_from(Ticket).where(
-                or_(
-                    Ticket.sla_status == SLAStatus.overdue,
-                    (Ticket.sla_status == SLAStatus.active)
-                    & (Ticket.sla_due_time < func.now()),
-                )
-            )
-        )
-    )
-    sla_overdue = sla_overdue_res.scalar_one()
-
-    # ── Category distribution ─────────────────────────────────────────────────
+    metrics_stmt = select(
+        func.count().label("total"),
+        func.count().filter(Ticket.priority == TicketPriority.critical).label("critical"),
+        func.count().filter(or_(
+            Ticket.sla_status == SLAStatus.overdue,
+            (Ticket.sla_status == SLAStatus.active) & (Ticket.sla_due_time < func.now()),
+        )).label("sla_overdue"),
+        *[
+            func.count().filter(Ticket.status == item).label(
+                f"status_{item.value.replace('-', '_')}"
+            ) for item in TicketStatus
+        ],
+    ).select_from(Ticket)
+    metrics = (await db.execute(f(metrics_stmt))).one()
+    status_counts = {
+        item.value: getattr(metrics, f"status_{item.value.replace('-', '_')}") or 0
+        for item in TicketStatus
+    }
     cat_rows = await db.execute(
-        f(
-            select(Ticket.category, func.count().label("count")).group_by(Ticket.category)
-        )
+        f(select(Ticket.category, func.count().label("count")).group_by(Ticket.category))
     )
-    category_dist: dict[str, int] = {row[0]: row[1] for row in cat_rows.all()}
+    category_dist = {row[0]: row[1] for row in cat_rows.all()}
+    pri_rows = await db.execute(
+        f(select(Ticket.priority, func.count().label("count")).group_by(Ticket.priority))
+    )
+    pri_dist = {row[0].value: row[1] for row in pri_rows.all()}
+    for item in TicketPriority:
+        pri_dist.setdefault(item.value, 0)
 
-    # ── Priority distribution ─────────────────────────────────────────────────
-    pri_dist: dict[str, int] = {}
-    for p in TicketPriority:
-        res = await db.execute(
-            f(select(func.count()).select_from(Ticket).where(Ticket.priority == p))
-        )
-        pri_dist[p.value] = res.scalar_one()
-
-    return {
-        "total": total,
+    result = {
+        "total": metrics.total,
         "open": status_counts.get("open", 0),
         "in_progress": status_counts.get("in-progress", 0),
         "on_hold": status_counts.get("on-hold", 0),
         "resolved": status_counts.get("resolved", 0),
         "closed": status_counts.get("closed", 0),
-        "critical": critical,
-        "sla_overdue": sla_overdue,
+        "critical": metrics.critical,
+        "sla_overdue": metrics.sla_overdue,
         "status_counts": status_counts,
         "category_distribution": category_dist,
         "priority_distribution": pri_dist,
     }
-
+    await cache_service.cache_set(redis, cache_key, result, cache_service.STATS_TTL)
+    return result
 
 @router.get("/agent-stats")
 async def agent_stats(
