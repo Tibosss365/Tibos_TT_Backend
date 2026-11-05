@@ -1631,6 +1631,7 @@ async def decide_approval(
 @router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ticket(
     ticket_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -1640,10 +1641,17 @@ async def delete_ticket(
     ticket.deleted_at = datetime.now(timezone.utc)
     ticket.updated_at = datetime.now(timezone.utc)
     await db.commit()
+    # Do not hold the DELETE response open while notifying optional realtime
+    # subscribers. A stalled WebSocket must not make a committed delete look
+    # like it is still in progress in the client.
     try:
-        await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
+        background_tasks.add_task(
+            broadcast_ticket_event,
+            "ticket_deleted",
+            {"ticket_id": str(ticket_id)},
+        )
     except Exception:
-        pass
+        logger.exception("Could not schedule ticket-deleted broadcast")
 
 
 @router.post("/{ticket_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
@@ -1674,10 +1682,17 @@ async def permanent_delete_ticket(
     await _get_any_ticket_or_404(ticket_id, db)
     await db.execute(delete(Ticket).where(Ticket.id == ticket_id))
     await db.commit()
+    # Do not hold the DELETE response open while notifying optional realtime
+    # subscribers. A stalled WebSocket must not make a committed delete look
+    # like it is still in progress in the client.
     try:
-        await broadcast_ticket_event("ticket_deleted", {"ticket_id": str(ticket_id)})
+        background_tasks.add_task(
+            broadcast_ticket_event,
+            "ticket_deleted",
+            {"ticket_id": str(ticket_id)},
+        )
     except Exception:
-        pass
+        logger.exception("Could not schedule ticket-deleted broadcast")
 
 
 @router.post("/bulk", status_code=status.HTTP_200_OK)
