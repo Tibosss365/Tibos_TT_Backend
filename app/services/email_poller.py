@@ -585,9 +585,8 @@ async def _process_inbound_email(
     # ── No match — create a new ticket ───────────────────────────────────
     # Load ticket settings so prefix/digits/default-status honour admin config
     # Emails without usable threading headers can still be forwards or copies
-    # of an email that already opened a ticket. Compare normalized subjects
-    # against successfully processed inbound email logs so portal-created
-    # tickets with the same title are not accidentally suppressed.
+    # of an email that already opened a ticket. Compare against all active
+    # tickets, regardless of how they were created or who sent the email.
     normalized_subject = normalize_subject(subject)
     if normalized_subject:
         subject_lock_key = f"email-ticket-subject:{normalized_subject}"
@@ -597,19 +596,19 @@ async def _process_inbound_email(
         )
         subject_pattern = r"^\s*((re|fwd?|aw|sv)\s*:\s*)+"
         duplicate_subject_res = await db.execute(
-            select(EmailTicketLog)
+            select(Ticket)
             .where(
-                EmailTicketLog.status == EmailLogStatus.processed,
-                EmailTicketLog.ticket_id.is_not(None),
+                Ticket.is_deleted.is_(False),
+                Ticket.status.not_in(("resolved", "closed")),
                 func.btrim(func.regexp_replace(
-                    func.lower(EmailTicketLog.subject), subject_pattern, "", "g"
+                    func.lower(Ticket.subject), subject_pattern, "", "g"
                 )) == normalized_subject,
             )
-            .order_by(EmailTicketLog.processed_at.desc())
+            .order_by(Ticket.created_at.desc())
             .limit(1)
         )
-        prior_subject_log = duplicate_subject_res.scalar_one_or_none()
-        if prior_subject_log:
+        matching_ticket = duplicate_subject_res.scalar_one_or_none()
+        if matching_ticket:
             await _upsert_email_log(
                 db,
                 inbound_config_id=inbound.id,
@@ -619,11 +618,11 @@ async def _process_inbound_email(
                 subject=subject,
                 received_at=received_at,
                 status=EmailLogStatus.duplicate,
-                ticket_id=prior_subject_log.ticket_id,
-                error_message="A processed inbound email already created a ticket with this subject.",
+                ticket_id=matching_ticket.id,
+                error_message="An active ticket already exists with this subject.",
                 body=body,
             )
-            raise DuplicateMessageError("Duplicate normalized email subject")
+            raise DuplicateMessageError("An active ticket already exists with this subject")
 
     ts_res = await db.execute(select(TicketSettings).limit(1))
     ts = ts_res.scalar_one_or_none()
