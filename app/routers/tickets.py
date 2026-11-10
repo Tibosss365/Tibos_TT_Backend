@@ -144,6 +144,55 @@ async def _auto_discover_domain(domain: str, db: AsyncSession) -> str | None:
     return None
 
 
+async def _discover_ticket_company_background(ticket_id: uuid.UUID, domain: str) -> None:
+    """Enrich a newly submitted ticket after its response has been sent."""
+    async with AsyncSessionLocal() as db:
+        try:
+            company_name = await _auto_discover_domain(domain, db)
+            if not company_name:
+                return
+            ticket = await db.get(Ticket, ticket_id)
+            if ticket and not ticket.company:
+                ticket.company = company_name
+                ticket.updated_at = datetime.now(timezone.utc)
+            await db.commit()
+            if ticket and ticket.company == company_name:
+                try:
+                    from app.redis_client import get_redis
+                    from app.services.cache_service import invalidate_tickets
+                    await invalidate_tickets(await get_redis())
+                except Exception:
+                    pass
+                await broadcast_ticket_event(
+                    "ticket_updated",
+                    {"ticket_id": str(ticket.id), "ticket_number": ticket.ticket_id},
+                )
+        except Exception:
+            await db.rollback()
+            logger.exception("Background company discovery failed for ticket %s", ticket_id)
+
+
+async def _notify_ticket_created_background(
+    ticket_id: uuid.UUID,
+    actor_name: str,
+    actor_id: uuid.UUID,
+) -> None:
+    """Persist and push create notifications outside the submit response path."""
+    async with AsyncSessionLocal() as db:
+        try:
+            ticket = await _get_ticket_or_404(ticket_id, db)
+            admins = await _get_admins(db)
+            await notify_ticket_created(db, ticket, admins)
+            if ticket.assignee_id and ticket.assignee_id != actor_id:
+                assignee = await db.get(User, ticket.assignee_id)
+                if assignee:
+                    await notify_ticket_assigned(db, ticket, assignee, actor_name)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Background ticket notification failed for ticket %s", ticket_id)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -653,6 +702,7 @@ async def create_ticket(
     # ── Auto-fill company from domain company registry ────────────────────
     # Priority: 1) value provided by caller  2) DB lookup  3) live Clearbit discovery
     company = body.company
+    discover_company_domain = None
     if not company and email and "@" in email:
         email_domain = email.split("@")[-1].lower().strip()
 
@@ -664,10 +714,9 @@ async def create_ticket(
         if dc:
             company = dc.company_name
         else:
-            # 2. Not in registry — try live Clearbit lookup and auto-save result
-            discovered = await _auto_discover_domain(email_domain, db)
-            if discovered:
-                company = discovered
+            # External enrichment is optional; run it after responding so a
+            # slow third-party lookup cannot delay ticket submission.
+            discover_company_domain = email_domain
 
     # ── Account owners: snapshot the company's owners onto the ticket ─────
     # An explicit list from the caller (agent chose owners on the form) wins;
@@ -748,16 +797,6 @@ async def create_ticket(
     # Reload with relationships
     full = await _get_ticket_or_404(ticket.id, db)
 
-    # Notifications
-    admins = await _get_admins(db)
-    await notify_ticket_created(db, full, admins)
-
-    if body.assignee_id and body.assignee_id != current_user.id:
-        assignee_res = await db.execute(select(User).where(User.id == body.assignee_id))
-        assignee = assignee_res.scalar_one_or_none()
-        if assignee:
-            await notify_ticket_assigned(db, full, assignee, current_user.name)
-
     # ── Email: ticket created confirmation to submitter ────────────────
     # Build the confirmation now, but deliver it after the API response so a
     # slow SMTP/Graph service cannot hold up ticket submission.
@@ -795,6 +834,18 @@ async def create_ticket(
         )
     # Commit before broadcasting so any SSE-triggered fetchTickets sees the new ticket
     await db.commit()
+    background_tasks.add_task(
+        _notify_ticket_created_background,
+        ticket.id,
+        current_user.name,
+        current_user.id,
+    )
+    if discover_company_domain:
+        background_tasks.add_task(
+            _discover_ticket_company_background,
+            ticket.id,
+            discover_company_domain,
+        )
     try:
         await broadcast_ticket_event(
             "ticket_created",
