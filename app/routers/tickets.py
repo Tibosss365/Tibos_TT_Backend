@@ -1779,7 +1779,7 @@ async def bulk_action(
             {
                 "action": body.action,
                 "count": len(tickets),
-                "ticket_ids": [str(ticket.id) for ticket in tickets] if body.action == "delete" else [],
+                "ticket_ids": [str(ticket.id) for ticket in tickets],
                 "deleted_at": now.isoformat() if body.action == "delete" else None,
                 "delete_reason": (body.delete_reason or "").strip() or None if body.action == "delete" else None,
             },
