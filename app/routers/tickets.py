@@ -13,7 +13,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_, update, delete, String
 from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.deps import get_current_user
 from app.database import AsyncSessionLocal, get_db
@@ -321,6 +322,25 @@ def _apply_filters(
     return stmt
 
 
+LIST_DESCRIPTION_CHARS = 1500
+
+
+async def _fetch_list_tickets(db: AsyncSession, stmt) -> list[Ticket]:
+    """Run a ticket-list query without pulling full descriptions from the DB.
+
+    Descriptions are mostly email HTML (up to >1 MB each), so lists only get a
+    preview; the full text is loaded when a single ticket is opened.
+    """
+    stmt = stmt.add_columns(
+        func.left(Ticket.description, LIST_DESCRIPTION_CHARS).label("desc_preview")
+    ).options(defer(Ticket.description))
+    tickets = []
+    for ticket, preview in (await db.execute(stmt)).all():
+        set_committed_value(ticket, "description", preview or "")
+        tickets.append(ticket)
+    return tickets
+
+
 def _apply_sort(stmt, sort: str):
     if sort == "oldest":
         return stmt.order_by(Ticket.created_at.asc())
@@ -376,8 +396,7 @@ async def list_tickets(
     stmt = _apply_filters(stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
     stmt = _apply_sort(stmt, sort)
 
-    result = await db.execute(stmt)
-    tickets = result.scalars().all()
+    tickets = await _fetch_list_tickets(db, stmt)
 
     return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
@@ -400,15 +419,15 @@ async def my_tickets(
     )
     total = count_res.scalar_one()
 
-    result = await db.execute(
+    tickets = await _fetch_list_tickets(
+        db,
         select(Ticket)
         .options(selectinload(Ticket.assignee))
         .where(Ticket.assignee_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
         .order_by(Ticket.updated_at.desc())
         .offset((page - 1) * page_size)
-        .limit(page_size)
+        .limit(page_size),
     )
-    tickets = result.scalars().all()
     return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
         total=total,
