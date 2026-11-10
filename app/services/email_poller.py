@@ -140,17 +140,31 @@ async def _upsert_email_log(
     return log
 
 
+from app.services.email_classifier import classify_email
+
+_SENDER_RULE_FIELDS = {"subject", "from_email", "from_domain"}
+_RECIPIENT_RULE_FIELDS = {"to_email", "cc_email"}
+
+
 def _check_filter_rules(
-    rules: list[dict], subject: str, from_email: str
+    rules: list[dict], subject: str, from_email: str,
+    to_emails: list[str] | None = None, cc_emails: list[str] | None = None,
+    fields: set[str] | None = None,
 ) -> tuple[bool, str]:
     """
     Check if the email matches any filter rule.
+
+    ``fields`` limits which rule fields are evaluated (default: all). Recipient
+    rules (to_email / cc_email) are applied separately, only to emails that would
+    start a NEW ticket, so replies on an existing ticket are never blocked by them.
 
     Returns (matched: bool, rule_description: str).
     Returns (False, '') when no rule matches or rules is empty.
     """
     for rule in (rules or []):
         field    = rule.get("field", "subject")
+        if fields is not None and field not in fields:
+            continue
         operator = rule.get("operator", "contains")
         raw_val  = (rule.get("value") or "").strip()
         if not raw_val:
@@ -163,6 +177,10 @@ def _check_filter_rules(
             text = from_email.lower()
         elif field == "from_domain":
             text = from_email.split("@")[1].lower() if "@" in from_email else ""
+        elif field == "to_email":
+            text = ", ".join(to_emails or []).lower()
+        elif field == "cc_email":
+            text = ", ".join(cc_emails or []).lower()
         else:
             continue
 
@@ -299,7 +317,7 @@ async def _graph_get_recent(
         "/mailFolders/inbox/messages"
         f"?$filter=receivedDateTime ge {since_iso}"
         "&$orderby=receivedDateTime asc"
-        "&$select=id,subject,from,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
+        "&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,internetMessageId,internetMessageHeaders,hasAttachments,isRead"
         "&$top=50"
     )
     messages: list[dict] = []
@@ -448,6 +466,8 @@ async def _process_inbound_email(
     in_reply_to: str = "",
     references: str = "",
     attachments: list[dict] | None = None,
+    to_emails: list[str] | None = None,
+    cc_emails: list[str] | None = None,
 ) -> tuple[Ticket, EmailTicketLog, bool]:
     """
     Process one inbound email.
@@ -463,7 +483,7 @@ async def _process_inbound_email(
     # ── Filter rules check (before dup check so filtered emails are skipped fast)
     rules = inbound.filter_rules or []
     if rules:
-        is_filtered, rule_desc = _check_filter_rules(rules, subject, from_email)
+        is_filtered, rule_desc = _check_filter_rules(rules, subject, from_email, fields=_SENDER_RULE_FIELDS)
         if is_filtered:
             raise FilteredEmailError(f"Filtered by rule: {rule_desc}")
 
@@ -544,6 +564,24 @@ async def _process_inbound_email(
             existing_ticket = res.scalar_one_or_none()
             if existing_ticket:
                 break
+
+    # Recipient rules (To / CC) only decide whether a NEW ticket is created.
+    if not existing_ticket and rules:
+        is_filtered, rule_desc = _check_filter_rules(
+            rules, subject, from_email, to_emails, cc_emails, fields=_RECIPIENT_RULE_FIELDS,
+        )
+        if is_filtered:
+            raise FilteredEmailError(f"Filtered by rule: {rule_desc}")
+
+    # Keyword smart filter — new tickets only. "shadow" just records its verdict.
+    smart_note = None
+    smart_cfg = getattr(inbound, "smart_filter", None) or {}
+    if not existing_ticket and smart_cfg.get("mode") in ("shadow", "on"):
+        verdict = classify_email(subject, body, smart_cfg)
+        if verdict.commercial:
+            if smart_cfg["mode"] == "on":
+                raise FilteredEmailError(f"Smart filter: {verdict.reason()}")
+            smart_note = f"Smart filter (test mode): this email {verdict.reason()} and would have been filtered."
 
     if existing_ticket:
         # Append reply as email_in timeline entry on the existing ticket.
@@ -686,6 +724,9 @@ async def _process_inbound_email(
             text="Auto-assigned by inbound email rule",
         ))
 
+    if smart_note:
+        db.add(TicketTimeline(ticket_id=ticket.id, type=TimelineType.comment, text=smart_note))
+
     log = await _upsert_email_log(
         db,
         inbound_config_id=inbound.id,
@@ -795,6 +836,8 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                             in_reply_to=parsed.get("in_reply_to", ""),
                             references=parsed.get("references", ""),
                             attachments=parsed.get("attachments", []),
+                            to_emails=parsed.get("to_emails", []),
+                            cc_emails=parsed.get("cc_emails", []),
                         )
                         await db.commit()
                         processed += 1
@@ -990,6 +1033,8 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
             from_email = from_info.get("address", "unknown@unknown")
             from_name  = from_info.get("name", "")
             subject    = msg.get("subject", "(no subject)")
+            to_emails  = [(r.get("emailAddress") or {}).get("address", "").lower() for r in msg.get("toRecipients", [])]
+            cc_emails  = [(r.get("emailAddress") or {}).get("address", "").lower() for r in msg.get("ccRecipients", [])]
             body_raw   = await _graph_get_message_body(mailbox, access_token, msg["id"])
             body_text  = body_raw.get("content", "")
             if body_raw.get("contentType", "").lower() == "html":
@@ -1047,6 +1092,8 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                         in_reply_to=in_reply_to,
                         references=references,
                         attachments=graph_attachments,
+                        to_emails=[a for a in to_emails if a],
+                        cc_emails=[a for a in cc_emails if a],
                     )
                     await db.commit()
                     processed += 1

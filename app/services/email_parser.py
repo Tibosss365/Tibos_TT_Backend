@@ -14,7 +14,7 @@ import quopri
 import re
 from datetime import datetime, timezone
 from email.header import decode_header
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import TypedDict
 
@@ -37,6 +37,8 @@ class ParsedEmail(TypedDict):
     in_reply_to: str   # value of In-Reply-To header (for thread matching)
     references: str    # value of References header (for thread matching)
     attachments: list[ParsedAttachment]
+    to_emails: list[str]   # lower-cased addresses in the To header
+    cc_emails: list[str]   # lower-cased addresses in the Cc header
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -305,6 +307,9 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
     from_name  = _decode_header_value(from_name_raw) if from_name_raw else from_addr.split("@")[0]
     from_email = from_addr.lower().strip()
 
+    to_emails = [addr.lower().strip() for _, addr in getaddresses(msg.get_all("To", [])) if addr]
+    cc_emails = [addr.lower().strip() for _, addr in getaddresses(msg.get_all("Cc", [])) if addr]
+
     # Subject
     subject_raw = msg.get("Subject") or "(no subject)"
     subject     = _decode_header_value(subject_raw)
@@ -341,4 +346,6 @@ def parse_raw_email(raw: bytes) -> ParsedEmail:
         in_reply_to=in_reply_to,
         references=references,
         attachments=attachments,
+        to_emails=to_emails,
+        cc_emails=cc_emails,
     )

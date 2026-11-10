@@ -84,6 +84,10 @@ class InboundEmailConfig(Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
 
+    # Keyword "smart filter": {"mode": "off"|"shadow"|"on", "commercial": [...],
+    # "technical": [...], "threshold": int}. NULL = off with default keyword lists.
+    smart_filter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     # ── Stats (updated by poller) ─────────────────────────────────────
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_poll_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

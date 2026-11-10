@@ -27,6 +27,7 @@ class InboundEmailConfigOut(BaseModel):
     move_to_folder: str | None
     # Filter rules — list of {field, operator, value} dicts
     filter_rules: list[dict] = []
+    smart_filter: dict | None = None
     last_polled_at: datetime | None
     last_poll_attempt_at: datetime | None = None
     last_poll_error: str | None = None
@@ -67,6 +68,7 @@ class InboundEmailConfigUpdate(BaseModel):
     # ── Filter rules ─────────────────────────────────────────────────────────
     # Each item: {"field": str, "operator": str, "value": str}
     filter_rules: list[dict] | None = None
+    smart_filter: dict | None = None
 
     # ── Validators ──────────────────────────────────────────────────────────
 
