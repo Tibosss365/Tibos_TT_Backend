@@ -1630,7 +1630,7 @@ async def delete_ticket(
     ticket = await _get_ticket_or_404(ticket_id, db)
     ticket.is_deleted = True
     ticket.deleted_at = datetime.now(timezone.utc)
-    ticket.updated_at = datetime.now(timezone.utc)
+    ticket.updated_at = ticket.deleted_at
     await db.commit()
     # Do not hold the DELETE response open while notifying optional realtime
     # subscribers. A stalled WebSocket must not make a committed delete look
@@ -1639,7 +1639,7 @@ async def delete_ticket(
         background_tasks.add_task(
             broadcast_ticket_event,
             "ticket_deleted",
-            {"ticket_id": str(ticket_id)},
+            {"ticket_id": str(ticket_id), "deleted_at": ticket.deleted_at.isoformat()},
         )
     except Exception:
         logger.exception("Could not schedule ticket-deleted broadcast")
@@ -1755,7 +1755,12 @@ async def bulk_action(
     try:
         await broadcast_ticket_event(
             "tickets_bulk_updated",
-            {"action": body.action, "count": len(body.ticket_ids)},
+            {
+                "action": body.action,
+                "count": len(tickets),
+                "ticket_ids": [str(ticket.id) for ticket in tickets] if body.action == "delete" else [],
+                "deleted_at": now.isoformat() if body.action == "delete" else None,
+            },
             actor_user_id=str(current_user.id),
         )
     except Exception:
