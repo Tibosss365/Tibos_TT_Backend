@@ -6,14 +6,13 @@ The client connects with a Bearer token in the Authorization header
 """
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.security import decode_token
-from app.database import get_db
+from app.database import AsyncSessionLocal
 from app.models.user import User
 from app.services.sse_manager import sse_manager
 
@@ -23,7 +22,6 @@ router = APIRouter(prefix="/events", tags=["sse"])
 @router.get("")
 async def sse_stream(
     token: str = Query(..., description="JWT access token"),
-    db: AsyncSession = Depends(get_db),
 ):
     # Validate token manually (EventSource API can't set headers)
     try:
@@ -34,8 +32,11 @@ async def sse_stream(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
+    # Short-lived session: a request-scoped one would keep its DB connection checked
+    # out for as long as the stream stays open (one pooled connection per open tab).
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+        user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
