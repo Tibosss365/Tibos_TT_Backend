@@ -784,14 +784,13 @@ async def create_ticket(
             f"<p>We will get back to you as soon as possible. You can reply to this email to add more information.</p>"
         )
         await send_ticket_email(
-            to=full.email,
+            db,
+            full,
+            to_email=full.email,
             subject=f"[{full.ticket_id}] {full.subject}",
             body_html=email_body,
             action_label="New Ticket Created",
             action_color="#6366f1",
-            db=db,
-            ticket_id=ticket.id,
-            user_id=current_user.id,
         )
     # Commit before broadcasting so any SSE-triggered fetchTickets sees the new ticket
     await db.commit()
