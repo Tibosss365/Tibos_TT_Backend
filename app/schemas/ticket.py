@@ -260,6 +260,8 @@ class TicketFilter(BaseModel):
 class BulkTicketAction(BaseModel):
     ticket_ids: list[uuid.UUID] = Field(..., min_length=1)
     action: str = Field(..., pattern="^(resolve|close|delete|reopen)$")
+    resolution: str | None = None
+    resolution_code: str | None = None
 
 
 class AddCommentRequest(BaseModel):

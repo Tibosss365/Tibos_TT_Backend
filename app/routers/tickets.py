@@ -1,4 +1,5 @@
 import csv
+from html import escape
 import io
 import logging
 import math
@@ -1171,7 +1172,7 @@ async def update_ticket(
                 db.add(TicketTimeline(
                     ticket_id=ticket.id,
                     type=TimelineType.comment,
-                    text=f"<strong>Resolution:</strong> {res_note}",
+                    text=f"<strong>Resolution:</strong> {escape(res_note)}",
                     author_id=current_user.id,
                 ))
 
@@ -1229,16 +1230,6 @@ async def update_ticket(
             ),
             author_id=current_user.id,
         ))
-
-    # ── Reopen count ─────────────────────────────────────────────────────────
-    if "status" in update_data:
-        new_st = update_data["status"]
-        if (
-            new_st == TicketStatus.open
-            and old_status in (TicketStatus.resolved, TicketStatus.closed)
-        ):
-            ticket.reopen_count = (ticket.reopen_count or 0) + 1
-            ticket.escalation_level = 0
 
     # ── Automation engine ────────────────────────────────────────────────────
     try:
@@ -1701,19 +1692,64 @@ async def bulk_action(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    now = datetime.now(timezone.utc)
     if body.action == "delete":
-        await db.execute(
-            update(Ticket)
-            .where(Ticket.id.in_(body.ticket_ids))
-            .values(is_deleted=True, deleted_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
-        )
+        tickets = list((await db.execute(
+            select(Ticket).where(Ticket.id.in_(body.ticket_ids), Ticket.is_deleted.is_(False))
+        )).scalars().all())
+        for ticket in tickets:
+            ticket.is_deleted = True
+            ticket.deleted_at = now
+            ticket.updated_at = now
     else:
-        new_status = TicketStatus.resolved if body.action == "resolve" else TicketStatus.closed
-        await db.execute(
-            update(Ticket)
-            .where(Ticket.id.in_(body.ticket_ids))
-            .values(status=new_status, updated_at=datetime.now(timezone.utc))
-        )
+        tickets = list((await db.execute(
+            select(Ticket).where(Ticket.id.in_(body.ticket_ids), Ticket.is_deleted.is_(False))
+        )).scalars().all())
+        new_status = {
+            "resolve": TicketStatus.resolved,
+            "close": TicketStatus.closed,
+            "reopen": TicketStatus.open,
+        }[body.action]
+        transitioning = [ticket for ticket in tickets if ticket.status != new_status]
+
+        if body.action == "resolve":
+            if not (body.resolution or "").strip():
+                raise HTTPException(status_code=400, detail="Resolution notes are required to resolve tickets in bulk.")
+            from app.models.feature_models import TicketConfigItem
+            has_codes = (await db.execute(
+                select(TicketConfigItem.id).where(TicketConfigItem.kind == "resolution_code").limit(1)
+            )).first() is not None
+            if has_codes and not (body.resolution_code or "").strip():
+                raise HTTPException(status_code=400, detail="A resolution code is required to resolve tickets.")
+
+        if body.action in ("resolve", "close") and any(t.assignee_id is None for t in transitioning):
+            raise HTTPException(status_code=400, detail="Assign an agent to every selected ticket before resolving or closing.")
+
+        for ticket in transitioning:
+            old_status = ticket.status
+            ticket.status = new_status
+            ticket.updated_at = now
+            if body.action == "resolve":
+                ticket.resolution = body.resolution.strip()
+                ticket.resolution_code = (body.resolution_code or "").strip() or None
+            if body.action == "reopen":
+                ticket.reopen_count = (ticket.reopen_count or 0) + 1
+                ticket.escalation_level = 0
+            await SLAService.handle_status_change(ticket, new_status, old_status, db)
+            db.add(TicketTimeline(
+                ticket_id=ticket.id, type=TimelineType.status,
+                text=f"Status changed to <strong>{new_status.value}</strong> by <strong>{current_user.name}</strong>",
+                author_id=current_user.id,
+            ))
+            if body.action == "resolve":
+                db.add(TicketTimeline(
+                    ticket_id=ticket.id, type=TimelineType.resolved,
+                    text=f"Ticket resolved by <strong>{current_user.name}</strong>", author_id=current_user.id,
+                ))
+                db.add(TicketTimeline(
+                    ticket_id=ticket.id, type=TimelineType.comment,
+                    text=f"<strong>Resolution:</strong> {escape(body.resolution.strip())}", author_id=current_user.id,
+                ))
 
     await db.commit()
     try:
@@ -1724,4 +1760,4 @@ async def bulk_action(
         )
     except Exception:
         pass
-    return {"affected": len(body.ticket_ids)}
+    return {"affected": len(tickets)}
