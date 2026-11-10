@@ -213,6 +213,7 @@ class TicketListOut(BaseModel):
     updated_at: datetime
     is_deleted: bool = False
     deleted_at: Union[datetime, None] | None = None
+    delete_reason: str | None = None
     # ── Extended fields (migration 030) ──────────────────────────────────
     source: str = "portal"
     tags: list[str] = []
@@ -262,6 +263,7 @@ class BulkTicketAction(BaseModel):
     action: str = Field(..., pattern="^(resolve|close|delete|reopen)$")
     resolution: str | None = None
     resolution_code: str | None = None
+    delete_reason: str | None = Field(default=None, max_length=2000)
 
 
 class AddCommentRequest(BaseModel):

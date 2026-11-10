@@ -206,6 +206,7 @@ class Ticket(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    delete_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Extended fields (migration 030) ─────────────────────────────────────
     source: Mapped[str] = mapped_column(

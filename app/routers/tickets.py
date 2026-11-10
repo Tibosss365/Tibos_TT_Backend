@@ -1623,14 +1623,23 @@ async def decide_approval(
 async def delete_ticket(
     ticket_id: uuid.UUID,
     background_tasks: BackgroundTasks,
+    reason: str | None = Query(None, max_length=2000),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """Soft-delete: marks ticket as deleted (is_deleted=True). Recoverable via /restore."""
     ticket = await _get_ticket_or_404(ticket_id, db)
     ticket.is_deleted = True
     ticket.deleted_at = datetime.now(timezone.utc)
     ticket.updated_at = ticket.deleted_at
+    ticket.delete_reason = reason.strip() if reason and reason.strip() else None
+    if ticket.delete_reason:
+        db.add(TicketTimeline(
+            ticket_id=ticket.id,
+            type=TimelineType.comment,
+            text=f"Ticket deletion reason: {escape(ticket.delete_reason)}",
+            author_id=current_user.id,
+        ))
     await db.commit()
     # Do not hold the DELETE response open while notifying optional realtime
     # subscribers. A stalled WebSocket must not make a committed delete look
@@ -1639,7 +1648,11 @@ async def delete_ticket(
         background_tasks.add_task(
             broadcast_ticket_event,
             "ticket_deleted",
-            {"ticket_id": str(ticket_id), "deleted_at": ticket.deleted_at.isoformat()},
+            {
+                "ticket_id": str(ticket_id),
+                "deleted_at": ticket.deleted_at.isoformat(),
+                "delete_reason": ticket.delete_reason,
+            },
         )
     except Exception:
         logger.exception("Could not schedule ticket-deleted broadcast")
@@ -1701,6 +1714,14 @@ async def bulk_action(
             ticket.is_deleted = True
             ticket.deleted_at = now
             ticket.updated_at = now
+            ticket.delete_reason = (body.delete_reason or "").strip() or None
+            if ticket.delete_reason:
+                db.add(TicketTimeline(
+                    ticket_id=ticket.id,
+                    type=TimelineType.comment,
+                    text=f"Ticket deletion reason: {escape(ticket.delete_reason)}",
+                    author_id=current_user.id,
+                ))
     else:
         tickets = list((await db.execute(
             select(Ticket).where(Ticket.id.in_(body.ticket_ids), Ticket.is_deleted.is_(False))
@@ -1760,6 +1781,7 @@ async def bulk_action(
                 "count": len(tickets),
                 "ticket_ids": [str(ticket.id) for ticket in tickets] if body.action == "delete" else [],
                 "deleted_at": now.isoformat() if body.action == "delete" else None,
+                "delete_reason": (body.delete_reason or "").strip() or None if body.action == "delete" else None,
             },
             actor_user_id=str(current_user.id),
         )
