@@ -1,5 +1,4 @@
 """Record API request outcomes for the staff activity log."""
-import asyncio
 import logging
 import uuid
 
@@ -15,9 +14,6 @@ from sqlalchemy import select
 logger = logging.getLogger("uvicorn.error")
 
 
-_pending: set[asyncio.Task] = set()
-
-
 class RequestAuditMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path != "/activity/requests" and request.method != "OPTIONS":
@@ -25,30 +21,19 @@ class RequestAuditMiddleware(BaseHTTPMiddleware):
                 response = await call_next(request)
                 status_code = response.status_code
             except Exception:
-                self._record_later(request, 500)
+                await self._record(request, 500)
                 raise
-            self._record_later(request, status_code)
+            await self._record(request, status_code)
             return response
         return await call_next(request)
 
-    def _record_later(self, request: Request, status_code: int) -> None:
-        """Persist the audit row after the response, never blocking the request."""
+    async def _record(self, request: Request, status_code: int) -> None:
         if request.url.path in {"/health", "/docs", "/openapi.json", "/redoc"}:
             return
-        client = request.client
-        task = asyncio.create_task(self._record(
-            method=request.method,
-            path=request.url.path[:500],
-            auth=request.headers.get("authorization", ""),
-            ip=client.host if client else None,
-            status_code=status_code,
-        ))
-        _pending.add(task)
-        task.add_done_callback(_pending.discard)
 
-    async def _record(self, *, method: str, path: str, auth: str, ip: str | None, status_code: int) -> None:
         user_id = None
         name = email = None
+        auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             try:
                 subject = decode_token(auth[7:].strip()).get("sub")
@@ -64,14 +49,15 @@ class RequestAuditMiddleware(BaseHTTPMiddleware):
                         name, email = user.name, user.username
                     else:
                         user_id = None
+                client = request.client
                 db.add(AuditLog(
                     user_id=user_id,
                     user_name=name,
                     user_email=email,
-                    method=method,
-                    path=path,
+                    method=request.method,
+                    path=request.url.path[:500],
                     status_code=status_code,
-                    ip_address=ip,
+                    ip_address=client.host if client else None,
                 ))
                 await db.commit()
         except Exception:
