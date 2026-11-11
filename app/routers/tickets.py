@@ -13,7 +13,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_, update, delete, String
 from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, joinedload, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.deps import get_current_user
 from app.database import AsyncSessionLocal, get_db
@@ -321,6 +322,41 @@ def _apply_filters(
     return stmt
 
 
+LIST_DESCRIPTION_CHARS = 1500
+
+
+async def _fetch_list_tickets(
+    db: AsyncSession, stmt, *, full_description: bool = False, with_total: bool = False,
+) -> tuple[list[Ticket], int | None]:
+    """Run a ticket-list query cheaply.
+
+    Descriptions are mostly email HTML (some over 1 MB), so list responses carry only
+    a preview unless ``full_description`` is set; the single-ticket endpoint always
+    returns the full text. ``with_total`` returns the unpaged row count from the same
+    query (window function) instead of a separate COUNT round trip.
+    """
+    extra = []
+    if not full_description:
+        extra.append(func.left(Ticket.description, LIST_DESCRIPTION_CHARS).label("desc_preview"))
+        stmt = stmt.options(defer(Ticket.description))
+    if with_total:
+        extra.append(func.count().over().label("_total"))
+    if extra:
+        stmt = stmt.add_columns(*extra)
+
+    tickets: list[Ticket] = []
+    total: int | None = None
+    for row in (await db.execute(stmt)).unique().all():
+        ticket, index = row[0], 1
+        if not full_description:
+            set_committed_value(ticket, "description", row[index] or "")
+            index += 1
+        if with_total:
+            total = row[index]
+        tickets.append(ticket)
+    return tickets, total
+
+
 def _apply_sort(stmt, sort: str):
     if sort == "oldest":
         return stmt.order_by(Ticket.created_at.asc())
@@ -356,28 +392,27 @@ async def list_tickets(
     page_size: int = Query(20, ge=1, le=500),
     # Accept 'limit' as an alias for page_size (used by analytics page)
     limit: int | None = Query(None, ge=1, le=500),
+    full_description: bool = Query(False, description="Return complete descriptions (used by exports); lists default to a preview"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     effective_page_size = limit if limit is not None else page_size
 
-    count_stmt = select(func.count()).select_from(Ticket).where(Ticket.is_deleted == False)  # noqa: E712
-    count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
-    total_res = await db.execute(count_stmt)
-    total = total_res.scalar_one()
-
     stmt = (
         select(Ticket)
         .where(Ticket.is_deleted == False)  # noqa: E712
-        .options(selectinload(Ticket.assignee))
+        .options(joinedload(Ticket.assignee))
         .offset((page - 1) * effective_page_size)
         .limit(effective_page_size)
     )
     stmt = _apply_filters(stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
     stmt = _apply_sort(stmt, sort)
 
-    result = await db.execute(stmt)
-    tickets = result.scalars().all()
+    tickets, total = await _fetch_list_tickets(db, stmt, full_description=full_description, with_total=True)
+    if total is None:  # empty page: ask for the real total (e.g. a page past the end)
+        count_stmt = select(func.count()).select_from(Ticket).where(Ticket.is_deleted == False)  # noqa: E712
+        count_stmt = _apply_filters(count_stmt, search, status, priority, category, assignee_id, sla_status, date_from, date_to)
+        total = (await db.execute(count_stmt)).scalar_one()
 
     return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
@@ -400,15 +435,15 @@ async def my_tickets(
     )
     total = count_res.scalar_one()
 
-    result = await db.execute(
+    tickets, _ = await _fetch_list_tickets(
+        db,
         select(Ticket)
-        .options(selectinload(Ticket.assignee))
+        .options(joinedload(Ticket.assignee))
         .where(Ticket.assignee_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
         .order_by(Ticket.updated_at.desc())
         .offset((page - 1) * page_size)
-        .limit(page_size)
+        .limit(page_size),
     )
-    tickets = result.scalars().all()
     return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
         total=total,
@@ -431,15 +466,15 @@ async def my_requests(
     )
     total = count_res.scalar_one()
 
-    result = await db.execute(
+    tickets, _ = await _fetch_list_tickets(
+        db,
         select(Ticket)
-        .options(selectinload(Ticket.assignee))
+        .options(joinedload(Ticket.assignee))
         .where(Ticket.requester_id == current_user.id, Ticket.is_deleted == False)  # noqa: E712
         .order_by(Ticket.updated_at.desc())
         .offset((page - 1) * page_size)
-        .limit(page_size)
+        .limit(page_size),
     )
-    tickets = result.scalars().all()
     return PaginatedTickets(
         items=[TicketListOut.model_validate(t) for t in tickets],
         total=total,
@@ -930,15 +965,15 @@ async def list_deleted_tickets(
     )
     total = count_res.scalar_one()
 
-    result = await db.execute(
+    tickets, _ = await _fetch_list_tickets(
+        db,
         select(Ticket)
-        .options(selectinload(Ticket.assignee))
+        .options(joinedload(Ticket.assignee))
         .where(Ticket.is_deleted == True)  # noqa: E712
         .order_by(Ticket.deleted_at.desc())
         .offset((page - 1) * page_size)
-        .limit(page_size)
+        .limit(page_size),
     )
-    tickets = result.scalars().all()
     for t in tickets:
         _inject_empty_attachments(t)
     return PaginatedTickets(

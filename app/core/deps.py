@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.core.security import decode_token
 from app.database import get_db
 from app.models.user import User, UserRole
+from app.core import user_cache
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -35,13 +36,20 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    uid = uuid.UUID(user_id)
+    cached = user_cache.recall(uid)
+    if cached is not None:
+        return await db.merge(cached, load=False)
+
+    result = await db.execute(select(User).where(User.id == uid))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
+        user_cache.forget(uid)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
+    user_cache.remember(user)
     return user
 
 
