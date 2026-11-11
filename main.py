@@ -28,6 +28,7 @@ from app.services.trash_cleanup import trash_cleanup
 from app.middleware.request_audit import RequestAuditMiddleware
 from app.services.escalation_service import escalation_service
 from app.services.recurring_ticket_service import recurring_ticket_service
+from app.services.auto_assignment_service import auto_assign_service
 
 # Import all models so Base.metadata knows about all tables
 import app.models  # noqa: F401
@@ -259,6 +260,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         _log(f"  [WARN] Recurring ticket service could not start: {e}")
 
+    # 10. Start auto-assign sweep (no-op until enabled in Admin → Tickets)
+    try:
+        auto_assign_service.start()
+        _log("[OK] Auto-assign service started")
+    except Exception as e:
+        _log(f"  [WARN] Auto-assign service could not start: {e}")
+
     yield
 
     # ── Shutdown ───────────────────────────────────────────────────────
@@ -270,6 +278,7 @@ async def lifespan(app: FastAPI):
     trash_cleanup.stop()
     escalation_service.stop()
     recurring_ticket_service.stop()
+    auto_assign_service.stop()
     await close_redis()
     await engine.dispose()
     _log("[OK] Shutdown complete")
@@ -375,5 +384,8 @@ async def health():
         ) else "stopped",
         "recurring_ticket_service": "running" if (
             recurring_ticket_service._task and not recurring_ticket_service._task.done()
+        ) else "stopped",
+        "auto_assign_service": "running" if (
+            auto_assign_service._task and not auto_assign_service._task.done()
         ) else "stopped",
     }

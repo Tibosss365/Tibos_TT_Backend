@@ -162,6 +162,8 @@ class TicketSettingsOut(BaseModel):
     number_digits:    int
     default_status:   str
     default_priority: str
+    auto_assign_enabled:       bool = False
+    auto_assign_after_minutes: int  = 30
 
     model_config = {"from_attributes": True}
 
@@ -171,6 +173,9 @@ class TicketSettingsUpdate(BaseModel):
     number_digits:    int = 4
     default_status:   str = "open"
     default_priority: str = "medium"
+    # None = leave unchanged (older clients don't send these)
+    auto_assign_enabled:       bool | None = None
+    auto_assign_after_minutes: int  | None = None
 
 
 class AdminStats(BaseModel):

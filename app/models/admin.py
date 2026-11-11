@@ -40,6 +40,13 @@ class TicketSettings(Base):
     # Creation defaults
     default_status:   Mapped[str] = mapped_column(String(20), default="open",   nullable=False)
     default_priority: Mapped[str] = mapped_column(String(20), default="medium", nullable=False)
+    # Auto-assign tickets nobody has picked up (see auto_assignment_service.py)
+    auto_assign_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    auto_assign_after_minutes: Mapped[int] = mapped_column(
+        Integer, default=30, server_default="30", nullable=False
+    )
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

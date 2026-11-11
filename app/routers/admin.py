@@ -95,6 +95,10 @@ async def update_ticket_settings(
     ts.number_digits    = max(1, min(8, body.number_digits))
     ts.default_status   = body.default_status
     ts.default_priority = body.default_priority
+    if body.auto_assign_enabled is not None:
+        ts.auto_assign_enabled = body.auto_assign_enabled
+    if body.auto_assign_after_minutes is not None:
+        ts.auto_assign_after_minutes = max(1, min(1440, body.auto_assign_after_minutes))
 
     await db.flush()
     await db.refresh(ts)
