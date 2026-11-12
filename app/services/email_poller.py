@@ -454,6 +454,67 @@ def _to_raw_attachment_list(attachments: list) -> list[RawAttachment]:
     return result
 
 
+_TICKET_TAG_RE = re.compile(r"\[\s*([A-Za-z][A-Za-z0-9]{0,9})\s*-\s*(\d{1,9})\s*\]")
+
+
+def _plain_text(value: str | None) -> str:
+    """Tags/entities/whitespace stripped and lower-cased — for comparing email bodies."""
+    return re.sub(
+        r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", value or ""))
+    ).strip().lower()
+
+
+async def _find_ticket_by_tag(db: AsyncSession, subject: str) -> Ticket | None:
+    """Ticket named by a "[TKT-01700]" tag in the subject (our own emails carry one)."""
+    for prefix, number in _TICKET_TAG_RE.findall(subject or ""):
+        res = await db.execute(
+            select(Ticket).where(
+                Ticket.is_deleted.is_(False),
+                func.upper(Ticket.ticket_prefix) == prefix.upper(),
+                Ticket.ticket_number == int(number),
+            ).limit(1)
+        )
+        ticket = res.scalar_one_or_none()
+        if ticket:
+            return ticket
+    return None
+
+
+async def _find_active_ticket_by_subject(db: AsyncSession, subject: str) -> Ticket | None:
+    """Newest unresolved ticket whose subject equals this one (ignoring Re:/Fwd:)."""
+    normalized = normalize_subject(subject)
+    if not normalized:
+        return None
+    res = await db.execute(
+        select(Ticket)
+        .where(
+            Ticket.is_deleted.is_(False),
+            Ticket.status.not_in(("resolved", "closed")),
+            func.btrim(func.regexp_replace(
+                func.lower(Ticket.subject), r"^\s*((re|fwd?|aw|sv)\s*:\s*)+", "", "g"
+            )) == normalized,
+        )
+        .order_by(Ticket.created_at.desc())
+        .limit(1)
+    )
+    return res.scalar_one_or_none()
+
+
+async def _body_already_recorded(db: AsyncSession, ticket: Ticket, body: str) -> bool:
+    """True when this exact text is already the ticket's description or an incoming email on it
+    (a re-delivered copy), so it must not be added to the conversation a second time."""
+    key = _plain_text(body)
+    if not key or key == _plain_text(ticket.description):
+        return True
+    rows = await db.execute(
+        select(TicketTimeline.text).where(
+            TicketTimeline.ticket_id == ticket.id,
+            TicketTimeline.type == TimelineType.email_in,
+        )
+    )
+    return any(_plain_text(t) == key for t in rows.scalars())
+
+
 async def _process_inbound_email(
     db: AsyncSession,
     inbound: InboundEmailConfig,
@@ -564,6 +625,23 @@ async def _process_inbound_email(
             existing_ticket = res.scalar_one_or_none()
             if existing_ticket:
                 break
+
+    # ── Replies that carry no usable threading headers ────────────────────
+    # Outlook/Gmail replies often can't be matched by Message-ID, because a ticket
+    # created from an email stores no thread id. Without this they would be thrown
+    # away as "duplicates" and never reach the ticket's conversation. Match them by
+    #   1. the [TKT-1234] tag in the subject (replies to our own emails), then
+    #   2. an active ticket that has the same subject (a normal Re:/Fwd: chain).
+    # Mail from the helpdesk mailbox itself (bounces, our own copies) is excluded.
+    own_addresses = {
+        a.strip().lower() for a in (inbound.graph_mailbox, inbound.imap_user) if a and a.strip()
+    }
+    if not existing_ticket and (from_email or "").strip().lower() not in own_addresses:
+        existing_ticket = await _find_ticket_by_tag(db, subject)
+        if not existing_ticket:
+            candidate = await _find_active_ticket_by_subject(db, subject)
+            if candidate and not await _body_already_recorded(db, candidate, body):
+                existing_ticket = candidate
 
     # Recipient rules (To / CC) only decide whether a NEW ticket is created.
     if not existing_ticket and rules:
