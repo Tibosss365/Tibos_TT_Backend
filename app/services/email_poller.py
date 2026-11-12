@@ -60,6 +60,7 @@ from app.models.ticket import Ticket, TicketTimeline, TimelineType
 from app.models.ticket_attachment import TicketAttachment
 from app.services.email_parser import parse_raw_email
 from app.services.email_inbox_service import normalize_subject
+from app.services.event_bus import emit as emit_event
 from app.services.notification_service import broadcast_ticket_event
 from app.services.cache_service import invalidate_tickets
 from app.services.sla_service import SLAService
@@ -454,6 +455,16 @@ def _to_raw_attachment_list(attachments: list) -> list[RawAttachment]:
     return result
 
 
+async def _run_rules(trigger: str, ticket: Ticket, db: AsyncSession) -> None:
+    """Run the admin's automation rules for an email-created/updated ticket.
+    A failing rule must never stop the email becoming a ticket (the engine guards each rule)."""
+    try:
+        from app.services.automation_engine import run_automation
+        await run_automation(trigger, ticket, db)
+    except Exception as exc:
+        logger.warning(f"[automation] {trigger} hook failed for email ticket: {exc}")
+
+
 _TICKET_TAG_RE = re.compile(r"\[\s*([A-Za-z][A-Za-z0-9]{0,9})\s*-\s*(\d{1,9})\s*\]")
 
 
@@ -696,6 +707,7 @@ async def _process_inbound_email(
             raw_list = _to_raw_attachment_list(attachments)
             await process_all_attachments(db, existing_ticket.id, raw_list, skip_inline=True)
         await db.flush()
+        await _run_rules("comment_added", existing_ticket, db)
         return existing_ticket, log, True
 
     # ── No match — create a new ticket ───────────────────────────────────
@@ -823,6 +835,7 @@ async def _process_inbound_email(
             db, ticket.id, _to_raw_attachment_list(attachments), skip_inline=True
         )
 
+    await _run_rules("ticket_created", ticket, db)
     return ticket, log, False
 
 
@@ -926,6 +939,7 @@ async def _poll_imap(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> int
                             f"Email→Ticket {action}: {ticket.ticket_id} from "
                             f"<{parsed['from_email']}> subject='{parsed['subject'][:60]}'"
                         )
+                        emit_event("comment_added" if is_reply else "ticket_created", ticket)
                         try:
                             redis = await get_redis()
                             await invalidate_tickets(redis)
@@ -1177,6 +1191,7 @@ async def _poll_graph(inbound: InboundEmailConfig, email_cfg: EmailConfig) -> in
                     processed += 1
                     handled = True
 
+                    emit_event("comment_added" if is_reply else "ticket_created", ticket)
                     try:
                         redis = await get_redis()
                         await invalidate_tickets(redis)

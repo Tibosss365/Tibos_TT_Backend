@@ -576,11 +576,20 @@ class SLABreachDetector:
             for ticket in tickets:
                 ticket.sla_status = SLAStatus.overdue
                 updated += 1
+                # "SLA breached" automation rules (isolated: never blocks marking the breach)
+                try:
+                    from app.services.automation_engine import run_automation
+                    await run_automation("sla_breach", ticket, db)
+                except Exception as exc:
+                    logger.warning(f"[automation] sla_breach hook failed: {exc}")
             if tickets:
                 await db.commit()
                 logger.info(
                     f"SLA breach check: {updated} ticket(s) newly overdue at {now.isoformat()}"
                 )
+                from app.services.event_bus import emit as emit_event
+                for ticket in tickets:
+                    emit_event("sla_breach", ticket)   # webhooks / Slack / Teams channels
         return updated
 
 

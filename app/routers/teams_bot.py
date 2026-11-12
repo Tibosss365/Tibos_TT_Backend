@@ -236,7 +236,16 @@ async def bot_messages(request: Request, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.warning("Teams bot: SLA start failed: %s", e)
 
+    # Admin automation rules also apply to Teams-created tickets (isolated: never blocks the ticket)
+    try:
+        from app.services.automation_engine import run_automation
+        await run_automation("ticket_created", ticket, db)
+    except Exception as e:
+        logger.warning("Teams bot: automation failed: %s", e)
+
     await db.commit()
+    from app.services.event_bus import emit as emit_event
+    emit_event("ticket_created", ticket)
     try:
         await broadcast_ticket_event(
             "ticket_created",

@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, joinedload, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.services.event_bus import emit as emit_event
+
 from app.core.deps import get_current_user
 from app.database import AsyncSessionLocal, get_db
 from app.models.ticket import (
@@ -785,6 +787,7 @@ async def create_ticket(
 
     # Reload with relationships
     full = await _get_ticket_or_404(ticket.id, db)
+    emit_event("ticket_created", full)     # webhooks / Slack / Teams channels
 
     # Notifications
     admins = await _get_admins(db)
@@ -1286,6 +1289,10 @@ async def update_ticket(
     # sends the same status more than once.
     status_changed = "status" in update_data and update_data["status"] != old_status
 
+    emit_event("ticket_updated", full)
+    if status_changed and update_data["status"] in (TicketStatus.resolved, TicketStatus.closed):
+        emit_event("ticket_resolved", full)
+
     # Notify on resolve + send CSAT survey
     if status_changed and update_data["status"] == TicketStatus.resolved:
         admins = await _get_admins(db)
@@ -1393,6 +1400,8 @@ async def add_comment(
         await run_automation("comment_added", ticket, db)
     except Exception as _ae:
         logger.warning(f"[automation] comment_added hook failed: {_ae}")
+
+    emit_event("comment_added", ticket)
 
     await db.flush()
 
@@ -1677,6 +1686,7 @@ async def delete_ticket(
             author_id=current_user.id,
         ))
     await db.commit()
+    emit_event("ticket_deleted", ticket)
     try:
         await broadcast_ticket_event(
             "ticket_deleted",

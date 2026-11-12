@@ -122,5 +122,14 @@ class RecurringTicketService:
         db.add(ticket)
         await db.flush()
 
+        # Admin automation rules and webhooks apply to scheduled tickets too (isolated from the schedule)
+        try:
+            from app.services.automation_engine import run_automation
+            from app.services.event_bus import emit as emit_event
+            await run_automation("ticket_created", ticket, db)
+            emit_event("ticket_created", ticket)
+        except Exception as exc:
+            logger.warning(f"[recurring] automation hook failed: {exc}")
+
 
 recurring_ticket_service = RecurringTicketService()
