@@ -174,11 +174,14 @@ def _any_ticket_query(db: AsyncSession):
 
 def _ticket_detail_query(db: AsyncSession):
     """Full query including attachments — only used by the single-ticket GET endpoint."""
+    # Many-to-one links (assignee, timeline author) ride along in the same query
+    # instead of one extra round trip each — the database is far from the app, so
+    # every saved query is ~250 ms off opening a ticket.
     return (
         select(Ticket)
         .options(
-            selectinload(Ticket.assignee),
-            selectinload(Ticket.timeline).selectinload(TicketTimeline.author),
+            joinedload(Ticket.assignee),
+            selectinload(Ticket.timeline).joinedload(TicketTimeline.author),
             selectinload(Ticket.attachments),
         )
     )
