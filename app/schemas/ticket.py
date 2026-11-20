@@ -149,11 +149,12 @@ class TicketOut(TicketBase):
     csat_sent_at: datetime | None = None
     custom_field_data: dict = {}
     due_date: datetime | None = None
+    resolved_at: datetime | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
         "created_at", "updated_at", "deleted_at",
-        "first_responded_at", "csat_sent_at", "due_date",
+        "first_responded_at", "csat_sent_at", "due_date", "resolved_at",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:
@@ -222,11 +223,12 @@ class TicketListOut(BaseModel):
     csat_rating: Union[int, None] | None = None
     custom_field_data: dict = {}
     due_date: Union[datetime, None] | None = None
+    resolved_at: Union[datetime, None] | None = None
 
     @field_serializer(
         "sla_start_time", "sla_due_time", "sla_paused_at", "sla_due_at",
         "created_at", "updated_at", "deleted_at",
-        "first_responded_at", "due_date",
+        "first_responded_at", "due_date", "resolved_at",
         when_used="json",
     )
     def _ser_dt(self, v: datetime | None) -> str | None:

@@ -221,6 +221,12 @@ class Ticket(Base):
     reopen_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # When the ticket was resolved (or closed straight away). Set automatically by the
+    # status listener at the bottom of this file, cleared if it is reopened — it is
+    # what "time to resolve" is measured from. (updated_at changes on any later edit.)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # How far this ticket has climbed a matching EscalationRule's tier ladder
     # (0 = not escalated). Prevents the same tier firing again on every hourly
     # check, and resets to 0 on reopen — see escalation_service.py.
@@ -312,3 +318,37 @@ class TicketTimeline(Base):
     author: Mapped["User | None"] = relationship(  # type: ignore[name-defined]
         "User", back_populates="timeline_entries"
     )
+
+
+# ── resolved_at bookkeeping ────────────────────────────────────────────────────
+# Every status change goes through the ORM (single edit, bulk action, automation
+# rule, email), so one listener keeps Ticket.resolved_at right for all of them:
+# stamped when a ticket first becomes resolved/closed, kept when it moves
+# resolved → closed, cleared when it is reopened.
+from sqlalchemy import event as _sa_event, inspect as _sa_inspect
+
+_DONE_STATUSES = ("resolved", "closed")
+
+
+def _status_value(x):
+    return getattr(x, "value", x)
+
+
+@_sa_event.listens_for(Ticket, "before_insert")
+def _stamp_resolved_on_insert(mapper, connection, target):
+    if _status_value(target.status) in _DONE_STATUSES and target.resolved_at is None:
+        target.resolved_at = datetime.now(timezone.utc)
+
+
+@_sa_event.listens_for(Ticket, "before_update")
+def _stamp_resolved_on_update(mapper, connection, target):
+    history = _sa_inspect(target).attrs.status.history
+    if not history.added:
+        return                                   # status unchanged
+    new = _status_value(history.added[0])
+    old = _status_value(history.deleted[0]) if history.deleted else None
+    if new in _DONE_STATUSES:
+        if old not in _DONE_STATUSES or target.resolved_at is None:
+            target.resolved_at = datetime.now(timezone.utc)
+    else:
+        target.resolved_at = None                # reopened / back in progress

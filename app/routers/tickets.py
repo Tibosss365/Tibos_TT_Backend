@@ -556,7 +556,7 @@ async def export_resolved_excel(
         "Ticket ID", "Subject", "Type", "Category", "Priority", "Status",
         "Assignee", "Submitter", "Company", "Email", "Phone", "Asset",
         "Description", "Resolution", "Resolution Code", "Group",
-        "Created", "Updated",
+        "Created", "Updated", "Resolved At", "Time to Resolve (hours)",
     ]
     sheet.append(headers)
     for cell in sheet[1]:
@@ -573,6 +573,9 @@ async def export_resolved_excel(
             ticket.resolution_code, ticket.group_id,
             ticket.created_at.replace(tzinfo=None) if ticket.created_at else None,
             ticket.updated_at.replace(tzinfo=None) if ticket.updated_at else None,
+            ticket.resolved_at.replace(tzinfo=None) if ticket.resolved_at else None,
+            round((ticket.resolved_at - ticket.created_at).total_seconds() / 3600, 2)
+            if ticket.resolved_at and ticket.created_at else None,
         ])
 
     for column_cells in sheet.columns:
