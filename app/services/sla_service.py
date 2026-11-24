@@ -567,6 +567,7 @@ class SLABreachDetector:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Ticket).where(
+                    Ticket.is_deleted.is_(False),      # tickets in the trash are not "breached" (and must not fire rules/webhooks)
                     Ticket.sla_status.cast(String) == SLAStatus.active.value,
                     Ticket.sla_due_time.isnot(None),
                     Ticket.sla_due_time < now,
