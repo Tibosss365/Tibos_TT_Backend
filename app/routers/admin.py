@@ -27,7 +27,13 @@ from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.services.email_sender import send_test_email
 from app.services.account_owner_service import normalize_owners as _normalize_owners
-from app.services.report_sections import gather_report_sections, render_report_sections, report_subject
+from app.services.report_sections import (
+    DEFAULT_TRUE_SECTION_KEYS,
+    gather_report_sections,
+    normalize_section_template,
+    render_report_sections,
+    report_subject,
+)
 from app.schemas.admin import (
     AdminStats,
     AlertSettingsOut,
@@ -698,11 +704,17 @@ async def _run_test_alert(
         _tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc).astimezone(_tz)
 
-    if combined_report:
+    daily_cfg = (_reports_cfg.get("daily") or {})
+    daily_template = normalize_section_template(daily_cfg.get("template"))
+    use_combined = combined_report and (
+        daily_template.get("includeDailyMonthlyReport", True) is not False
+    )
+
+    if use_combined:
         from app.services.report_scheduler import build_daily_monthly_email
 
         subject, html_body = await build_daily_monthly_email(
-            db, alert_cfg, now, reports_override=reports_override
+            db, alert_cfg, now, reports_override=reports_override, is_test=True
         )
         errors: list[str] = []
         for to_email in to_emails:
@@ -721,96 +733,22 @@ async def _run_test_alert(
             "report": "daily-monthly",
         }
 
-    unassigned_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
-            Ticket.assignee_id.is_(None),
-            Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress]),
-        )
-    )
-    sla_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
-            Ticket.sla_due_at.isnot(None),
-            Ticket.sla_due_at < now,
-            Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress]),
-        )
-    )
-    on_hold_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(Ticket.status == TicketStatus.on_hold)
-    )
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    open_today_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
-            Ticket.created_at >= midnight,
-            Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
-        )
-    )
-    created_today_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(Ticket.created_at >= midnight)
-    )
-    resolved_today_res = await db.execute(
-        select(func.count()).select_from(Ticket).where(
-            Ticket.updated_at >= midnight,
-            Ticket.status.in_([TicketStatus.resolved, TicketStatus.closed]),
-        )
-    )
+    from app.services.report_scheduler import _gather_data, _period_start
 
-    # Agent stats — all active users, merged with per-status ticket counts
-    # Step 1: fetch every active user
-    all_users_res = await db.execute(select(User).where(User.is_active == True))
-    all_users = all_users_res.scalars().all()
-
-    # Step 2: per-assignee ticket counts via a single GROUP BY query
-    ticket_counts_q = await db.execute(
-        select(
-            Ticket.assignee_id,
-            func.count().label("total"),
-            func.sum(sa_case((Ticket.status == TicketStatus.open,        1), else_=0)).label("open"),
-            func.sum(sa_case((Ticket.status == TicketStatus.in_progress, 1), else_=0)).label("in_progress"),
-            func.sum(sa_case((Ticket.status == TicketStatus.on_hold,     1), else_=0)).label("on_hold"),
-            func.sum(sa_case((Ticket.status == TicketStatus.resolved,    1), else_=0)).label("resolved"),
-            func.sum(sa_case((Ticket.status == TicketStatus.closed,      1), else_=0)).label("closed"),
-        ).where(
-            Ticket.assignee_id.isnot(None)
-        ).group_by(Ticket.assignee_id)
-    )
-    ticket_rows = {str(r.assignee_id): r for r in ticket_counts_q.fetchall()}
-
-    # Step 3: merge — every user gets a row (zeros if no tickets)
-    agent_stats = sorted([
-        {
-            "name":        u.name or u.username,
-            "initials":    (u.initials or "".join(w[0].upper() for w in (u.name or u.username or "?").split()[:2]) or "?"),
-            "total":       int((ticket_rows[str(u.id)].total       if str(u.id) in ticket_rows else 0) or 0),
-            "open":        int((ticket_rows[str(u.id)].open        if str(u.id) in ticket_rows else 0) or 0),
-            "in_progress": int((ticket_rows[str(u.id)].in_progress if str(u.id) in ticket_rows else 0) or 0),
-            "on_hold":     int((ticket_rows[str(u.id)].on_hold     if str(u.id) in ticket_rows else 0) or 0),
-            "resolved":    int(((ticket_rows[str(u.id)].resolved if str(u.id) in ticket_rows else 0) or 0)
-                             + ((ticket_rows[str(u.id)].closed   if str(u.id) in ticket_rows else 0) or 0)),
-        }
-        for u in all_users
-    ], key=lambda x: x["total"], reverse=True)
-
-    counts = {
-        "unassigned":    unassigned_res.scalar_one(),
-        "sla_breach":    sla_res.scalar_one(),
-        "on_hold":       on_hold_res.scalar_one(),
-        "open_today":    open_today_res.scalar_one(),
-        "created_today": created_today_res.scalar_one(),
-        "resolved_today": resolved_today_res.scalar_one(),
-    }
+    period_start = _period_start("daily", now)
+    counts, agent_stats = await _gather_data(db, period_start)
 
     # ── 4. Build HTML email ───────────────────────────────────────────────
-    report_template = ((_reports_cfg.get("daily") or {}).get("template") or {})
+    report_template = daily_template
     subject = report_subject(report_template, now, "daily")
     section_data = (
-        await gather_report_sections(db, now, report_template)
-        if any(report_template.get(key) is True for key in (
-            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
-        )) else {}
+        await gather_report_sections(db, now, report_template, report_type="daily")
+        if any(report_template.get(key) is True for key in DEFAULT_TRUE_SECTION_KEYS)
+        else {}
     )
     html_body = _build_alert_html(
         counts, now, agent_stats=agent_stats, template=report_template,
-        report_type="daily", report_sections=section_data,
+        report_type="daily", report_sections=section_data, is_test=True,
     )
 
     # ── 5. Send (non-blocking) ────────────────────────────────────────────
@@ -837,6 +775,7 @@ def _build_alert_html(
     template: dict | None = None,
     report_type: str | None = None,
     report_sections: dict | None = None,
+    is_test: bool = False,
 ) -> str:
     """
     Build the full alert/report HTML email.
@@ -864,11 +803,12 @@ def _build_alert_html(
     )
 
     # ── Period-aware labels for created/resolved counts ───────────────────
+    tz_label = now.strftime("%Z") or "local time"
     _PERIOD = {
-        "daily":   ("Today",      "since midnight UTC"),
-        "weekly":  ("This Week",  "since Monday midnight UTC"),
+        "daily":   ("Today",      f"since midnight {tz_label}"),
+        "weekly":  ("This Week",  f"since Monday midnight {tz_label}"),
         "monthly": ("This Month", "since the 1st of the month"),
-    }.get(report_type or "daily", ("Today", "since midnight UTC"))
+    }.get(report_type or "daily", ("Today", f"since midnight {tz_label}"))
 
     # ── Stat rows (ticket counts) ─────────────────────────────────────────
     _STAT_DEFS = [
@@ -995,8 +935,12 @@ def _build_alert_html(
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
         + custom_footer
         + '<br>'
-        'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
-        'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
+        + (
+            'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
+            if is_test else
+            'Automated report from Tibos Helpdesk.<br>'
+        )
+        + 'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
         '</td></tr>'
         '</table></td></tr></table></body></html>'
     )

@@ -25,7 +25,7 @@ class ReportSectionTests(unittest.TestCase):
             ],
             "daily_agent_report": [{
                 "name": "A&B", "created_today": 1, "under_1h": 2,
-                "one_to_two_hours": 3, "resolved_today": 5,
+                "one_to_two_hours": 3, "two_to_24_hours": 4, "resolved_today": 5,
                 "resolved_under_1h": 1, "resolved_1_to_2h": 2,
                 "resolved_2_to_24h": 2, "created_this_month": 6,
             }],
@@ -43,7 +43,7 @@ class ReportSectionTests(unittest.TestCase):
         self.assertNotIn("<script>", html)
         self.assertIn("Today created", html)
         self.assertIn("Resolved 2–24h", html)
-        self.assertNotIn("Open 2–24h", html)
+        self.assertIn("Open 2–24h", html)
 
     def test_disabled_or_missing_new_sections_are_omitted(self):
         data = {
@@ -93,6 +93,112 @@ class ReportSectionTests(unittest.TestCase):
             updated_at=datetime(2026, 1, 1, tzinfo=ZoneInfo("UTC")),
         )
         self.assertEqual(out.reports["daily"]["template"], reports["daily"]["template"])
+
+    def test_normalize_section_template_defaults_missing_keys_and_preserves_false(self):
+        from app.services.report_sections import normalize_section_template
+
+        self.assertEqual(
+            normalize_section_template({"includeDailyAgentReport": False}),
+            {
+                "includeAgentPerformance": True,
+                "includeDailyAgentReport": False,
+                "includeCategorySpecialists": True,
+            },
+        )
+
+    def test_digest_time_label_and_is_due_for_545_pm(self):
+        from app.services.report_scheduler import _format_digest_time_label, _is_due
+
+        self.assertEqual(_format_digest_time_label("17:45"), "5:45 PM")
+        self.assertEqual(_format_digest_time_label("08:00"), "8:00 AM")
+
+        ist = ZoneInfo("Asia/Kolkata")
+        before = datetime(2026, 11, 27, 17, 44, tzinfo=ist)
+        at_545 = datetime(2026, 11, 27, 17, 45, tzinfo=ist)
+        rep = {"enabled": True, "time": "17:45"}
+        self.assertFalse(_is_due("daily", rep, {}, before, before.date()))
+        self.assertTrue(_is_due("daily", rep, {}, at_545, at_545.date()))
+        self.assertFalse(_is_due("daily", rep, {"daily": at_545.isoformat()}, at_545, at_545.date()))
+
+    def test_build_daily_monthly_email_respects_template_and_avoids_duplicate_status(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from app.services.report_scheduler import build_daily_monthly_email
+
+        def _run_sync_coro(coro):
+            try:
+                coro.send(None)
+            except StopIteration as stop:
+                return stop.value
+            raise AssertionError("Expected mocked coroutine to complete synchronously")
+
+        ist = ZoneInfo("Asia/Kolkata")
+        now_tz = datetime(2026, 11, 27, 17, 45, tzinfo=ist)
+        alert_cfg = SimpleNamespace(reports={
+            "timezone": "Asia/Kolkata",
+            "daily": {
+                "enabled": True,
+                "time": "17:45",
+                "template": {
+                    "subject": "Custom Daily — {date}",
+                    "intro": "End of day summary.",
+                    "footer": "Ops Team",
+                    "includeUnassigned": True,
+                    "includeSla": False,
+                    "includeOnHold": False,
+                    "includeOpenToday": True,
+                    "includeCreatedToday": True,
+                    "includeResolvedToday": True,
+                    "includeAgentStats": True,
+                    "includeAgentPerformance": True,
+                    "includeDailyAgentReport": True,
+                    "includeDailyMonthlyReport": True,
+                    "includeCategorySpecialists": False,
+                },
+            },
+        })
+        fake_counts = {
+            "unassigned": 2, "sla_breach": 1, "on_hold": 0,
+            "open_today": 5, "created_today": 3, "resolved_today": 4,
+        }
+        fake_agents = [
+            {"name": "Alice", "initials": "AL", "total": 5, "open": 2, "in_progress": 1, "on_hold": 0, "resolved": 2},
+        ]
+        fake_sections = {
+            "agent_performance": [{"name": "Alice", "count": 2}],
+            "daily_agent_report": [{
+                "name": "Alice", "created_today": 3, "under_1h": 1, "one_to_two_hours": 1,
+                "two_to_24_hours": 0, "resolved_today": 2, "resolved_under_1h": 1,
+                "resolved_1_to_2h": 1, "resolved_2_to_24h": 0, "created_this_month": 10,
+            }],
+            "monthly_agent_report": [{
+                "name": "Alice", "created_this_month": 10, "under_1h": 1, "one_to_two_hours": 1,
+                "two_to_24_hours": 0, "resolved_this_month": 8, "resolved_under_1h": 3,
+                "resolved_1_to_2h": 2, "resolved_2_to_24h": 3,
+            }],
+            "category_specialists": [],
+        }
+
+        async def _fake_sections(_db, _now, _tmpl, report_type="daily"):
+            return fake_sections
+
+        with (
+            patch("app.services.report_scheduler._gather_data", new=AsyncMock(return_value=(fake_counts, fake_agents))),
+            patch("app.services.report_scheduler.gather_report_sections", side_effect=_fake_sections),
+        ):
+            subject, html = _run_sync_coro(build_daily_monthly_email(None, alert_cfg, now_tz))
+
+        self.assertEqual(subject, "Custom Daily — 27 Nov 2026")
+        self.assertIn("5:45 PM DIGEST", html)
+        self.assertIn("Agent Wise Ticket Count", html)
+        self.assertIn("Daily Report", html)
+        self.assertIn("Monthly Agent Metrics", html)
+        self.assertIn("Ops Team", html)
+        self.assertIn("Automated report from Tibos Helpdesk.", html)
+        self.assertNotIn("SLA Breaches", html)
+        self.assertEqual(html.count("Unassigned Tickets"), 1)
+        self.assertEqual(html.count("Currently Open"), 1)
+        self.assertNotIn("Category Specialists", html)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,56 @@ from app.models.user import User, UserRole
 
 
 COMPLETED = (TicketStatus.resolved, TicketStatus.closed)
+DEFAULT_TRUE_SECTION_KEYS = (
+    "includeAgentPerformance",
+    "includeDailyAgentReport",
+    "includeCategorySpecialists",
+)
+
+
+def normalize_section_template(template: dict | None) -> dict:
+    """Apply UI defaults (enabled unless explicitly False) to a saved report template."""
+    normalized = dict(template or {})
+    for key in DEFAULT_TRUE_SECTION_KEYS:
+        if key not in normalized:
+            normalized[key] = True
+    return normalized
+
+
+async def resolve_completion_times(
+    db: AsyncSession,
+    tickets: list[tuple],
+) -> dict:
+    """Map ticket_id -> resolution timestamp from TicketTimeline status/resolved events."""
+    ticket_ids = [row[0] for row in tickets]
+    resolution_times: dict = {}
+    if not ticket_ids:
+        return resolution_times
+
+    timeline_result = await db.execute(
+        select(
+            TicketTimeline.ticket_id,
+            TicketTimeline.type,
+            TicketTimeline.text,
+            TicketTimeline.created_at,
+        )
+        .where(
+            TicketTimeline.ticket_id.in_(ticket_ids),
+            TicketTimeline.type.in_([TimelineType.resolved, TimelineType.status]),
+        )
+        .order_by(TicketTimeline.created_at.desc())
+    )
+    for ticket_id, event_type, event_text, event_at in timeline_result.all():
+        if ticket_id in resolution_times:
+            continue
+        text = re.sub(r"<[^>]*>", "", unescape(event_text or ""))
+        is_completion = event_type == TimelineType.resolved or (
+            event_type == TimelineType.status
+            and re.search(r"\b(?:resolved|closed)\b", text, re.IGNORECASE)
+        )
+        if is_completion:
+            resolution_times[ticket_id] = event_at
+    return resolution_times
 
 
 def report_subject(template: dict | None, now: datetime, report_type: str = "daily") -> str:
@@ -94,7 +144,11 @@ async def gather_report_sections(
 
     perf_result = await db.execute(
         select(Ticket.assignee_id, func.count(Ticket.id))
-        .where(Ticket.assignee_id.in_(user_ids), Ticket.status.in_(COMPLETED))
+        .where(
+            Ticket.is_deleted.is_(False),
+            Ticket.assignee_id.in_(user_ids),
+            Ticket.status.in_(COMPLETED),
+        )
         .group_by(Ticket.assignee_id)
     )
     perf_counts = {row[0]: int(row[1] or 0) for row in perf_result.all()}
@@ -109,9 +163,12 @@ async def gather_report_sections(
             func.sum(case((unresolved & (Ticket.created_at > hour_1) & (Ticket.created_at <= now_utc), 1), else_=0)).label("under_1h"),
             func.sum(case((unresolved & (Ticket.created_at > hour_2) & (Ticket.created_at <= hour_1), 1), else_=0)).label("one_to_two_hours"),
             func.sum(case((unresolved & (Ticket.created_at > hour_24) & (Ticket.created_at <= hour_2), 1), else_=0)).label("two_to_24_hours"),
-            func.sum(case((Ticket.created_at >= month_start, 1), else_=0)).label("created_this_month"),
+            func.sum(case(((Ticket.created_at >= month_start) & (Ticket.created_at < tomorrow_start), 1), else_=0)).label("created_this_month"),
         )
-        .where(Ticket.assignee_id.in_(user_ids))
+        .where(
+            Ticket.is_deleted.is_(False),
+            Ticket.assignee_id.in_(user_ids),
+        )
         .group_by(Ticket.assignee_id)
     )
     daily_counts = {row[0]: row._mapping for row in daily_result.all()}
@@ -121,6 +178,7 @@ async def gather_report_sections(
     completed_result = await db.execute(
         select(Ticket.id, Ticket.assignee_id, Ticket.created_at, Ticket.updated_at)
         .where(
+            Ticket.is_deleted.is_(False),
             Ticket.assignee_id.in_(user_ids),
             Ticket.status.in_(COMPLETED),
             Ticket.updated_at >= day_start,
@@ -128,30 +186,7 @@ async def gather_report_sections(
         )
     )
     completed_today = completed_result.all()
-    resolution_times = {}
-    ticket_ids = [row[0] for row in completed_today]
-    if ticket_ids:
-        timeline_result = await db.execute(
-            select(
-                TicketTimeline.ticket_id, TicketTimeline.type,
-                TicketTimeline.text, TicketTimeline.created_at,
-            )
-            .where(
-                TicketTimeline.ticket_id.in_(ticket_ids),
-                TicketTimeline.type.in_([TimelineType.resolved, TimelineType.status]),
-            )
-            .order_by(TicketTimeline.created_at.desc())
-        )
-        for ticket_id, event_type, event_text, event_at in timeline_result.all():
-            if ticket_id in resolution_times:
-                continue
-            text = re.sub(r"<[^>]*>", "", unescape(event_text or ""))
-            is_completion = event_type == TimelineType.resolved or (
-                event_type == TimelineType.status
-                and re.search(r"\bstatus changed to\s+(?:resolved|closed)\b", text, re.IGNORECASE)
-            )
-            if is_completion:
-                resolution_times[ticket_id] = event_at
+    resolution_times = await resolve_completion_times(db, completed_today)
 
     duration_counts = {
         user.id: {
@@ -209,7 +244,10 @@ async def gather_report_sections(
             func.sum(case((unresolved & (Ticket.created_at > hour_2) & (Ticket.created_at <= hour_1), 1), else_=0)).label("one_to_two_hours"),
             func.sum(case((unresolved & (Ticket.created_at > hour_24) & (Ticket.created_at <= hour_2), 1), else_=0)).label("two_to_24_hours"),
         )
-        .where(Ticket.assignee_id.in_(user_ids))
+        .where(
+            Ticket.is_deleted.is_(False),
+            Ticket.assignee_id.in_(user_ids),
+        )
         .group_by(Ticket.assignee_id)
     )
     monthly_counts = {row[0]: row._mapping for row in monthly_result.all()}
@@ -220,6 +258,7 @@ async def gather_report_sections(
     monthly_completed_result = await db.execute(
         select(Ticket.id, Ticket.assignee_id, Ticket.created_at, Ticket.updated_at)
         .where(
+            Ticket.is_deleted.is_(False),
             Ticket.assignee_id.in_(user_ids),
             Ticket.status.in_(COMPLETED),
             Ticket.updated_at >= month_start,
@@ -227,30 +266,7 @@ async def gather_report_sections(
         )
     )
     completed_this_month = monthly_completed_result.all()
-    resolution_times = {}
-    monthly_ticket_ids = [row[0] for row in completed_this_month]
-    if monthly_ticket_ids:
-        monthly_timeline_result = await db.execute(
-            select(
-                TicketTimeline.ticket_id, TicketTimeline.type,
-                TicketTimeline.text, TicketTimeline.created_at,
-            )
-            .where(
-                TicketTimeline.ticket_id.in_(monthly_ticket_ids),
-                TicketTimeline.type.in_([TimelineType.resolved, TimelineType.status]),
-            )
-            .order_by(TicketTimeline.created_at.desc())
-        )
-        for ticket_id, event_type, event_text, event_at in monthly_timeline_result.all():
-            if ticket_id in resolution_times:
-                continue
-            text = re.sub(r"<[^>]*>", "", unescape(event_text or ""))
-            is_completion = event_type == TimelineType.resolved or (
-                event_type == TimelineType.status
-                and re.search(r"\bstatus changed to\s+(?:resolved|closed)\b", text, re.IGNORECASE)
-            )
-            if is_completion:
-                resolution_times[ticket_id] = event_at
+    resolution_times = await resolve_completion_times(db, completed_this_month)
 
     monthly_resolutions = {
         user.id: {
@@ -295,6 +311,7 @@ async def gather_report_sections(
         specialist_result = await db.execute(
             select(Ticket.category, Ticket.assignee_id, func.count(Ticket.id))
             .where(
+                Ticket.is_deleted.is_(False),
                 Ticket.assignee_id.in_(user_ids),
                 Ticket.status.in_(COMPLETED),
             )
@@ -377,7 +394,7 @@ def render_report_sections(
             ])
         else:
             table("Daily Report", ["Agent", "Today created", "Open < 1h", "Open 1–2h", "Open 2–24h", "Resolved today", "Resolved < 1h", "Resolved 1–2h", "Resolved 2–24h", "This month"], [
-                [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row["two_to_24_hours"], row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
+                [row["name"], row["created_today"], row["under_1h"], row["one_to_two_hours"], row.get("two_to_24_hours", 0), row["resolved_today"], row["resolved_under_1h"], row["resolved_1_to_2h"], row["resolved_2_to_24h"], row["created_this_month"]]
                 for row in data.get("daily_agent_report", [])
             ])
     if report_type != "monthly" and template.get("includeCategorySpecialists") is True:
