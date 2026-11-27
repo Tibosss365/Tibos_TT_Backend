@@ -50,9 +50,7 @@ from app.models.admin import AlertSettings, EmailConfig
 from app.models.ticket import SLAStatus, Ticket, TicketStatus, TicketTimeline, TimelineType
 from app.models.user import User, UserRole
 from app.services.report_sections import (
-    DEFAULT_TRUE_SECTION_KEYS,
     gather_report_sections,
-    normalize_section_template,
     report_subject,
     resolve_completion_times,
 )
@@ -160,8 +158,7 @@ class ReportScheduler:
 
                 logger.info("Report scheduler: %s report is due — sending…", report_type)
                 try:
-                    daily_tmpl = (rep.get("template") or {}) if report_type == "daily" else {}
-                    if report_type == "daily" and daily_tmpl.get("includeDailyMonthlyReport", True) is not False:
+                    if report_type == "daily":
                         sent = await self._send_daily_report(db, alert_cfg, rep, now_tz)
                     else:
                         sent = await self._send_report(db, alert_cfg, report_type, rep, now_tz)
@@ -193,7 +190,7 @@ class ReportScheduler:
         rep: dict,
         now_tz: datetime,
     ) -> bool:
-        template = normalize_section_template(rep.get("template"))
+        template = rep.get("template") or {}
 
         # ── Recipients ────────────────────────────────────────────────────
         to_emails = await _resolve_recipients(db, alert_cfg)
@@ -212,8 +209,9 @@ class ReportScheduler:
         counts, agent_stats = await _gather_data(db, period_start_utc)
         section_data = (
             await gather_report_sections(db, now_tz, template, report_type=report_type)
-            if any(template.get(key) is True for key in DEFAULT_TRUE_SECTION_KEYS)
-            else {}
+            if any(template.get(key) is True for key in (
+                "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+            )) else {}
         )
 
         # ── Subject ───────────────────────────────────────────────────────
@@ -228,7 +226,6 @@ class ReportScheduler:
             template=template,
             report_type=report_type,
             report_sections=section_data,
-            is_test=False,
         )
 
         # ── Send ──────────────────────────────────────────────────────────
@@ -294,17 +291,6 @@ async def _resolve_recipients(db: AsyncSession, alert_cfg: AlertSettings) -> lis
             if addr and addr not in to_emails:
                 to_emails.append(addr)
     return to_emails
-
-
-def _format_digest_time_label(time_str: str | None) -> str:
-    """Format configured schedule time like '17:45' as '5:45 PM'."""
-    try:
-        h, m = _parse_schedule_time(time_str or "17:45")
-    except (ValueError, TypeError, AttributeError):
-        return "DAILY"
-    period = "AM" if h < 12 else "PM"
-    hour_12 = h % 12 or 12
-    return f"{hour_12}:{m:02d} {period}"
 
 
 def _is_due(
@@ -398,28 +384,30 @@ async def build_daily_monthly_email(
     alert_cfg: AlertSettings,
     now_tz: datetime,
     reports_override: dict | None = None,
-    is_test: bool = False,
 ) -> tuple[str, str]:
-    """Build the daily (or combined daily + month-to-date) email and subject."""
-    import html as html_mod
-
+    """Build the separate combined daily + month-to-date email and subject."""
     reports = reports_override or alert_cfg.reports or {}
-    daily_cfg = reports.get("daily") or {}
-    daily_template = normalize_section_template(daily_cfg.get("template"))
-    monthly_raw = (reports.get("monthly") or {}).get("template")
-    monthly_template = normalize_section_template(monthly_raw if monthly_raw else daily_template)
+    daily_template = dict((reports.get("daily") or {}).get("template") or {})
+    monthly_template = dict(
+        (reports.get("monthly") or {}).get("template") or daily_template
+    )
     include_monthly = daily_template.get("includeDailyMonthlyReport", True) is not False
-
-    # Never duplicate global current-status snapshots inside the Monthly block,
-    # and never repeat the intro paragraph.
-    for key in (
-        "includeUnassigned",
-        "includeSla",
-        "includeOnHold",
-        "includeOpenToday",
-        "includeAgentStats",
-    ):
-        monthly_template[key] = False
+    # This digest explicitly promises a daily and a month-to-date snapshot.
+    # Keep the daily half complete even when individual sections are unchecked
+    # in the regular daily email template.
+    if include_monthly:
+        for key in (
+            "includeUnassigned",
+            "includeSla",
+            "includeOnHold",
+            "includeOpenToday",
+            "includeCreatedToday",
+            "includeResolvedToday",
+            "includeDailyAgentReport",
+        ):
+            daily_template[key] = True
+    # The combined email has one shared introduction; the monthly fragment
+    # must not repeat it.
     monthly_template["intro"] = ""
 
     daily_start = _period_start("daily", now_tz)
@@ -429,13 +417,15 @@ async def build_daily_monthly_email(
 
     daily_sections = (
         await gather_report_sections(db, now_tz, daily_template, report_type="daily")
-        if any(daily_template.get(key) is True for key in DEFAULT_TRUE_SECTION_KEYS)
-        else {}
+        if any(daily_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
     )
     monthly_sections = (
         await gather_report_sections(db, now_tz, monthly_template, report_type="monthly")
-        if include_monthly and any(monthly_template.get(key) is True for key in DEFAULT_TRUE_SECTION_KEYS)
-        else {}
+        if include_monthly and any(monthly_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
     )
 
     from app.routers.admin import _build_alert_html
@@ -452,11 +442,10 @@ async def build_daily_monthly_email(
     daily_html = _build_alert_html(
         daily_counts,
         now_tz,
-        agent_stats=agent_stats,
+        agent_stats=None,
         template=daily_template,
         report_type="daily",
         report_sections=daily_sections,
-        is_test=is_test,
     )
     monthly_html = None
     if include_monthly:
@@ -467,51 +456,31 @@ async def build_daily_monthly_email(
             template=monthly_template,
             report_type="monthly",
             report_sections=monthly_sections,
-            is_test=is_test,
         )
 
     date_text = now_tz.strftime("%B %d, %Y")
     report_label = "Daily + Monthly" if include_monthly else "Daily"
-    if (daily_template.get("subject") or "").strip():
-        subject = report_subject(daily_template, now_tz, "daily")
-    else:
-        subject = f"{report_label} Ticket Health Report — {date_text}"
-
-    digest_badge = _format_digest_time_label(daily_cfg.get("time"))
-    daily_fragment = content_fragment(daily_html)
+    subject = f"{report_label} Ticket Health Report — {date_text}"
     daily_block = (
         '<tr><td class="section-pad" style="padding:18px 26px 0;">'
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
         '<tr><td bgcolor="#eef2ff" style="padding:11px 14px;background:#eef2ff;border-left:4px solid #4f46e5;'
         'font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#3730a3;">'
         'Daily Report</td></tr>'
-        + daily_fragment
+        + content_fragment(daily_html)
         + '</table></td></tr>'
     )
     monthly_block = ""
     if monthly_html:
-        monthly_fragment = content_fragment(monthly_html)
-        if monthly_fragment.strip():
-            monthly_block = (
-                '<tr><td class="section-pad" style="padding:24px 26px 0;">'
-                '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-                '<tr><td bgcolor="#ecfdf5" style="padding:11px 14px;background:#ecfdf5;border-left:4px solid #059669;'
-                'font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#047857;">'
-                'Monthly Report &nbsp;·&nbsp; Month to Date</td></tr>'
-                + monthly_fragment
-                + '</table></td></tr>'
-            )
-
-    footer_text = str(daily_template.get("footer") or "").strip()
-    custom_footer = (
-        f'<div style="padding-bottom:8px;color:#667085;">{html_mod.escape(footer_text).replace(chr(10), "<br>")}</div>'
-        if footer_text else ""
-    )
-    footer_note = (
-        "This is a test report sent from your Tibos Helpdesk admin panel."
-        if is_test
-        else "Automated report from Tibos Helpdesk."
-    )
+        monthly_block = (
+            '<tr><td class="section-pad" style="padding:24px 26px 0;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+            '<tr><td bgcolor="#ecfdf5" style="padding:11px 14px;background:#ecfdf5;border-left:4px solid #059669;'
+            'font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#047857;">'
+            'Monthly Report &nbsp;·&nbsp; Month to Date</td></tr>'
+            + content_fragment(monthly_html)
+            + '</table></td></tr>'
+        )
 
     html_body = (
         '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -526,7 +495,7 @@ async def build_daily_monthly_email(
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td>'
         '<span style="display:inline-block;padding:6px 10px;border:1px solid #7772c8;border-radius:20px;'
         'font-family:Arial,sans-serif;font-size:10px;font-weight:700;color:#e0e7ff;letter-spacing:1px;text-transform:uppercase;">'
-        f'{report_label} &nbsp;|&nbsp; {digest_badge} DIGEST</span>'
+        f'{report_label} &nbsp;|&nbsp; 5:45 PM DIGEST</span>'
         '<div style="padding-top:15px;font-family:Arial,sans-serif;font-size:27px;line-height:1.2;font-weight:700;color:#ffffff;">Ticket Health Report</div>'
         f'<div style="padding-top:8px;font-family:Arial,sans-serif;font-size:13px;line-height:1.5;color:#c7d2fe;">{date_text} &nbsp;·&nbsp; {now_tz:%H:%M} {now_tz.tzname() or "local time"}</div>'
         '</td></tr></table></td></tr>'
@@ -543,8 +512,7 @@ async def build_daily_monthly_email(
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
         '<td height="1" bgcolor="#e8ecf2" style="height:1px;background:#e8ecf2;font-size:0;line-height:0;">&nbsp;</td>'
         '</tr><tr><td align="center" style="padding-top:16px;font-family:Arial,sans-serif;font-size:11px;line-height:1.7;color:#98a2b3;">'
-        + custom_footer
-        + f'{footer_note}<br>Manage report settings in <strong style="color:#667085;">Admin &rarr; Alerts</strong>.'
+        'Automated report from Tibos Helpdesk.<br>Manage report settings in <strong style="color:#667085;">Admin &rarr; Alerts</strong>.'
         '</td></tr></table></td></tr>'
         '</table></td></tr></table></body></html>'
     )
@@ -562,7 +530,7 @@ async def _gather_data(
         select(func.count()).select_from(Ticket).where(
             not_deleted,
             Ticket.assignee_id.is_(None),
-            Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress]),
+            Ticket.status.notin_([TicketStatus.resolved, TicketStatus.closed]),
         )
     )
     sla_res = await db.execute(

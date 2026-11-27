@@ -15,20 +15,6 @@ from app.models.user import User, UserRole
 
 
 COMPLETED = (TicketStatus.resolved, TicketStatus.closed)
-DEFAULT_TRUE_SECTION_KEYS = (
-    "includeAgentPerformance",
-    "includeDailyAgentReport",
-    "includeCategorySpecialists",
-)
-
-
-def normalize_section_template(template: dict | None) -> dict:
-    """Apply UI defaults (enabled unless explicitly False) to a saved report template."""
-    normalized = dict(template or {})
-    for key in DEFAULT_TRUE_SECTION_KEYS:
-        if key not in normalized:
-            normalized[key] = True
-    return normalized
 
 
 async def resolve_completion_times(

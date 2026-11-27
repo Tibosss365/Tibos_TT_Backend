@@ -27,13 +27,7 @@ from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.services.email_sender import send_test_email
 from app.services.account_owner_service import normalize_owners as _normalize_owners
-from app.services.report_sections import (
-    DEFAULT_TRUE_SECTION_KEYS,
-    gather_report_sections,
-    normalize_section_template,
-    render_report_sections,
-    report_subject,
-)
+from app.services.report_sections import gather_report_sections, render_report_sections, report_subject
 from app.schemas.admin import (
     AdminStats,
     AlertSettingsOut,
@@ -704,17 +698,11 @@ async def _run_test_alert(
         _tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc).astimezone(_tz)
 
-    daily_cfg = (_reports_cfg.get("daily") or {})
-    daily_template = normalize_section_template(daily_cfg.get("template"))
-    use_combined = combined_report and (
-        daily_template.get("includeDailyMonthlyReport", True) is not False
-    )
-
-    if use_combined:
+    if combined_report:
         from app.services.report_scheduler import build_daily_monthly_email
 
         subject, html_body = await build_daily_monthly_email(
-            db, alert_cfg, now, reports_override=reports_override, is_test=True
+            db, alert_cfg, now, reports_override=reports_override
         )
         errors: list[str] = []
         for to_email in to_emails:
@@ -739,16 +727,17 @@ async def _run_test_alert(
     counts, agent_stats = await _gather_data(db, period_start)
 
     # ── 4. Build HTML email ───────────────────────────────────────────────
-    report_template = daily_template
+    report_template = ((_reports_cfg.get("daily") or {}).get("template") or {})
     subject = report_subject(report_template, now, "daily")
     section_data = (
-        await gather_report_sections(db, now, report_template, report_type="daily")
-        if any(report_template.get(key) is True for key in DEFAULT_TRUE_SECTION_KEYS)
-        else {}
+        await gather_report_sections(db, now, report_template)
+        if any(report_template.get(key) is True for key in (
+            "includeAgentPerformance", "includeDailyAgentReport", "includeCategorySpecialists"
+        )) else {}
     )
     html_body = _build_alert_html(
         counts, now, agent_stats=agent_stats, template=report_template,
-        report_type="daily", report_sections=section_data, is_test=True,
+        report_type="daily", report_sections=section_data,
     )
 
     # ── 5. Send (non-blocking) ────────────────────────────────────────────
@@ -775,7 +764,6 @@ def _build_alert_html(
     template: dict | None = None,
     report_type: str | None = None,
     report_sections: dict | None = None,
-    is_test: bool = False,
 ) -> str:
     """
     Build the full alert/report HTML email.
@@ -803,12 +791,11 @@ def _build_alert_html(
     )
 
     # ── Period-aware labels for created/resolved counts ───────────────────
-    tz_label = now.strftime("%Z") or "local time"
     _PERIOD = {
-        "daily":   ("Today",      f"since midnight {tz_label}"),
-        "weekly":  ("This Week",  f"since Monday midnight {tz_label}"),
+        "daily":   ("Today",      "since midnight UTC"),
+        "weekly":  ("This Week",  "since Monday midnight UTC"),
         "monthly": ("This Month", "since the 1st of the month"),
-    }.get(report_type or "daily", ("Today", f"since midnight {tz_label}"))
+    }.get(report_type or "daily", ("Today", "since midnight UTC"))
 
     # ── Stat rows (ticket counts) ─────────────────────────────────────────
     _STAT_DEFS = [
@@ -935,12 +922,8 @@ def _build_alert_html(
         '<p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">'
         + custom_footer
         + '<br>'
-        + (
-            'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
-            if is_test else
-            'Automated report from Tibos Helpdesk.<br>'
-        )
-        + 'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
+        'This is a test alert sent from your Tibos Helpdesk admin panel.<br>'
+        'Manage alert settings in <strong>Admin &rarr; Alerts</strong>.</p>'
         '</td></tr>'
         '</table></td></tr></table></body></html>'
     )

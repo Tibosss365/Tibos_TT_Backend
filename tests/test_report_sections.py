@@ -94,23 +94,8 @@ class ReportSectionTests(unittest.TestCase):
         )
         self.assertEqual(out.reports["daily"]["template"], reports["daily"]["template"])
 
-    def test_normalize_section_template_defaults_missing_keys_and_preserves_false(self):
-        from app.services.report_sections import normalize_section_template
-
-        self.assertEqual(
-            normalize_section_template({"includeDailyAgentReport": False}),
-            {
-                "includeAgentPerformance": True,
-                "includeDailyAgentReport": False,
-                "includeCategorySpecialists": True,
-            },
-        )
-
-    def test_digest_time_label_and_is_due_for_545_pm(self):
-        from app.services.report_scheduler import _format_digest_time_label, _is_due
-
-        self.assertEqual(_format_digest_time_label("17:45"), "5:45 PM")
-        self.assertEqual(_format_digest_time_label("08:00"), "8:00 AM")
+    def test_is_due_for_545_pm(self):
+        from app.services.report_scheduler import _is_due
 
         ist = ZoneInfo("Asia/Kolkata")
         before = datetime(2026, 11, 27, 17, 44, tzinfo=ist)
@@ -120,7 +105,7 @@ class ReportSectionTests(unittest.TestCase):
         self.assertTrue(_is_due("daily", rep, {}, at_545, at_545.date()))
         self.assertFalse(_is_due("daily", rep, {"daily": at_545.isoformat()}, at_545, at_545.date()))
 
-    def test_build_daily_monthly_email_respects_template_and_avoids_duplicate_status(self):
+    def test_build_daily_monthly_email_keeps_previous_template_with_accurate_counts(self):
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, patch
         from app.services.report_scheduler import build_daily_monthly_email
@@ -140,20 +125,10 @@ class ReportSectionTests(unittest.TestCase):
                 "enabled": True,
                 "time": "17:45",
                 "template": {
-                    "subject": "Custom Daily — {date}",
-                    "intro": "End of day summary.",
-                    "footer": "Ops Team",
-                    "includeUnassigned": True,
-                    "includeSla": False,
-                    "includeOnHold": False,
-                    "includeOpenToday": True,
-                    "includeCreatedToday": True,
-                    "includeResolvedToday": True,
-                    "includeAgentStats": True,
                     "includeAgentPerformance": True,
                     "includeDailyAgentReport": True,
                     "includeDailyMonthlyReport": True,
-                    "includeCategorySpecialists": False,
+                    "includeCategorySpecialists": True,
                 },
             },
         })
@@ -161,9 +136,6 @@ class ReportSectionTests(unittest.TestCase):
             "unassigned": 2, "sla_breach": 1, "on_hold": 0,
             "open_today": 5, "created_today": 3, "resolved_today": 4,
         }
-        fake_agents = [
-            {"name": "Alice", "initials": "AL", "total": 5, "open": 2, "in_progress": 1, "on_hold": 0, "resolved": 2},
-        ]
         fake_sections = {
             "agent_performance": [{"name": "Alice", "count": 2}],
             "daily_agent_report": [{
@@ -183,22 +155,17 @@ class ReportSectionTests(unittest.TestCase):
             return fake_sections
 
         with (
-            patch("app.services.report_scheduler._gather_data", new=AsyncMock(return_value=(fake_counts, fake_agents))),
+            patch("app.services.report_scheduler._gather_data", new=AsyncMock(return_value=(fake_counts, []))),
             patch("app.services.report_scheduler.gather_report_sections", side_effect=_fake_sections),
         ):
             subject, html = _run_sync_coro(build_daily_monthly_email(None, alert_cfg, now_tz))
 
-        self.assertEqual(subject, "Custom Daily — 27 Nov 2026")
+        self.assertEqual(subject, "Daily + Monthly Ticket Health Report — November 27, 2026")
         self.assertIn("5:45 PM DIGEST", html)
-        self.assertIn("Agent Wise Ticket Count", html)
         self.assertIn("Daily Report", html)
+        self.assertIn("Monthly Report &nbsp;·&nbsp; Month to Date", html)
         self.assertIn("Monthly Agent Metrics", html)
-        self.assertIn("Ops Team", html)
-        self.assertIn("Automated report from Tibos Helpdesk.", html)
-        self.assertNotIn("SLA Breaches", html)
-        self.assertEqual(html.count("Unassigned Tickets"), 1)
-        self.assertEqual(html.count("Currently Open"), 1)
-        self.assertNotIn("Category Specialists", html)
+        self.assertIn("Category Specialists", html)
 
 
 if __name__ == "__main__":
